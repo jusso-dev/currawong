@@ -1,0 +1,79 @@
+# Currawong
+
+Currawong is an open source email security gateway written in Rust, built for Australian organisations. It sits in front of your mailboxes (Microsoft 365, Google Workspace or on-premises Exchange), checks every message going in and out, and keeps your data in Australia.
+
+It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint or Mimecast, but memory safe, self-hostable and aware of Australian rules such as PSPF protective markings and Australian identifiers like TFNs and Medicare numbers.
+
+> Status: M0 skeleton. Nothing here filters mail yet. See the [roadmap issue](https://github.com/jusso-dev/currawong/issues?q=is%3Aissue+label%3Aroadmap) and milestones.
+
+## Why
+
+- Mail gateways parse hostile input at high volume while exposed to the internet. That is exactly where memory safety pays off.
+- Australian buyers need data residency, ACSC threat feeds and PSPF marking enforcement. Global vendors treat these as afterthoughts.
+- MSPs need real multi-tenancy without per-tenant appliances.
+
+## Features (planned)
+
+| Area | What it does |
+| --- | --- |
+| SMTP gateway | Inbound and outbound relay on tokio, STARTTLS, MTA-STS, DANE, TLS-RPT, greylisting, rate limits, DNSBLs, connection reputation |
+| Sender authentication | SPF, DKIM, DMARC, ARC and BIMI via Stalwart's `mail-auth` |
+| Malware | ClamAV (clamd), YARA, true file type checks, nested archive extraction with limits, macro and OLE detection, sandbox detonation hook |
+| Phishing | URL rewriting with time-of-click checks, lookalike and homoglyph domains, HTML smuggling, QR code phishing |
+| BEC | Display name spoofing, payment and invoice change detection, optional pluggable LLM classifier |
+| Spam | Bayesian and rule scoring |
+| Outbound data protection | TFN, Medicare, ABN, ACN, driver's licence and Luhn-checked card detection, policy-based TLS and encryption |
+| Protective markings | Read and enforce `X-Protective-Marking` (OFFICIAL, OFFICIAL: Sensitive, PROTECTED) |
+| Quarantine | Quarantine store, user digests, release workflow |
+| Policy | Per domain, group and user policy engine |
+| Admin | axum web UI and API, RBAC, MSP multi-tenancy, audit log |
+| Mailbox APIs | Microsoft Graph and Gmail API for post-delivery remediation (clawback) |
+| Feeds and SIEM | ACSC CTIS feeds, syslog/CEF and webhook export, first-class [Wedgetail](https://github.com/yumaitau/wedgetail) integration |
+| Residency | On-premises or AWS Sydney and Melbourne only, enforced in config |
+| Hardening | Sandboxed parser processes, cargo-fuzz targets, memory and size limits |
+
+## Architecture
+
+See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) and the ADRs in [docs/adr](docs/adr).
+
+```
+internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
+                                                     auth -> scan (isolated) -> dlp -> policy
+                                                                       |
+                                     deliver (mail-send) / quarantine / reject -> events -> SIEM
+```
+
+## Workspace layout
+
+| Crate | Purpose |
+| --- | --- |
+| `crates/core` | Shared types: `MessageId`, `Direction`, `Verdict`, errors |
+| `crates/smtp` | SMTP server and outbound delivery |
+| `crates/spool` | Durable on-disk queue |
+| `crates/auth` | SPF, DKIM, DMARC, ARC, BIMI |
+| `crates/scan` | Scanner orchestration and isolated parser workers |
+| `crates/dlp` | Australian identifier detection and protective markings |
+| `crates/policy` | Policy engine and scoring |
+| `crates/quarantine` | Quarantine store and digests |
+| `crates/admin` | axum admin API and UI |
+| `crates/currawongd` | The daemon binary |
+
+## Roadmap
+
+- **M0 skeleton:** workspace, config, logging, CI, spool format.
+- **M1 MVP:** working relay with sender authentication and ClamAV.
+- **M2 FortiMail parity:** spam, URL protection, BEC, DLP, quarantine, admin UI, multi-tenancy, mailbox APIs.
+- **M3 beyond:** LLM BEC classifier, sandbox detonation, residency attestation, appliance images.
+
+## Building
+
+```
+cargo check --workspace
+cargo test --workspace
+```
+
+CI config lives in `docs/ci/ci.yml` until it is moved into `.github/workflows/`.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).
