@@ -4,7 +4,7 @@ Currawong is an open source email security gateway written in Rust, built for Au
 
 It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint or Mimecast, but memory safe, self-hostable and aware of Australian rules such as PSPF protective markings and Australian identifiers like TFNs and Medicare numbers.
 
-> Status: M0 skeleton. Nothing here filters mail yet. See the [roadmap issue](https://github.com/jusso-dev/currawong/issues?q=is%3Aissue+label%3Aroadmap) and milestones.
+> Status: M0 skeleton. Nothing here filters mail yet. See the [roadmap issue #1](https://github.com/jusso-dev/currawong/issues/1) and milestones.
 
 ## Why
 
