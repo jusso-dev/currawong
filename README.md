@@ -27,7 +27,7 @@ It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint 
 | Quarantine | Quarantine store, user digests, release workflow |
 | Policy | Per domain, group and user policy engine |
 | Admin | axum web UI and API, RBAC, MSP multi-tenancy, audit log |
-| Mailbox APIs | Microsoft Graph and Gmail API for post-delivery remediation (clawback) |
+| Mailbox platforms | M365, Google Workspace and on-premises Exchange 2016, 2019 and SE (connectors, hybrid, Edge, journaling monitor mode), with post-delivery remediation via Graph, Gmail API or legacy EWS |
 | Feeds and SIEM | ACSC CTIS feeds, syslog/CEF and webhook export, first-class [Wedgetail](https://github.com/yumaitau/wedgetail) integration |
 | Residency | On-premises or AWS Sydney and Melbourne only, enforced in config |
 | Hardening | Sandboxed parser processes, cargo-fuzz targets, memory and size limits |
