@@ -7,7 +7,12 @@
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
 //!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
 //!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
-//!   `dlp.incomplete` when some text could not be scanned for identifiers.
+//!   `dlp.incomplete` when some text could not be scanned for identifiers;
+//!   `pspf.invalid` (a protective marking that breaks the standard),
+//!   `pspf.mismatch` (header and subject markings disagree) and
+//!   `pspf.missing` (no protective marking at all).
+//! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
+//!   for the `marking` and `marking_at_least` conditions.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).
@@ -51,6 +56,18 @@ impl Signals {
             }
             if dlp.incomplete {
                 signals.flag("dlp.incomplete");
+            }
+        }
+        if let Some(marking) = &report.marking {
+            signals.marking = marking.classification.map(|c| c.as_str().to_string());
+            for (name, set) in [
+                ("pspf.invalid", marking.invalid),
+                ("pspf.mismatch", marking.mismatch),
+                ("pspf.missing", marking.classification.is_none()),
+            ] {
+                if set {
+                    signals.flag(name);
+                }
             }
         }
         if !report.yara.is_empty() {
