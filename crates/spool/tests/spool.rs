@@ -85,6 +85,147 @@ fn retry_schedule_matches_adr_0001() {
     }
 }
 
+const ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+const BODY: &[u8] = b"Subject: hi\r\n\r\nbody";
+
+fn names(dir: &std::path::Path) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    out.sort();
+    out
+}
+
+fn write_json(path: std::path::PathBuf, env: &Envelope) {
+    std::fs::write(path, serde_json::to_vec(env).unwrap()).unwrap();
+}
+
+/// An older spool moved the eml before the JSON, so a crash could leave the
+/// eml in `active/` and its envelope in `incoming/`.
+#[tokio::test]
+async fn recover_rejoins_eml_with_envelope_left_in_another_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    let mut env = envelope(ID);
+    env.attempts = 3;
+    std::fs::write(dir.path().join(format!("active/{ID}.eml")), BODY).unwrap();
+    write_json(dir.path().join(format!("incoming/{ID}.json")), &env);
+
+    let recovered = spool.recover().await.unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0], env);
+    assert_eq!(
+        names(&dir.path().join("incoming")),
+        [format!("{ID}.eml"), format!("{ID}.json")]
+    );
+    assert!(names(&dir.path().join("active")).is_empty());
+    assert_eq!(spool.read_body(&env.id).await.unwrap(), BODY);
+}
+
+/// A source JSON whose unlink was not made durable sits beside a newer pair.
+#[tokio::test]
+async fn stale_envelope_does_not_shadow_the_live_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    let mut live = envelope(ID);
+    live.state = SpoolState::Deferred;
+    live.attempts = 4;
+    std::fs::write(dir.path().join(format!("deferred/{ID}.eml")), BODY).unwrap();
+    write_json(dir.path().join(format!("deferred/{ID}.json")), &live);
+    write_json(
+        dir.path().join(format!("incoming/{ID}.json")),
+        &envelope(ID),
+    );
+
+    assert_eq!(spool.load(&live.id).await.unwrap(), live);
+    assert!(spool.list(SpoolState::Incoming).await.unwrap().is_empty());
+    let recovered = spool.recover().await.unwrap();
+    assert_eq!(recovered, [live.clone()]);
+    assert!(names(&dir.path().join("incoming")).is_empty());
+    assert_eq!(spool.read_body(&live.id).await.unwrap(), BODY);
+}
+
+/// Bytes are never deleted: an eml with no envelope anywhere is set aside.
+#[tokio::test]
+async fn eml_without_any_envelope_is_quarantined_not_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    std::fs::write(dir.path().join(format!("active/{ID}.eml")), BODY).unwrap();
+
+    assert!(spool.recover().await.unwrap().is_empty());
+    assert_eq!(names(&dir.path().join("bad")), [format!("{ID}.eml")]);
+    assert!(names(&dir.path().join("active")).is_empty());
+}
+
+#[tokio::test]
+async fn corrupt_envelope_does_not_block_startup_or_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    let good = envelope("01ARZ3NDEKTSV4RRFFQ69G5FB1");
+    spool
+        .accept(good.clone(), std::io::Cursor::new(BODY))
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join(format!("incoming/{ID}.eml")), BODY).unwrap();
+    std::fs::write(dir.path().join(format!("incoming/{ID}.json")), b"{not json").unwrap();
+
+    let listed = spool.list(SpoolState::Incoming).await.unwrap();
+    assert_eq!(listed, std::slice::from_ref(&good));
+    let recovered = spool.recover().await.unwrap();
+    assert_eq!(recovered, [good]);
+    assert_eq!(
+        names(&dir.path().join("bad")),
+        [format!("{ID}.eml"), format!("{ID}.json")]
+    );
+}
+
+struct FailingBody;
+
+impl tokio::io::AsyncRead for FailingBody {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        _buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Err(std::io::Error::other("client went away")))
+    }
+}
+
+#[tokio::test]
+async fn failed_accept_leaves_nothing_behind() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    assert!(spool.accept(envelope(ID), FailingBody).await.is_err());
+    assert!(names(&dir.path().join("incoming")).is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn spool_files_and_directories_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("spool");
+    let spool = Spool::open(&root).await.unwrap();
+    let env = envelope(ID);
+    spool
+        .accept(env.clone(), std::io::Cursor::new(BODY))
+        .await
+        .unwrap();
+    spool
+        .transition(&env.id, SpoolState::Deferred)
+        .await
+        .unwrap();
+    let mode =
+        |path: std::path::PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(root.clone()), 0o700);
+    for state in ["incoming", "active", "deferred", "done", "bad"] {
+        assert_eq!(mode(root.join(state)), 0o700, "{state}");
+    }
+    assert_eq!(mode(root.join(format!("deferred/{ID}.eml"))), 0o600);
+    assert_eq!(mode(root.join(format!("deferred/{ID}.json"))), 0o600);
+}
+
 #[tokio::test]
 async fn directory_sync_does_not_error() {
     let dir = tempfile::tempdir().unwrap();

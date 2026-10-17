@@ -2,9 +2,18 @@
 //!
 //! A 250 reply is only returned after the message file and its metadata have
 //! been renamed into place and the directory has been synced.
+//!
+//! Crash invariants, which `recover` relies on:
+//! - A message is live in the state directory that holds both `<id>.eml` and
+//!   `<id>.json`. Any other `<id>.json` is stale.
+//! - `accept` renames the JSON before the eml, so a crash inside `accept`
+//!   (before the 250) can leave a JSON with no eml, never an eml with no JSON.
+//! - `transition` writes the destination JSON before moving the eml and only
+//!   removes the source JSON afterwards, so every step leaves a complete pair.
 use currawong_core::{Direction, MessageId};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeSet,
     net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
@@ -13,6 +22,9 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
 pub use currawong_core::Error as CoreError;
+
+#[cfg(test)]
+mod crash_tests;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
@@ -38,6 +50,16 @@ pub enum SpoolState {
     Deferred,
     Done,
 }
+
+const STATES: [SpoolState; 4] = [
+    SpoolState::Incoming,
+    SpoolState::Active,
+    SpoolState::Deferred,
+    SpoolState::Done,
+];
+
+/// Entries recovery cannot repair are moved here for an operator to inspect.
+const BAD_DIR: &str = "bad";
 
 impl SpoolState {
     pub fn dir_name(self) -> &'static str {
@@ -103,20 +125,24 @@ impl Envelope {
 #[derive(Debug, Clone)]
 pub struct Spool {
     root: PathBuf,
+    /// Test-only crash injection: number of durable steps left before a panic.
+    #[cfg(test)]
+    crash_after: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl Spool {
     pub async fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        for state in [
-            SpoolState::Incoming,
-            SpoolState::Active,
-            SpoolState::Deferred,
-            SpoolState::Done,
-        ] {
-            tokio::fs::create_dir_all(root.join(state.dir_name())).await?;
+        create_private_dir(&root, false).await?;
+        for state in STATES {
+            create_private_dir(&root.join(state.dir_name()), true).await?;
         }
-        Ok(Self { root })
+        create_private_dir(&root.join(BAD_DIR), true).await?;
+        Ok(Self {
+            root,
+            #[cfg(test)]
+            crash_after: None,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -126,24 +152,56 @@ impl Spool {
     pub async fn accept(
         &self,
         mut env: Envelope,
-        mut body: impl AsyncRead + Unpin,
+        body: impl AsyncRead + Unpin,
     ) -> Result<MessageId> {
         if !is_safe_id(env.id.as_str()) {
             return Err(SpoolError::UnsafeId(env.id.as_str().to_string()));
         }
         env.state = SpoolState::Incoming;
         let dir = self.state_dir(SpoolState::Incoming);
+        let mut placed = false;
+        if let Err(err) = self.accept_files(&dir, &env, body, &mut placed).await {
+            // The caller replies 451, so nothing may stay behind to be
+            // delivered twice when the client retries. The eml goes first so a
+            // crash here leaves at most a JSON with no eml, which recovery drops.
+            let id = &env.id;
+            let mut names = vec![format!("{id}.eml.tmp"), format!("{id}.json.tmp")];
+            if placed {
+                names.splice(0..0, [format!("{id}.eml"), format!("{id}.json")]);
+            }
+            for name in names {
+                let _ = tokio::fs::remove_file(dir.join(name)).await;
+            }
+            let _ = sync_dir(&dir).await;
+            return Err(err);
+        }
+        Ok(env.id)
+    }
+
+    async fn accept_files(
+        &self,
+        dir: &Path,
+        env: &Envelope,
+        mut body: impl AsyncRead + Unpin,
+        placed: &mut bool,
+    ) -> Result<()> {
         let eml_tmp = dir.join(format!("{}.eml.tmp", env.id));
         let eml = dir.join(format!("{}.eml", env.id));
         {
-            let mut file = tokio::fs::File::create(&eml_tmp).await?;
+            let mut file = create_private_file(&eml_tmp).await?;
+            self.step();
             tokio::io::copy(&mut body, &mut file).await?;
             file.sync_all().await?;
+            self.step();
         }
+        // JSON before eml: an eml in a state directory always has its envelope.
+        *placed = true;
+        self.write_json(dir, env).await?;
         tokio::fs::rename(&eml_tmp, &eml).await?;
-        self.write_json(&dir, &env).await?;
-        sync_dir(&dir).await?;
-        Ok(env.id)
+        self.step();
+        sync_dir(dir).await?;
+        self.step();
+        Ok(())
     }
 
     pub async fn transition(&self, id: &MessageId, to: SpoolState) -> Result<()> {
@@ -154,15 +212,25 @@ impl Spool {
         }
         let from_dir = self.state_dir(from);
         let to_dir = self.state_dir(to);
-        let eml_from = from_dir.join(format!("{}.eml", id));
-        let eml_to = to_dir.join(format!("{}.eml", id));
-        tokio::fs::rename(&eml_from, &eml_to).await?;
         env.state = to;
-        // JSON is renamed last so a crash between the two renames is visible.
-        let json_from = from_dir.join(format!("{}.json", id));
-        let _ = tokio::fs::remove_file(&json_from).await;
+        // Destination JSON first, then the eml, then drop the source JSON.
+        // Recovery treats the JSON beside the eml as live, so a crash at any
+        // point leaves the message whole in either `from` or `to`.
         self.write_json(&to_dir, &env).await?;
+        tokio::fs::rename(
+            from_dir.join(format!("{id}.eml")),
+            to_dir.join(format!("{id}.eml")),
+        )
+        .await?;
+        self.step();
         sync_dir(&to_dir).await?;
+        self.step();
+        sync_dir(&from_dir).await?;
+        self.step();
+        remove_if_present(&from_dir.join(format!("{id}.json"))).await?;
+        self.step();
+        sync_dir(&from_dir).await?;
+        self.step();
         Ok(())
     }
 
@@ -173,22 +241,21 @@ impl Spool {
         let dir = self.state_dir(env.state);
         self.write_json(&dir, env).await?;
         sync_dir(&dir).await?;
+        self.step();
         Ok(())
     }
 
+    /// Load the envelope that sits beside the message's eml.
     pub async fn load(&self, id: &MessageId) -> Result<Envelope> {
-        for state in [
-            SpoolState::Incoming,
-            SpoolState::Active,
-            SpoolState::Deferred,
-            SpoolState::Done,
-        ] {
-            let path = self.state_dir(state).join(format!("{}.json", id));
-            if tokio::fs::try_exists(&path).await? {
-                let bytes = tokio::fs::read(&path).await?;
-                let mut env: Envelope = serde_json::from_slice(&bytes)?;
-                env.state = state;
-                return Ok(env);
+        if !is_safe_id(id.as_str()) {
+            return Err(SpoolError::UnsafeId(id.0.clone()));
+        }
+        for state in STATES {
+            let dir = self.state_dir(state);
+            if tokio::fs::try_exists(dir.join(format!("{id}.eml"))).await?
+                && tokio::fs::try_exists(dir.join(format!("{id}.json"))).await?
+            {
+                return read_envelope(&dir, id.as_str(), state).await;
             }
         }
         Err(SpoolError::NotFound(id.0.clone()))
@@ -200,89 +267,156 @@ impl Spool {
         Ok(tokio::fs::read(path).await?)
     }
 
+    /// Messages in `state`. Entries that cannot be read are logged and
+    /// skipped so one bad file cannot stop the whole queue.
     pub async fn list(&self, state: SpoolState) -> Result<Vec<Envelope>> {
+        let dir = self.state_dir(state);
         let mut out = Vec::new();
-        let mut dir = tokio::fs::read_dir(self.state_dir(state)).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if let Some(id) = name.strip_suffix(".json") {
-                if is_safe_id(id) {
-                    out.push(self.load(&MessageId(id.to_string())).await?);
+        for id in self.ids_with(&dir, ".json").await? {
+            match tokio::fs::try_exists(dir.join(format!("{id}.eml"))).await {
+                // A JSON with no eml beside it is stale or mid-transition.
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(err) => {
+                    tracing::warn!(%id, %err, "skipping unreadable spool entry");
+                    continue;
                 }
+            }
+            match read_envelope(&dir, &id, state).await {
+                Ok(env) => out.push(env),
+                // Moved by a concurrent transition.
+                Err(SpoolError::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => tracing::warn!(%id, %err, "skipping unreadable spool entry"),
             }
         }
         Ok(out)
     }
 
-    /// Delete stray temporary files and move orphaned `active/` messages back
-    /// to `incoming/` so a crash cannot lose accepted mail.
+    /// Finish or roll back anything a crash interrupted, then move orphaned
+    /// `active/` messages back to `incoming/` so a crash cannot lose accepted
+    /// mail. Returns the messages the daemon still has to process.
     pub async fn recover(&self) -> Result<Vec<Envelope>> {
-        for state in [
-            SpoolState::Incoming,
-            SpoolState::Active,
-            SpoolState::Deferred,
-            SpoolState::Done,
-        ] {
+        for state in STATES {
             self.delete_tmp(state).await?;
         }
-        let active = self.list(SpoolState::Active).await?;
-        for env in active {
+        self.repair().await?;
+        for env in self.list(SpoolState::Active).await? {
             self.transition(&env.id, SpoolState::Incoming).await?;
         }
-        self.repair_split_pairs().await?;
         let mut recovered = self.list(SpoolState::Incoming).await?;
         recovered.extend(self.list(SpoolState::Deferred).await?);
         Ok(recovered)
     }
 
-    async fn repair_split_pairs(&self) -> Result<()> {
-        // An eml that moved without its json is finished by writing json into
-        // the directory that holds the eml.
-        for state in [
-            SpoolState::Incoming,
-            SpoolState::Active,
-            SpoolState::Deferred,
-            SpoolState::Done,
-        ] {
+    /// Leave every message as exactly one eml and JSON pair in one state
+    /// directory, removing stale JSON and quarantining what cannot be read.
+    async fn repair(&self) -> Result<()> {
+        let mut ids = BTreeSet::new();
+        for state in STATES {
             let dir = self.state_dir(state);
-            let mut rd = tokio::fs::read_dir(&dir).await?;
-            while let Some(entry) = rd.next_entry().await? {
-                let name = entry.file_name();
-                let name = name.to_string_lossy().to_string();
-                let Some(id) = name.strip_suffix(".eml") else {
-                    continue;
-                };
-                if !is_safe_id(id) {
-                    continue;
+            ids.extend(self.ids_with(&dir, ".eml").await?);
+            ids.extend(self.ids_with(&dir, ".json").await?);
+        }
+        for id in ids {
+            self.repair_one(&id).await?;
+        }
+        Ok(())
+    }
+
+    async fn repair_one(&self, id: &str) -> Result<()> {
+        let mut home = None;
+        let mut jsons = Vec::new();
+        for state in STATES {
+            let dir = self.state_dir(state);
+            if home.is_none() && tokio::fs::try_exists(dir.join(format!("{id}.eml"))).await? {
+                home = Some(state);
+            }
+            if tokio::fs::try_exists(dir.join(format!("{id}.json"))).await? {
+                jsons.push(state);
+            }
+        }
+        let Some(home) = home else {
+            // Only a crash inside `accept` leaves a JSON with no eml, and that
+            // was before the 250, so there is no message to keep.
+            for state in jsons {
+                tracing::warn!(%id, state = state.dir_name(), "removing envelope with no message");
+                self.remove_json(state, id).await?;
+            }
+            return Ok(());
+        };
+        let home_dir = self.state_dir(home);
+        if jsons.contains(&home) {
+            if let Err(err) = read_envelope(&home_dir, id, home).await {
+                tracing::warn!(%id, %err, "quarantining unreadable spool entry");
+                self.quarantine(home, id).await?;
+                return Ok(());
+            }
+        } else {
+            // Written by an older spool that moved the eml before the JSON:
+            // adopt the first readable envelope from another directory.
+            let mut adopted = None;
+            for &state in &jsons {
+                if let Ok(env) = read_envelope(&self.state_dir(state), id, state).await {
+                    adopted = Some(env);
+                    break;
                 }
-                let json = dir.join(format!("{id}.json"));
-                if tokio::fs::try_exists(&json).await? {
-                    continue;
-                }
-                if let Ok(mut env) = self.load_any_json(id).await {
-                    env.state = state;
-                    self.write_json(&dir, &env).await?;
-                    for other in [
-                        SpoolState::Incoming,
-                        SpoolState::Active,
-                        SpoolState::Deferred,
-                        SpoolState::Done,
-                    ] {
-                        if other == state {
-                            continue;
-                        }
-                        let stray = self.state_dir(other).join(format!("{id}.json"));
-                        let _ = tokio::fs::remove_file(stray).await;
-                    }
-                }
+            }
+            let Some(mut env) = adopted else {
+                tracing::warn!(%id, state = home.dir_name(), "quarantining message with no envelope");
+                self.quarantine(home, id).await?;
+                return Ok(());
+            };
+            tracing::warn!(%id, state = home.dir_name(), "rejoining envelope with its message");
+            env.state = home;
+            self.write_json(&home_dir, &env).await?;
+            sync_dir(&home_dir).await?;
+            self.step();
+        }
+        for state in jsons {
+            if state != home {
+                self.remove_json(state, id).await?;
             }
         }
         Ok(())
     }
 
-    async fn load_any_json(&self, id: &str) -> Result<Envelope> {
-        self.load(&MessageId(id.to_string())).await
+    async fn remove_json(&self, state: SpoolState, id: &str) -> Result<()> {
+        let dir = self.state_dir(state);
+        remove_if_present(&dir.join(format!("{id}.json"))).await?;
+        self.step();
+        sync_dir(&dir).await?;
+        Ok(())
+    }
+
+    async fn quarantine(&self, state: SpoolState, id: &str) -> Result<()> {
+        let dir = self.state_dir(state);
+        let bad = self.root.join(BAD_DIR);
+        for name in [format!("{id}.json"), format!("{id}.eml")] {
+            match tokio::fs::rename(dir.join(&name), bad.join(&name)).await {
+                Ok(()) => self.step(),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
+        sync_dir(&bad).await?;
+        sync_dir(&dir).await?;
+        Ok(())
+    }
+
+    /// Safe ids of files in `dir` ending in `suffix`.
+    async fn ids_with(&self, dir: &Path, suffix: &str) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        let mut rd = tokio::fs::read_dir(dir).await?;
+        while let Some(entry) = rd.next_entry().await? {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(id) = name.strip_suffix(suffix) {
+                if is_safe_id(id) {
+                    out.push(id.to_string());
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn delete_tmp(&self, state: SpoolState) -> Result<()> {
@@ -293,6 +427,7 @@ impl Spool {
             let name = name.to_string_lossy();
             if name.ends_with(".tmp") {
                 tokio::fs::remove_file(entry.path()).await?;
+                self.step();
             }
         }
         Ok(())
@@ -306,13 +441,27 @@ impl Spool {
         let tmp = dir.join(format!("{}.json.tmp", env.id));
         let final_path = dir.join(format!("{}.json", env.id));
         {
-            let mut file = tokio::fs::File::create(&tmp).await?;
+            let mut file = create_private_file(&tmp).await?;
+            self.step();
             let bytes = serde_json::to_vec_pretty(env)?;
             file.write_all(&bytes).await?;
             file.sync_all().await?;
+            self.step();
         }
         tokio::fs::rename(tmp, final_path).await?;
+        self.step();
         Ok(())
+    }
+
+    /// Marks a point where the on-disk state is what a crash would leave.
+    /// Tests panic here to stop the operation dead, skipping any cleanup.
+    fn step(&self) {
+        #[cfg(test)]
+        if let Some(left) = &self.crash_after {
+            if left.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("injected crash");
+            }
+        }
     }
 }
 
@@ -332,6 +481,47 @@ pub fn is_safe_id(id: &str) -> bool {
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() && !c.is_ascii_lowercase())
+}
+
+async fn read_envelope(dir: &Path, id: &str, state: SpoolState) -> Result<Envelope> {
+    let bytes = tokio::fs::read(dir.join(format!("{id}.json"))).await?;
+    let mut env: Envelope = serde_json::from_slice(&bytes)?;
+    env.state = state;
+    Ok(env)
+}
+
+async fn remove_if_present(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err.into()),
+        _ => Ok(()),
+    }
+}
+
+/// Message files are readable by the spool owner only.
+async fn create_private_file(path: &Path) -> Result<tokio::fs::File> {
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    Ok(opts.open(path).await?)
+}
+
+/// Create `dir` as owner-only. State directories belong to the spool, so
+/// existing ones are tightened too; the root may be operator-provided.
+async fn create_private_dir(dir: &Path, tighten: bool) -> Result<()> {
+    let mut builder = tokio::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(dir).await?;
+    #[cfg(unix)]
+    if tighten {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await?;
+    }
+    #[cfg(not(unix))]
+    let _ = tighten;
+    Ok(())
 }
 
 async fn sync_dir(dir: &Path) -> Result<()> {
