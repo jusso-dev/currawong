@@ -137,9 +137,10 @@ pub struct ScannerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClamdConfig {
-    /// `unix:/path` or `tcp:127.0.0.1:3310`. Empty disables the engine.
+    /// `unix:/path` or `tcp:127.0.0.1:3310`. Empty disables the engine only
+    /// when `required` is false.
     pub address: String,
-    /// When the address is set, an unreachable engine fails closed.
+    /// An unreachable or unconfigured required engine fails closed (defer).
     pub required: bool,
 }
 

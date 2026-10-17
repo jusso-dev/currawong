@@ -32,6 +32,7 @@ impl ReadinessCheck for SpoolWritable {
 
 pub struct ClamdReady {
     pub address: String,
+    pub required: bool,
 }
 
 #[async_trait]
@@ -42,7 +43,11 @@ impl ReadinessCheck for ClamdReady {
 
     async fn check(&self) -> Result<(), String> {
         if self.address.is_empty() {
-            return Ok(());
+            return if self.required {
+                Err("clamd is required and no address is configured".into())
+            } else {
+                Ok(())
+            };
         }
         let address = currawong_scan::ClamdAddress::parse(&self.address)?;
         currawong_scan::ClamdClient::new(address, true).ping().await
@@ -72,6 +77,7 @@ pub fn checks_for(cfg: &Config) -> Vec<Arc<dyn ReadinessCheck>> {
         }),
         Arc::new(ClamdReady {
             address: cfg.scanner.clamd.address.clone(),
+            required: cfg.scanner.enabled && cfg.scanner.clamd.required,
         }),
         Arc::new(SignaturesReady {
             dirs: cfg.scanner.extra_signature_dirs.clone(),

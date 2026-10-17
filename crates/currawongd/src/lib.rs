@@ -4,7 +4,7 @@ mod pipeline;
 mod scheduler;
 
 pub use health::{checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable};
-pub use pipeline::Pipeline;
+pub use pipeline::{worker_binary, Pipeline};
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};
 
 use currawong_core::{config::Config, residency::ResidencyGuard, Config as CoreConfig};

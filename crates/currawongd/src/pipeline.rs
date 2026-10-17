@@ -1,12 +1,9 @@
 //! Auth, parse, scan and the M1 policy decision.
 use currawong_auth::AuthChecker;
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
-use currawong_parser::{parse::parse_bytes, ParseResponse};
+use currawong_parser::ParseResponse;
 use currawong_policy::decide;
-use currawong_scan::{
-    combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
-    Scanner, WorkerPool,
-};
+use currawong_scan::{combine, ClamdAddress, ClamdClient, EngineOutput, ScanOutcome, WorkerPool};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 
@@ -24,6 +21,7 @@ impl Pipeline {
                 cfg.scanner.job_timeout_secs,
                 cfg.scanner.max_jobs_per_worker as u64,
             )
+            .with_size(cfg.scanner.worker_pool_size)
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
         Self { cfg, auth, pool }
@@ -42,7 +40,8 @@ impl Pipeline {
             let verdict = decide(&report);
             return (report, verdict);
         }
-        let parsed = self.parse(env, raw, body_path).await;
+        // Holds the extracted parts on disk until the engines have run.
+        let (parsed, _parts_dir) = self.parse(env, raw, body_path).await;
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
         let parser_failed = parsed.error.is_some();
@@ -51,28 +50,21 @@ impl Pipeline {
         }
         self.fold_part_flags(&mut report);
         let mut outputs = Vec::new();
-        let filetype = FileTypeScanner {
-            treat_macros_as_active: self.cfg.scanner.treat_macros_as_active,
-            treat_executables_as_active: self.cfg.scanner.treat_executables_as_active,
-            limits: self.cfg.scanner.extract.clone(),
-        };
-        let result = filetype
-            .scan(&ScanItem {
-                name: "message.eml",
-                bytes: raw,
-            })
-            .await;
-        outputs.push(finding("filetype", &result));
+        if self.cfg.scanner.clamd.address.is_empty() && self.cfg.scanner.clamd.required {
+            outputs.push(EngineOutput {
+                name: "clamav".into(),
+                result: currawong_scan::EngineResult::Failed {
+                    reason: "clamd is required and no address is configured".into(),
+                    unreachable: true,
+                },
+                required: true,
+            });
+        }
         if !self.cfg.scanner.clamd.address.is_empty() {
             match ClamdAddress::parse(&self.cfg.scanner.clamd.address) {
                 Ok(address) => {
                     let client = ClamdClient::new(address, self.cfg.scanner.clamd.required);
-                    let result = client
-                        .scan(&ScanItem {
-                            name: "message.eml",
-                            bytes: raw,
-                        })
-                        .await;
+                    let result = client.scan_message(raw, &report.parts).await;
                     let mut output = finding("clamav", &result);
                     output.required = self.cfg.scanner.clamd.required;
                     outputs.push(output);
@@ -93,7 +85,7 @@ impl Pipeline {
         report.malware = combined.malware;
         report.active_content = report.active_content || combined.active_content;
         report.defer = combined.defer;
-        report.fail_closed = combined.fail_closed;
+        report.fail_closed = report.fail_closed || combined.fail_closed;
         report.notes.extend(combined.notes);
         for output in &outputs {
             report.engines.push(EngineFinding {
@@ -106,50 +98,112 @@ impl Pipeline {
         (report, verdict)
     }
 
+    /// Part flags from the parser worker become the M1 verdict inputs.
     fn fold_part_flags(&self, report: &mut ScanReport) {
-        for part in &report.parts {
-            if self.cfg.scanner.treat_executables_as_active
-                && part.flags.contains(&PartFlag::Executable)
+        let scanner = &self.cfg.scanner;
+        let mut notes = Vec::new();
+        for part in &mut report.parts {
+            let name = part.filename.as_deref().unwrap_or("attachment").to_string();
+            if blocked_extension(part.filename.as_deref(), &scanner.blocked_extensions)
+                && !part.flags.contains(&PartFlag::Executable)
             {
-                report.active_content = true;
-                report.notes.push(format!(
-                    "executable {}",
-                    part.filename.as_deref().unwrap_or("attachment")
-                ));
+                part.flags.push(PartFlag::Executable);
             }
-            if self.cfg.scanner.treat_macros_as_active && part.flags.contains(&PartFlag::HasMacro) {
-                report.active_content = true;
-                report.notes.push(format!(
-                    "macro {}",
-                    part.filename.as_deref().unwrap_or("attachment")
-                ));
-            }
-            if part.flags.contains(&PartFlag::LimitExceeded) {
-                report.fail_closed = true;
-                report
-                    .notes
-                    .push("archive extraction limit exceeded".into());
+            for flag in &part.flags {
+                let (active, note) = match flag {
+                    PartFlag::Executable if scanner.treat_executables_as_active => {
+                        (true, format!("executable {name}"))
+                    }
+                    PartFlag::HasMacro if scanner.treat_macros_as_active => {
+                        (true, format!("macro {name}"))
+                    }
+                    PartFlag::Encrypted => (true, format!("encrypted archive {name}")),
+                    PartFlag::HasOleObject => (true, format!("embedded OLE object {name}")),
+                    PartFlag::ExtMismatch => (true, format!("type does not match name {name}")),
+                    PartFlag::LimitExceeded => {
+                        (false, "archive extraction limit exceeded".to_string())
+                    }
+                    PartFlag::Unscannable => (false, format!("could not inspect {name}")),
+                    PartFlag::Executable | PartFlag::HasMacro => continue,
+                };
+                if active {
+                    report.active_content = true;
+                } else {
+                    report.fail_closed = true;
+                }
+                notes.push(note);
             }
         }
+        report.notes.extend(notes);
     }
 
+    /// Always in a worker process (ADR 0002). No worker, no parse: the
+    /// message fails closed rather than being parsed inside the daemon.
     async fn parse(
         &mut self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
-    ) -> ParseResponse {
-        if let (Some(pool), Some(path)) = (self.pool.as_mut(), body_path) {
-            return match pool
-                .scan_file(env.id.as_str(), path, &self.cfg.scanner.extract)
-                .await
-            {
-                ScanOutcome::Parsed(response) => response,
-                ScanOutcome::Failed { reason } => ParseResponse::failed(env.id.as_str(), reason),
-            };
+    ) -> (ParseResponse, Option<tempfile::TempDir>) {
+        let id = env.id.as_str();
+        let Some(pool) = self.pool.as_ref() else {
+            return (
+                ParseResponse::failed(id, "parser worker binary not found"),
+                None,
+            );
+        };
+        let dir = match parts_dir(&self.cfg) {
+            Ok(dir) => dir,
+            Err(err) => {
+                return (
+                    ParseResponse::failed(id, format!("parts directory: {err}")),
+                    None,
+                )
+            }
+        };
+        let path = match body_path {
+            Some(path) => path.to_path_buf(),
+            None => {
+                let path = dir.path().join("message.eml");
+                if let Err(err) = tokio::fs::write(&path, raw).await {
+                    return (
+                        ParseResponse::failed(id, format!("stage message: {err}")),
+                        Some(dir),
+                    );
+                }
+                path
+            }
+        };
+        let out = dir.path().join("parts");
+        if let Err(err) = tokio::fs::create_dir(&out).await {
+            return (
+                ParseResponse::failed(id, format!("parts directory: {err}")),
+                Some(dir),
+            );
         }
-        parse_bytes(env.id.as_str(), raw, &self.cfg.scanner.extract)
+        let response = match pool
+            .scan_file_into(id, &path, &self.cfg.scanner.extract, Some(&out))
+            .await
+        {
+            ScanOutcome::Parsed(response) => response,
+            ScanOutcome::Failed { reason } => ParseResponse::failed(id, reason),
+        };
+        (response, Some(dir))
     }
+}
+
+/// Per-message scratch space for extracted parts, next to the spool.
+fn parts_dir(cfg: &Config) -> std::io::Result<tempfile::TempDir> {
+    let base = cfg.spool.dir.join("parts");
+    std::fs::create_dir_all(&base)?;
+    tempfile::Builder::new().prefix("scan-").tempdir_in(base)
+}
+
+fn blocked_extension(filename: Option<&str>, blocked: &[String]) -> bool {
+    let Some((_, ext)) = filename.and_then(|name| name.rsplit_once('.')) else {
+        return false;
+    };
+    blocked.iter().any(|b| b.eq_ignore_ascii_case(ext))
 }
 
 fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {
@@ -160,11 +214,11 @@ fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {
     }
 }
 
+/// The configured worker, or one next to the daemon. A configured path that
+/// does not exist is not silently replaced.
 pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
     if let Some(path) = &cfg.scanner.worker_binary {
-        if path.exists() {
-            return Some(path.clone());
-        }
+        return path.is_file().then(|| path.clone());
     }
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join("currawong-parser-worker");

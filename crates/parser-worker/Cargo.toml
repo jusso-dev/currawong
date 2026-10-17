@@ -28,15 +28,20 @@ zip = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 cfb = { workspace = true }
+sevenz-rust2 = { workspace = true }
 rlimit = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
-libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
 zip = { workspace = true }
+sevenz-rust2 = { workspace = true, features = ["compress"] }
+base64 = { workspace = true }

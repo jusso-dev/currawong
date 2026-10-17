@@ -6,6 +6,7 @@ pub mod fuzz;
 pub mod ipc;
 pub mod office;
 pub mod parse;
+pub mod sandbox;
 
 pub use ipc::{ParseRequest, ParseResponse};
 pub use parse::parse_request;

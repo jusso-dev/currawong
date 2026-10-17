@@ -95,6 +95,9 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         cfg.metrics_addr().map_err(|err| err.to_string())?,
         checks_for(&cfg),
     );
+    if cfg.scanner.enabled && currawongd::worker_binary(&cfg).is_none() {
+        return Err("parser worker binary not found: set scanner.worker_binary".into());
+    }
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))

@@ -7,6 +7,12 @@ pub struct FileKind {
     pub executable: bool,
 }
 
+/// Shell link header size and CLSID 00021401-0000-0000-C000-000000000046.
+const LNK_MAGIC: [u8; 20] = [
+    0x4c, 0x00, 0x00, 0x00, 0x01, 0x14, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x46,
+];
+
 pub fn detect(bytes: &[u8]) -> FileKind {
     if looks_like_pe(bytes) {
         return FileKind {
@@ -27,6 +33,12 @@ pub fn detect(bytes: &[u8]) -> FileKind {
     {
         return FileKind {
             label: "application/x-mach-binary".into(),
+            executable: true,
+        };
+    }
+    if bytes.starts_with(&LNK_MAGIC) {
+        return FileKind {
+            label: "application/x-ms-shortcut".into(),
             executable: true,
         };
     }
@@ -72,7 +84,8 @@ pub fn detect(bytes: &[u8]) -> FileKind {
             executable: false,
         };
     }
-    if bytes.starts_with(b"{\\rtf") {
+    // Word opens anything that starts with `{\rt`, not only `{\rtf1`.
+    if bytes.starts_with(b"{\\rt") {
         return FileKind {
             label: "application/rtf".into(),
             executable: false,
@@ -99,9 +112,6 @@ pub fn flags_for(bytes: &[u8], filename: Option<&str>, kind: &FileKind) -> Vec<P
     if extension_mismatch(filename, kind) {
         flags.push(PartFlag::ExtMismatch);
     }
-    if blocked_extension(filename) && !flags.contains(&PartFlag::Executable) {
-        flags.push(PartFlag::Executable);
-    }
     if is_ole(bytes) {
         if office::has_macro_ole(bytes) {
             flags.push(PartFlag::HasMacro);
@@ -110,9 +120,7 @@ pub fn flags_for(bytes: &[u8], filename: Option<&str>, kind: &FileKind) -> Vec<P
             flags.push(PartFlag::HasOleObject);
         }
     }
-    if (kind.label == "application/rtf" || bytes.starts_with(b"{\\rtf"))
-        && office::rtf_has_object(bytes)
-    {
+    if kind.label == "application/rtf" && office::rtf_has_object(bytes) {
         flags.push(PartFlag::HasOleObject);
     }
     flags
@@ -133,13 +141,56 @@ fn extension_mismatch(filename: Option<&str>, kind: &FileKind) -> bool {
                 "exe" | "dll" | "scr" | "com" | "elf" | "so" | "dylib" | "bin"
             )
         }
+        "application/x-ms-shortcut" => ext == "lnk",
         "application/zip" => matches!(
             ext.as_str(),
-            "zip" | "docx" | "xlsx" | "pptx" | "docm" | "xlsm" | "pptm" | "odt" | "jar"
+            "zip"
+                | "docx"
+                | "xlsx"
+                | "pptx"
+                | "docm"
+                | "xlsm"
+                | "pptm"
+                | "dotx"
+                | "dotm"
+                | "xltx"
+                | "xltm"
+                | "xlsb"
+                | "xlam"
+                | "potx"
+                | "potm"
+                | "ppsx"
+                | "ppsm"
+                | "ppam"
+                | "vsdx"
+                | "vsdm"
+                | "odt"
+                | "ods"
+                | "odp"
+                | "odg"
+                | "epub"
+                | "kmz"
+                | "jar"
         ),
-        "application/x-cfb" => matches!(ext.as_str(), "doc" | "xls" | "ppt" | "msi" | "msg"),
+        "application/x-cfb" => matches!(
+            ext.as_str(),
+            "doc"
+                | "dot"
+                | "xls"
+                | "xlt"
+                | "xla"
+                | "ppt"
+                | "pps"
+                | "pot"
+                | "msi"
+                | "msg"
+                | "vsd"
+                | "pub"
+                | "mpp"
+                | "bin"
+        ),
         "application/pdf" => ext == "pdf",
-        "application/rtf" => ext == "rtf",
+        "application/rtf" => matches!(ext.as_str(), "rtf" | "doc"),
         "application/gzip" => matches!(ext.as_str(), "gz" | "tgz"),
         "application/x-tar" => matches!(ext.as_str(), "tar" | "tgz"),
         "application/x-7z-compressed" => ext == "7z",
@@ -147,42 +198,6 @@ fn extension_mismatch(filename: Option<&str>, kind: &FileKind) -> bool {
         _ => true,
     };
     !expected
-}
-
-pub fn blocked_extension(filename: Option<&str>) -> bool {
-    const BLOCKED: &[&str] = &[
-        "exe",
-        "scr",
-        "js",
-        "jse",
-        "vbs",
-        "vbe",
-        "wsf",
-        "wsh",
-        "hta",
-        "lnk",
-        "iso",
-        "one",
-        "bat",
-        "cmd",
-        "com",
-        "msi",
-        "dll",
-        "ps1",
-        "jar",
-        "cpl",
-        "msc",
-        "reg",
-        "pif",
-        "gadget",
-        "application",
-        "msp",
-        "msix",
-        "appx",
-    ];
-    let Some(name) = filename else { return false };
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    BLOCKED.contains(&ext.as_str())
 }
 
 pub fn looks_like_pe(bytes: &[u8]) -> bool {

@@ -50,10 +50,11 @@ mail-send = { version = "0.5", default-features = false, features = ["ring", "tl
 mail-builder = "0.4"
 hickory-resolver = "0.26"
 infer = "0.19"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 cfb = "0.10"
+sevenz-rust2 = { version = "0.24", default-features = false, features = ["aes256"] }
 tempfile = "3"
 http = "1"
 libc = "0.2"

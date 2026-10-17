@@ -60,12 +60,18 @@ key = "/etc/currawong/key.pem"
 
 # scanner.enabled: isolated parser workers and the malware engines.
 # scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
-# scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310. Empty disables ClamAV.
+#   worker_cpu_secs is per job. worker_binary (optional) is the path to
+#   currawong-parser-worker; by default it sits next to currawongd, and the
+#   daemon refuses to start without it.
+# scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310 (deploy/docker-compose.yml).
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
+#   Required with an empty address defers all mail and fails /readyz. Set
+#   required = false to run without ClamAV.
 # scanner.extra_signature_dirs: on-premises supplemental signatures. Configure
 # clamd to load these as well (OfficialDatabaseOnly no). Mail stays on the box.
 # scanner.extra_database_paths: extra .cvd/.cld/.ndb files for the same purpose.
-# scanner.blocked_extensions: active content even when ClamAV is clean.
+# scanner.blocked_extensions: active content even when ClamAV is clean. Applies
+#   to attachments and to files inside archives.
 # scanner.treat_macros_as_active / treat_executables_as_active: file-type policy.
 # scanner.extract.*: archive limits (depth, uncompressed bytes, files, ratio).
 [scanner]
@@ -86,7 +92,7 @@ extra_signature_dirs = []
 extra_database_paths = []
 
 [scanner.clamd]
-address = ""
+address = "tcp:127.0.0.1:3310"
 required = true
 
 [scanner.extract]

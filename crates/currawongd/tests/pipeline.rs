@@ -28,6 +28,39 @@ fn envelope(from: &str) -> Envelope {
     }
 }
 
+/// `cargo test --workspace` builds the worker binary next to the tests.
+fn worker_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let candidate = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .map(|dir| dir.join("currawong-parser-worker"))
+        .unwrap();
+    assert!(
+        candidate.is_file(),
+        "parser worker binary: run cargo build -p currawong-parser-worker"
+    );
+    candidate
+}
+
+/// A scanning config without ClamAV.
+fn scan_config(dir: &tempfile::TempDir) -> Config {
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.clamd.required = false;
+    cfg.scanner.worker_binary = Some(worker_bin());
+    cfg
+}
+
+fn with_attachment(name: &str, content_type: &str, bytes: &[u8]) -> Vec<u8> {
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    format!(
+        "From: a@example.test\r\nTo: b@example.test\r\nSubject: t\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n--b\r\nContent-Type: {content_type}; name=\"{name}\"\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n--b--\r\n"
+    )
+    .into_bytes()
+}
+
 fn text_message() -> Vec<u8> {
     b"From: user@example.test\r\nTo: dest@example.test\r\nSubject: hi\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\nhello\r\n".to_vec()
 }
@@ -35,10 +68,7 @@ fn text_message() -> Vec<u8> {
 #[tokio::test]
 async fn dmarc_reject_is_quarantined_and_clean_mail_stays_deliverable() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.spool.dir = dir.path().join("spool");
-    cfg.scanner.clamd.address.clear();
-    cfg.scanner.worker_binary = None;
+    let cfg = scan_config(&dir);
     let _spool = Spool::open(&cfg.spool.dir).await.unwrap();
     let auth = AuthChecker::offline("currawong.example.test").unwrap();
     seed_txt(auth.cache(), "attacker.test", "v=spf1 -all").unwrap();
@@ -60,9 +90,7 @@ async fn dmarc_reject_is_quarantined_and_clean_mail_stays_deliverable() {
 #[tokio::test]
 async fn renamed_executable_is_quarantined_without_clamav() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.spool.dir = dir.path().join("spool");
-    cfg.scanner.clamd.address.clear();
+    let cfg = scan_config(&dir);
     let auth = AuthChecker::offline("currawong.example.test").unwrap();
     let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
     let mut pe = vec![0u8; 0x80];
@@ -85,9 +113,7 @@ async fn renamed_executable_is_quarantined_without_clamav() {
 #[tokio::test]
 async fn pending_mail_is_not_marked_deliver_before_the_pipeline() {
     let dir = tempfile::tempdir().unwrap();
-    let mut cfg = Config::default();
-    cfg.spool.dir = dir.path().join("spool");
-    cfg.scanner.clamd.address.clear();
+    let cfg = scan_config(&dir);
     let spool = Arc::new(Spool::open(&cfg.spool.dir).await.unwrap());
     let env = envelope("user@example.test");
     spool
@@ -134,4 +160,169 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
         err.contains("Australia") || err.contains("us-east-1") || err.contains("not an allowed"),
         "{err}"
     );
+}
+
+async fn verdict_for(cfg: Config, raw: &[u8]) -> (currawong_core::ScanReport, Verdict) {
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    pipeline
+        .evaluate(&envelope("a@example.test"), raw, None)
+        .await
+}
+
+/// No in-daemon fallback: without a worker the message fails closed.
+#[tokio::test]
+async fn missing_worker_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = scan_config(&dir);
+    cfg.scanner.worker_binary = Some(dir.path().join("no-such-worker"));
+    let (report, verdict) = verdict_for(cfg, &text_message()).await;
+    assert!(report.fail_closed, "{report:?}");
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+}
+
+/// The default build requires clamd. With no address it defers and fails
+/// readiness instead of delivering unscanned mail.
+#[tokio::test]
+async fn required_clamd_without_an_address_defers_and_is_not_ready() {
+    use currawong_core::telemetry::ReadinessCheck;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = scan_config(&dir);
+    cfg.scanner.clamd.required = true;
+    let (_report, verdict) = verdict_for(cfg, &text_message()).await;
+    assert!(matches!(verdict, Verdict::Defer { .. }), "{verdict:?}");
+    let ready = currawongd::ClamdReady {
+        address: String::new(),
+        required: true,
+    };
+    assert!(ready.check().await.is_err());
+}
+
+#[tokio::test]
+async fn inspection_flags_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut zip = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(&mut zip);
+        writer
+            .start_file("a.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"hello").unwrap();
+        writer.finish().unwrap();
+    }
+    let zip = zip.into_inner();
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        (
+            "embedded OLE object",
+            with_attachment(
+                "note.rtf",
+                "application/rtf",
+                b"{\\rtf1{\\object\\objemb{\\*\\objdata 01}}}",
+            ),
+        ),
+        (
+            "type does not match name",
+            with_attachment("statement.pdf", "application/pdf", &zip),
+        ),
+        (
+            "could not inspect",
+            with_attachment("a.rar", "application/vnd.rar", b"Rar!\x1a\x07\x01\x00rest"),
+        ),
+    ];
+    for (note, raw) in cases {
+        let (report, verdict) = verdict_for(scan_config(&dir), &raw).await;
+        assert!(
+            matches!(verdict, Verdict::Quarantine { .. }),
+            "{note}: {verdict:?} {report:?}"
+        );
+        assert!(
+            report.notes.iter().any(|n| n.contains(note)),
+            "{note}: {:?}",
+            report.notes
+        );
+    }
+}
+
+#[tokio::test]
+async fn encrypted_archive_is_quarantined() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut writer = sevenz_rust2::ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(vec![
+        sevenz_rust2::encoder_options::AesEncoderOptions::new("not-in-the-body".into()).into(),
+        sevenz_rust2::EncoderMethod::LZMA2.into(),
+    ]);
+    writer
+        .push_archive_entry(
+            sevenz_rust2::ArchiveEntry::new_file("report.txt"),
+            Some(&b"quarterly"[..]),
+        )
+        .unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let raw = with_attachment("report.7z", "application/x-7z-compressed", &archive);
+    let (report, verdict) = verdict_for(scan_config(&dir), &raw).await;
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    assert!(report.notes.iter().any(|n| n.contains("encrypted archive")));
+}
+
+#[tokio::test]
+async fn blocked_extensions_come_from_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = scan_config(&dir);
+    cfg.scanner.blocked_extensions = vec!["xyz".into()];
+    let raw = with_attachment("notes.xyz", "text/plain", b"plain text");
+    let (_report, verdict) = verdict_for(cfg.clone(), &raw).await;
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    // js is on the default list but not on this one.
+    let raw = with_attachment("run.js", "text/plain", b"plain text");
+    let (_report, verdict) = verdict_for(cfg, &raw).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+}
+
+/// Issue #23: killing a worker mid-job does not take the daemon down, the
+/// message is quarantined, and the next message gets a fresh worker.
+#[tokio::test]
+async fn worker_killed_mid_job_quarantines_and_recovers() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = scan_config(&dir);
+    cfg.scanner.job_timeout_secs = 60;
+    cfg.scanner.worker_pool_size = 1;
+    cfg.scanner.extract.max_uncompressed_bytes = 2 * 1024 * 1024 * 1024;
+    cfg.scanner.extract.max_ratio = u32::MAX;
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let env = envelope("a@example.test");
+    let (_report, verdict) = pipeline.evaluate(&env, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    let pid = pipeline.pool.as_ref().unwrap().worker_pids()[0];
+
+    // About 1 GiB of zeros: far more work than the 300 ms before the kill.
+    let member = {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        enc.finish().unwrap()
+    };
+    let bomb: Vec<u8> = std::iter::repeat_n(member, 1024).flatten().collect();
+    let raw = with_attachment("zeros.gz", "application/gzip", &bomb);
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .unwrap()
+    });
+    let (report, verdict) = pipeline.evaluate(&env, &raw, None).await;
+    assert!(killer.join().unwrap().success());
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("parser worker failed")),
+        "{:?}",
+        report.notes
+    );
+    let (_report, verdict) = pipeline.evaluate(&env, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
 }

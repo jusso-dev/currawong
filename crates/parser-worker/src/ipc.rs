@@ -3,12 +3,27 @@ use currawong_core::config::ExtractLimits;
 use currawong_core::PartInfo;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tokio_util::codec::LengthDelimitedCodec;
+
+/// Largest frame either side accepts. A response that would be bigger is
+/// replaced by a failure so the worker never dies writing it.
+pub const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+pub fn codec() -> LengthDelimitedCodec {
+    LengthDelimitedCodec::builder()
+        .max_frame_length(MAX_FRAME)
+        .new_codec()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParseRequest {
     pub id: String,
     pub raw_path: PathBuf,
     pub limits: ExtractLimits,
+    /// When set, the worker writes each part's decoded bytes here and records
+    /// the file in `PartInfo::path`, so the supervisor can send it to clamd.
+    #[serde(default)]
+    pub out_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
