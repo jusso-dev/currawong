@@ -2,7 +2,10 @@
 //! `Deliverer::deliver` against in-process STARTTLS sinks. DNS, DNSSEC state
 //! and the MTA-STS policy fetch are fakes; the TLS is real.
 use async_trait::async_trait;
-use currawong_core::config::{Config, DomainRoute};
+use currawong_core::{
+    config::{Config, DomainRoute},
+    TlsRequirement,
+};
 use currawong_smtp::{
     delivery::{
         mta_sts::{MtaSts, PolicyFetcher},
@@ -232,6 +235,8 @@ struct Setup {
     policy: Option<String>,
     /// Send a TLS-RPT report (null sender, TLS-Report-Domain header).
     report_mail: bool,
+    /// What a policy asked for on this message.
+    tls: TlsRequirement,
 }
 
 async fn setup() -> Setup {
@@ -253,6 +258,7 @@ async fn setup() -> Setup {
         dns,
         policy: None,
         report_mail: false,
+        tls: TlsRequirement::None,
     }
 }
 
@@ -330,6 +336,7 @@ impl Setup {
             rcpt_status: Vec::new(),
             prepend_headers: Vec::new(),
             dsn_sent: false,
+            tls: self.tls,
             pipeline: "deliver".into(),
         };
         let body: &[u8] = if self.report_mail {
@@ -757,4 +764,108 @@ async fn require_tls_refuses_unverified_certificates() {
         .await
         .iter()
         .all(|session| !session.sent_mail()));
+}
+
+#[tokio::test]
+async fn policy_require_tls_without_starttls_defers() {
+    let mut sink = sink(None).await;
+    let mut setup = setup().await;
+    setup.tls = TlsRequirement::Required;
+    let spool = Arc::clone(&setup.spool);
+    let done = setup.deliver(&sink, OutboundTls::webpki()).await;
+    assert!(matches!(done.outcome, DeliveryOutcome::TempFail(_)));
+    assert!(
+        done.detail().contains(
+            "policy require_tls for example.test requires TLS with mx.example.test: STARTTLS not offered"
+        ),
+        "{}",
+        done.detail()
+    );
+    assert!(sink.drain().await.iter().all(|s| !s.sent_mail()));
+    let deferred = spool.list(SpoolState::Deferred).await.unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert!(deferred[0].rcpt_status[0]
+        .detail
+        .contains("STARTTLS not offered"));
+}
+
+#[tokio::test]
+async fn policy_require_tls_delivers_over_verified_tls() {
+    let pki = Pki::new();
+    let mut sink = sink(Some(pki.leaf(MX))).await;
+    let mut setup = setup().await;
+    setup.tls = TlsRequirement::Required;
+    let done = setup.deliver(&sink, pki.roots()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    let session = sink.next().await;
+    assert!(session.tls && session.sent_mail());
+}
+
+#[tokio::test]
+async fn policy_require_tls_refuses_unverified_certificates() {
+    let pki = Pki::new();
+    let mut sink = sink(Some(Identity::self_signed(MX))).await;
+    let mut setup = setup().await;
+    setup.tls = TlsRequirement::Required;
+    let done = setup.deliver(&sink, pki.roots()).await;
+    assert!(
+        done.detail()
+            .contains("policy require_tls for example.test"),
+        "{}",
+        done.detail()
+    );
+    // Opportunistic delivery would retry in clear text; require_tls must not.
+    assert!(sink.drain().await.iter().all(|s| !s.sent_mail()));
+}
+
+#[tokio::test]
+async fn policy_require_tls_overrides_mta_sts_testing() {
+    let pki = Pki::new();
+    let mut sink = sink(Some(Identity::self_signed(MX))).await;
+    let mut setup = setup().await;
+    setup.sts(policy("testing", MX));
+    setup.tls = TlsRequirement::Required;
+    let done = setup.deliver(&sink, pki.roots()).await;
+    assert!(matches!(done.outcome, DeliveryOutcome::TempFail(_)));
+    assert!(sink.drain().await.iter().all(|s| !s.sent_mail()));
+}
+
+#[tokio::test]
+async fn policy_require_dane_defers_without_tlsa() {
+    let pki = Pki::new();
+    let mut sink = sink(Some(pki.leaf(MX))).await;
+    let mut setup = setup().await;
+    setup.tls = TlsRequirement::Dane;
+    let done = setup.deliver(&sink, pki.roots()).await;
+    assert!(
+        done.detail().contains(
+            "policy require_dane for example.test: mx.example.test cannot be verified with DANE"
+        ),
+        "{}",
+        done.detail()
+    );
+    assert!(sink.drain().await.is_empty());
+}
+
+#[tokio::test]
+async fn policy_require_dane_delivers_with_a_tlsa_match() {
+    let identity = Identity::self_signed(MX);
+    let record = tlsa(3, 1, identity.spki_sha256());
+    let mut sink = sink(Some(identity)).await;
+    let mut setup = setup().await;
+    setup.dane(vec![record]);
+    setup.tls = TlsRequirement::Dane;
+    let done = setup.deliver(&sink, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    assert!(sink.next().await.tls);
 }

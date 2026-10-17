@@ -366,6 +366,7 @@ async fn deliver_report(
             rcpt_status: Vec::new(),
             prepend_headers: Vec::new(),
             dsn_sent: true,
+            tls: Default::default(),
             pipeline: "pending".into(),
         };
         spool

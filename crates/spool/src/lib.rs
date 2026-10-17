@@ -10,7 +10,7 @@
 //!   (before the 250) can leave a JSON with no eml, never an eml with no JSON.
 //! - `transition` writes the destination JSON before moving the eml and only
 //!   removes the source JSON afterwards, so every step leaves a complete pair.
-use currawong_core::{Direction, MessageId};
+use currawong_core::{Direction, MessageId, TlsRequirement};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeSet,
@@ -112,6 +112,9 @@ pub struct Envelope {
     pub prepend_headers: Vec<String>,
     #[serde(default)]
     pub dsn_sent: bool,
+    /// Transport security policy asked for. Copies split from this message keep it.
+    #[serde(default)]
+    pub tls: TlsRequirement,
     /// `pending`, `deliver`, `quarantine` or `scan_defer`. Missing on old
     /// envelopes means the pipeline has not run.
     #[serde(default = "default_pipeline")]

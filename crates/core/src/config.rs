@@ -40,6 +40,7 @@ pub struct Config {
     pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
     pub dlp: DlpProfile,
+    pub encrypt: EncryptConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -427,6 +428,56 @@ pub struct ClassifyConfig {
     pub allowed_domains: Vec<String>,
 }
 
+/// `[encrypt]`: the `encrypt`, `encrypt_smime` and `encrypt_portal` policy
+/// actions. Mail a policy asks to encrypt is never delivered in clear: when
+/// it cannot be encrypted it is quarantined.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EncryptConfig {
+    /// Recipient certificates for S/MIME, one `<address>.pem` per recipient
+    /// (address in lower case). Unset means no recipient has a known certificate.
+    pub smime_certs_dir: Option<PathBuf>,
+    pub portal: PortalConfig,
+}
+
+/// Secure pull portal: the message is held encrypted and the recipient gets
+/// a link; opening it takes a one-time code mailed to the same address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PortalConfig {
+    pub enabled: bool,
+    /// Where held messages are stored, sealed with AES-256-GCM.
+    pub dir: PathBuf,
+    /// 32-byte key file, created (mode 0600) on first start. Back it up:
+    /// held messages cannot be opened without it.
+    pub key_path: PathBuf,
+    /// Plain HTTP; run it behind the TLS proxy that serves `base_url`.
+    pub listen: String,
+    /// Public `https://` address of the portal, used in links.
+    pub base_url: String,
+    /// Sender of the notice and code mail. Empty means `postmaster@<gateway.hostname>`.
+    pub from: String,
+    /// Days a held message can be opened.
+    pub retention_days: u64,
+    /// Code requests and code attempts per minute from one client address.
+    pub requests_per_minute: u32,
+}
+
+impl Default for PortalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dir: PathBuf::from("/var/lib/currawong/portal"),
+            key_path: PathBuf::from("/etc/currawong/portal.key"),
+            listen: "127.0.0.1:8026".into(),
+            base_url: String::new(),
+            from: String::new(),
+            retention_days: 30,
+            requests_per_minute: 10,
+        }
+    }
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -693,6 +744,7 @@ impl Default for Config {
             classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
             dlp: DlpProfile::default(),
+            encrypt: EncryptConfig::default(),
         }
     }
 }
@@ -795,6 +847,26 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
             ));
+        }
+        let portal = &self.encrypt.portal;
+        if portal.enabled {
+            if !portal.base_url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "encrypt.portal.base_url must be an https:// address".into(),
+                ));
+            }
+            if portal.listen.parse::<SocketAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "encrypt.portal.listen '{}' is not a socket address",
+                    portal.listen
+                )));
+            }
+            if portal.retention_days == 0 || portal.requests_per_minute == 0 {
+                return Err(ConfigError::Invalid(
+                    "encrypt.portal.retention_days and requests_per_minute must be at least 1"
+                        .into(),
+                ));
+            }
         }
         if self.limits.max_connections == 0 {
             return Err(ConfigError::Invalid(

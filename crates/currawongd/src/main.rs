@@ -1,7 +1,9 @@
 //! currawongd: SMTP listeners, the scan pipeline and outbound delivery.
 use clap::Parser;
+use currawong_admin::routes::portal::PortalState;
 use currawong_auth::{AuthChecker, DmarcEventStore};
 use currawong_core::residency::ResidencyGuard;
+use currawong_dlp::encrypt::PortalStore;
 use currawong_smtp::{
     checks::CheckStack, delivery::Deliverer, dns::HickoryDns, limits::ConnectionLimits,
     relay::Relay, server::SmtpServer, session::SessionContext, tls::TlsManager,
@@ -9,8 +11,8 @@ use currawong_smtp::{
 use currawong_spool::Spool;
 use currawongd::{
     check_config, checks_for, classify_pending, report_signing_key, residency_reports,
-    send_dmarc_reports, spool_depth, supervise, BimiWorker, Pipeline, ReportHealth, BIMI_QUEUE,
-    REPORT_CHECK,
+    send_dmarc_reports, spool_depth, supervise, BimiWorker, Pipeline, ReportHealth, SpoolMailer,
+    BIMI_QUEUE, REPORT_CHECK,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -144,6 +146,38 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         pipeline = pipeline.with_keys(keys);
     } else if cfg.dkim.sign_outbound || cfg.dkim.seal_arc {
         tracing::warn!(database = %cfg.dkim.database.display(), "no DKIM key store; outbound mail is not signed");
+    }
+    let portal = &cfg.encrypt.portal;
+    if portal.enabled {
+        let store = Arc::new(
+            PortalStore::open(&portal.dir, &portal.key_path, portal.retention_days)
+                .map_err(|err| err.to_string())?,
+        );
+        pipeline = pipeline.with_portal(Arc::clone(&store));
+        let mailer = Arc::new(SpoolMailer {
+            spool: Arc::clone(&spool),
+            cfg: Arc::clone(&cfg),
+        });
+        let state = PortalState::new(Arc::clone(&store), mailer, portal.requests_per_minute);
+        let listener = TcpListener::bind(&portal.listen)
+            .await
+            .map_err(|err| format!("encrypt.portal.listen {}: {err}", portal.listen))?;
+        tracing::info!(bind = %portal.listen, "encryption portal listening");
+        tokio::spawn(currawong_admin::routes::portal::serve(listener, state));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                tick.tick().await;
+                let store = Arc::clone(&store);
+                let now = time_now();
+                match tokio::task::spawn_blocking(move || store.purge_expired(now)).await {
+                    Ok(Ok(0)) => {}
+                    Ok(Ok(removed)) => tracing::info!(removed, "expired portal messages removed"),
+                    Ok(Err(err)) => tracing::warn!(%err, "portal purge failed"),
+                    Err(err) => tracing::warn!(%err, "portal purge failed"),
+                }
+            }
+        });
     }
     pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
@@ -353,4 +387,11 @@ async fn wait_for_signals(
         let _ = tokio::signal::ctrl_c().await;
         shutdown.cancel();
     }
+}
+
+fn time_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }

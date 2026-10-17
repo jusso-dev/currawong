@@ -11,6 +11,7 @@ use currawong_core::{
     config::{Config, TenantConfig},
     AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
+use currawong_dlp::encrypt::PortalStore;
 use currawong_parser::{parse::parse_bytes_with, text::DlpText, ParseResponse};
 use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
@@ -47,6 +48,9 @@ pub struct Pipeline {
     /// the classifier failed to load (`classify_error`, noted on each report).
     pub classifier: Option<Arc<Classifier>>,
     pub classify_error: Option<String>,
+    /// Secure portal for `encrypt` and `encrypt_portal`. `None` when
+    /// `encrypt.portal.enabled` is off: such mail is quarantined instead.
+    pub portal: Option<Arc<PortalStore>>,
 }
 
 impl Pipeline {
@@ -100,7 +104,13 @@ impl Pipeline {
             checks: None,
             classifier,
             classify_error,
+            portal: None,
         }
+    }
+
+    pub fn with_portal(mut self, portal: Arc<PortalStore>) -> Self {
+        self.portal = Some(portal);
+        self
     }
 
     pub fn with_checks(mut self, checks: Arc<CheckStack>) -> Self {
@@ -182,6 +192,12 @@ impl Pipeline {
             }
             return Ok(self.auth_headers(env, report));
         }
+        self.dkim_headers(env, raw).await
+    }
+
+    /// DKIM signatures for outbound `raw` with the tenant's active keys.
+    /// Empty when nothing is to be signed.
+    pub async fn dkim_headers(&self, env: &Envelope, raw: &[u8]) -> Result<Vec<String>, String> {
         let (Some(keys), Some(tenant), true) =
             (&self.keys, &env.tenant_id, self.cfg.dkim.sign_outbound)
         else {

@@ -142,8 +142,16 @@ pub enum Action {
     Banner(String),
     Redirect(String),
     Bcc(String),
+    /// S/MIME when every recipient's certificate is known, else the portal.
     Encrypt,
+    /// S/MIME only. A recipient without a known certificate is quarantined.
+    EncryptSmime,
+    /// Hold the message in the encrypted portal and send a link instead.
+    EncryptPortal,
+    /// Deliver only over STARTTLS with a verified certificate, else defer.
     RequireTls,
+    /// Deliver only over DANE-verified STARTTLS, else defer.
+    RequireDane,
 }
 
 fn default_reject_code() -> u16 {
@@ -324,10 +332,9 @@ impl Policy {
                 Action::Reject { code } if !(500..600).contains(code) => {
                     return bad(format!("reject code {code} must be 5xx"));
                 }
-                // Refused rather than silently ignored: delivery cannot carry these out yet,
-                // and accepting them would deliver mail the policy meant to protect.
-                Action::Banner(_) | Action::Encrypt | Action::RequireTls => {
-                    return bad("banner, encrypt and require_tls are not supported yet".into());
+                // Refused rather than silently ignored: delivery cannot carry it out yet.
+                Action::Banner(_) => {
+                    return bad("banner is not supported yet".into());
                 }
                 _ => {}
             }

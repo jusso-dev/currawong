@@ -377,6 +377,9 @@ fn describe(action: &Action) -> String {
         Action::Redirect(to) => format!("redirect to {to}"),
         Action::Bcc(to) => format!("bcc {to}"),
         Action::Encrypt => "encrypt".into(),
+        Action::EncryptSmime => "encrypt with S/MIME".into(),
+        Action::EncryptPortal => "encrypt to the portal".into(),
         Action::RequireTls => "require TLS".into(),
+        Action::RequireDane => "require DANE".into(),
     }
 }

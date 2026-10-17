@@ -736,6 +736,7 @@ async fn queued(spool: &Spool, from: &str, to: &str, body: &[u8]) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: Vec::new(),
         dsn_sent: false,
+        tls: Default::default(),
         pipeline: "deliver".into(),
     };
     spool

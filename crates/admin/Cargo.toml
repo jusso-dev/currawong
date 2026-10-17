@@ -6,3 +6,14 @@ license.workspace = true
 
 [dependencies]
 currawong-core = { path = "../core" }
+currawong-dlp = { path = "../dlp" }
+async-trait = { workspace = true }
+axum = { workspace = true }
+governor = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tower = { workspace = true }

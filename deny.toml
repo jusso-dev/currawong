@@ -5,8 +5,9 @@ all-features = false
 yanked = "warn"
 unmaintained = "none"
 ignore = [
-    # Key generation only, on the appliance. The rsa crate is not used to
-    # decrypt network traffic. Signing uses mail-auth's aws-lc backend.
+    # Key generation on the appliance, and S/MIME key transport with the
+    # recipient's public key. The rsa crate never decrypts or signs with a
+    # private key on network input. Signing uses mail-auth's aws-lc backend.
     "RUSTSEC-2023-0071",
     # wasmtime 45.0.3, pinned (^45) by yara-x 1.21, the latest yara-x. Fixes
     # exist in other wasmtime lines (46.0.x and 47.x for 0222 and 0269; all

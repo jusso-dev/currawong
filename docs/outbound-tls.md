@@ -18,6 +18,7 @@ Currawong picks the TLS rule for each MX host in this order.
    - Every clear-text delivery is logged at warning level and counted in `currawong_delivery_tls_fallback_total{reason}`. The reasons are `starttls_not_offered`, `starttls_refused`, `tls_failed` and `sts_testing`.
    - The message's `Received` header gains the comment `(relayed onward without TLS)`.
    - Set `delivery.require_tls = true` to defer instead. That setting also covers `domains.routes` next hops, which DANE and MTA-STS do not apply to.
+   - A policy can ask for the same per message with the `require_tls` action, or for DANE with `require_dane`. The stronger rule wins: `require_tls` also stops MTA-STS `testing` from falling back to clear text, and `require_dane` defers when the host has no DNSSEC-secure TLSA records.
 
 WebPKI roots are the Mozilla set shipped in `webpki-roots`.
 

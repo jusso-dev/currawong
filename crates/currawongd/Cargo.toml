@@ -15,6 +15,7 @@ currawong-parser-worker = { path = "../parser-worker" }
 currawong-policy = { path = "../policy" }
 currawong-quarantine = { path = "../quarantine" }
 currawong-dlp = { path = "../dlp" }
+currawong-admin = { path = "../admin" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -30,6 +31,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }
