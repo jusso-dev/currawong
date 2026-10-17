@@ -730,13 +730,13 @@ async fn queued(spool: &Spool, from: &str, to: &str, body: &[u8]) -> Envelope {
         attempts: 0,
         next_attempt_at: None,
         state: SpoolState::Incoming,
-        direction: Direction::Inbound,
+        direction: Direction::Outbound,
         tls_version: None,
         tls_cipher: None,
         rcpt_status: Vec::new(),
         prepend_headers: Vec::new(),
         dsn_sent: false,
-        pipeline: "pending".into(),
+        pipeline: "deliver".into(),
     };
     spool
         .accept(env.clone(), std::io::Cursor::new(body.to_vec()))

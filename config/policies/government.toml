@@ -1,0 +1,153 @@
+# Currawong government policy pack: the default pack plus PSPF protective
+# marking enforcement for Australian Government tenants. Use it with
+#
+#   [policy]
+#   pack = "/etc/currawong/policies/government.toml"
+#
+# It contains every default policy unchanged (a test checks this), so it
+# replaces the default pack rather than adding to it. See docs/pspf.md.
+#
+# Markings come from the X-Protective-Marking header (preferred) or the
+# [SEC=...] subject marking. Signals: `marking` / `marking_at_least`
+# conditions on the classification (the highest level found in the header
+# or any subject marking), and flags `pspf.invalid`, `pspf.mismatch`,
+# `pspf.missing`, `pspf.caveat.<caveat>` and `pspf.access.<marker>`.
+#
+# PROTECTED may only go to government domains. Add more allowed domains as
+# extra `not` conditions, for example `{ not = { recipient = "*@partner.example" } }`.
+# Requiring TLS for PROTECTED mail needs the require_tls action (#35);
+# until then, keep outbound TLS required for these domains in delivery config.
+
+[[policy]]
+id = "pspf-secret"
+priority = 5
+conditions = [{ direction = "outbound" }, { marking_at_least = "SECRET" }]
+actions = [{ reject = { code = 550 } }]
+
+[[policy]]
+id = "pspf-protected-external"
+priority = 6
+conditions = [
+    { direction = "outbound" },
+    { marking_at_least = "PROTECTED" },
+    { not = { recipient = "*@*.gov.au" } },
+]
+actions = [{ reject = { code = 550 } }]
+
+[[policy]]
+id = "pspf-invalid"
+priority = 7
+conditions = [{ direction = "outbound" }, { flag = "pspf.invalid" }]
+actions = [{ quarantine = "pspf" }]
+
+[[policy]]
+id = "pspf-mismatch"
+priority = 8
+conditions = [{ direction = "outbound" }, { flag = "pspf.mismatch" }]
+actions = [{ quarantine = "pspf" }]
+
+# Government tenants must mark outbound mail. Unmarked mail is held.
+# To stamp OFFICIAL on unmarked mail instead, disable this policy and enable
+# pspf-default-marking below.
+[[policy]]
+id = "pspf-required"
+priority = 9
+conditions = [{ direction = "outbound" }, { flag = "pspf.missing" }]
+actions = [{ quarantine = "pspf" }]
+
+# Alternative to pspf-required: mark unmarked outbound mail OFFICIAL.
+[[policy]]
+id = "pspf-default-marking"
+priority = 90
+enabled = false
+conditions = [{ direction = "outbound" }, { flag = "pspf.missing" }]
+actions = [{ add_header = { name = "X-Protective-Marking", value = "VER=2018.6, NS=gov.au, SEC=OFFICIAL" } }]
+
+# ---- Default pack policies (keep identical to default.toml) ----
+
+[[policy]]
+id = "active-content"
+priority = 30
+conditions = [{ flag = "active_content" }]
+actions = [{ quarantine = "active-content" }]
+
+[[policy]]
+id = "dmarc-reject"
+priority = 50
+conditions = [
+    { auth = { method = "dmarc", result = "fail" } },
+    { auth = { method = "dmarc_policy", result = "reject" } },
+]
+actions = [{ quarantine = "spoofing" }]
+
+# Australian identifiers in outbound mail (`[dlp]` in the main config). Counts
+# are distinct identifiers at or above `dlp.min_confidence`. ABNs and ACNs are
+# on public registers, so they are counted (`dlp.abn`, `dlp.acn`) but not held.
+# `dlp.incomplete` means some text could not be scanned (too large, a document
+# that failed to parse, or documents outside the parser worker).
+[[policy]]
+id = "dlp-tfn"
+priority = 40
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.tfn", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-medicare"
+priority = 41
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.medicare", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-card"
+priority = 42
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.card", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-driver-licence"
+priority = 43
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.driver_licence", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-incomplete"
+priority = 44
+conditions = [{ direction = "outbound" }, { flag = "dlp.incomplete" }]
+actions = [{ quarantine = "dlp" }]
+
+# Business email compromise: impersonated staff, look-alike senders,
+# diverted replies and payment or gift-card requests (inbound only).
+[[policy]]
+id = "bec-quarantine"
+priority = 55
+conditions = [{ direction = "inbound" }, { score = { name = "bec", at_least = 0.6 } }]
+actions = [{ quarantine = "bec" }]
+
+# Below the quarantine score, a borrowed colleague's name is still marked so
+# mail clients and transport rules can warn the reader.
+[[policy]]
+id = "bec-warn"
+priority = 56
+conditions = [{ direction = "inbound" }, { flag = "bec.display_name_spoof" }]
+actions = [{ add_header = { name = "X-Currawong-Warning", value = "possible impersonation of a colleague" } }]
+
+[[policy]]
+id = "spam-quarantine"
+priority = 60
+conditions = [{ score = { name = "spam", at_least = 8.0 } }]
+actions = [{ quarantine = "spam" }]
+
+# Subject rewriting needs a body rewrite the spool does not do yet, so the
+# [SPAM] tag is carried in a header that mail clients can filter on.
+[[policy]]
+id = "spam-tag"
+priority = 70
+conditions = [{ score = { name = "spam", at_least = 5.0, below = 8.0 } }]
+actions = [{ add_header = { name = "X-Currawong-Spam", value = "[SPAM]" } }]
+
+# Links left without a click-time check (see the default pack).
+[[policy]]
+id = "url-rewrite-skipped"
+priority = 80
+conditions = [{ direction = "inbound" }, { flag = "url_rewrite.skipped" }]
+actions = [{ add_header = { name = "X-Currawong-Links", value = "not-rewritten" } }]

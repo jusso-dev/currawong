@@ -30,6 +30,10 @@ struct Plan {
     /// bytes, which the headers above were computed over.
     #[serde(default)]
     rewritten: bool,
+    /// The authenticated From address to remember once the message is
+    /// delivered, for BEC first-time sender checks.
+    #[serde(default)]
+    history_sender: Option<String>,
 }
 
 /// One failing message is logged and skipped; it does not stall the rest.
@@ -96,13 +100,13 @@ async fn classify_one(
     let mut bimi_auth = None;
     // The body delivered copies get when links were rewritten. Quarantine
     // and bounces keep the original.
-    let mut delivered = None;
+    let mut rewritten_body = None;
     let plan = match tokio::fs::read(&plan_path).await {
         Ok(bytes) => {
             let plan: Plan = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
             if plan.rewritten {
                 let mut report = ScanReport::new(env.id.clone());
-                delivered = pipeline.rewrite_urls(&env, &raw, &mut report).await;
+                rewritten_body = pipeline.rewrite_urls(&env, &raw, &mut report).await;
             }
             plan
         }
@@ -121,13 +125,13 @@ async fn classify_one(
                 .flatten()
                 .any(|d| matches!(d.verdict, Verdict::Deliver));
             if delivers {
-                delivered = rewritten;
+                rewritten_body = rewritten;
             }
             let headers = if !delivers {
                 pipeline.auth_headers(&env, &report)
             } else {
                 match pipeline
-                    .delivery_headers_for(&env, &raw, delivered.as_deref(), &report)
+                    .delivery_headers_for(&env, &raw, rewritten_body.as_deref(), &report)
                     .await
                 {
                     Ok(headers) => headers,
@@ -148,8 +152,9 @@ async fn classify_one(
             let plan = Plan {
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
+                history_sender: pipeline.history_sender(&env, &raw, &report),
                 groups,
-                rewritten: delivered.is_some(),
+                rewritten: rewritten_body.is_some(),
             };
             if plan.groups.len() > 1 {
                 write_atomic(
@@ -161,6 +166,17 @@ async fn classify_one(
             plan
         }
     };
+    let delivered: Vec<String> = plan
+        .groups
+        .iter()
+        .flatten()
+        .filter(|d| matches!(d.verdict, Verdict::Deliver))
+        .map(|d| d.recipient.clone())
+        .collect();
+    let history = plan
+        .history_sender
+        .clone()
+        .map(|sender| (env.clone(), sender));
     let cfg = &pipeline.cfg;
     if plan.groups.len() > 1 {
         // Copies get ids derived from the original and their recipients, so a
@@ -181,7 +197,7 @@ async fn classify_one(
             copy.pipeline = "pending".into();
             narrow(&mut copy, &rcpts);
             tracing::info!(id = %env.id, split = %copy.id, "recipients differ, message split");
-            let body = match (&delivered, &group[0].verdict) {
+            let body = match (&rewritten_body, &group[0].verdict) {
                 (Some(rewritten), Verdict::Deliver) => rewritten.clone(),
                 _ => raw.clone(),
             };
@@ -198,7 +214,7 @@ async fn classify_one(
     }
     let id = env.id.clone();
     let quarantined = matches!(plan.groups[0][0].verdict, Verdict::Quarantine { .. });
-    let rewritten = delivered.as_deref();
+    let rewritten = rewritten_body.as_deref();
     act(
         spool,
         quarantine,
@@ -212,6 +228,10 @@ async fn classify_one(
     .await?;
     if let (true, Some(auth)) = (quarantined, bimi_auth) {
         pipeline.queue_bimi(id, auth);
+    }
+    // Only once the message was handed to delivery.
+    if let Some((env, sender)) = history {
+        pipeline.record_delivery(&env, &sender, delivered).await;
     }
     Ok(())
 }
@@ -301,7 +321,7 @@ async fn act(
             if plan.bounce && !env.dsn_sent {
                 let dsn = bounce(&env, cfg);
                 if spool.load(&dsn.id).await.is_err() {
-                    let body = build_dsn(&cfg.gateway.hostname, &env, raw, &detail);
+                    let body = build_dsn(&cfg.gateway.hostname, &env, raw, &env.rcpt_status);
                     spool
                         .accept(dsn, Cursor::new(body))
                         .await

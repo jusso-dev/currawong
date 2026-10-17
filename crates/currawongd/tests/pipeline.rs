@@ -342,6 +342,47 @@ async fn pending_mail_is_not_marked_deliver_before_the_pipeline() {
     assert!(listed.iter().all(ready_to_deliver), "{listed:?}");
 }
 
+#[tokio::test]
+async fn one_unreadable_message_does_not_block_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    let spool = Arc::new(Spool::open(&cfg.spool.dir).await.unwrap());
+    // Eight unreadable and eight good messages, interleaved by id. Stopping
+    // at the first failure could only classify every good one if the spool
+    // happened to list all eight before all the bad ones (1 order in 12,870),
+    // so the result does not rest on directory order.
+    let mut good = Vec::new();
+    for n in 0..16 {
+        let mut env = envelope("user@example.test");
+        env.id = currawong_core::MessageId(format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}"));
+        spool
+            .accept(env.clone(), Cursor::new(text_message()))
+            .await
+            .unwrap();
+        if n % 2 == 0 {
+            // The body vanishes, so reading it fails for this message.
+            let eml = spool
+                .root()
+                .join("incoming")
+                .join(format!("{}.eml", env.id));
+            std::fs::remove_file(eml).unwrap();
+        } else {
+            good.push(env.id);
+        }
+    }
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let quarantine = QuarantineStore::open(dir.path().join("held")).unwrap();
+    classify_pending(&spool, &mut pipeline, &quarantine)
+        .await
+        .unwrap();
+    for id in good {
+        assert!(ready_to_deliver(&spool.load(&id).await.unwrap()), "{id}");
+    }
+}
+
 #[test]
 fn example_config_checks_and_foreign_bucket_fails() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -568,7 +609,8 @@ async fn yara_matches_reach_the_report_and_policy() {
     assert!(report.engines.iter().any(|f| f.engine == "yara"));
     assert!(matches!(verdict, Verdict::Quarantine { reason } if reason == "malware"));
 
-    // A `bec` match is recorded for policy and does not quarantine by itself.
+    // A `bec` YARA match is recorded for policy and is not malware. The BEC
+    // classifier (not the YARA tag) holds this bank-detail change.
     let bec = b"From: a@example.test\r\nTo: b@example.test\r\nSubject: invoice\r\n\r\nPlease note our change of bank details. BSB 000-000.\r\n";
     let (report, verdict) = pipeline.evaluate(&env, bec, None).await;
     let hit = report
@@ -578,7 +620,10 @@ async fn yara_matches_reach_the_report_and_policy() {
         .expect("bec rule matched");
     assert_eq!(hit.tags, vec!["bec".to_string()]);
     assert!(!report.malware && !report.active_content, "{report:?}");
-    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "bec-quarantine"),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -728,4 +773,177 @@ async fn outbound_user_policy_matches_only_the_logged_in_user() {
         vec![true, false, false],
         "only ada's login matches; bob sending as ada and trusted relay do not"
     );
+}
+
+fn marked_message(header: Option<&str>, subject: &str, to: &str) -> Vec<u8> {
+    let header = header
+        .map(|value| format!("X-Protective-Marking: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "From: officer@agency.gov.au\r\nTo: {to}\r\n{header}Subject: {subject}\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\nbriefing\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn pspf_outbound_protected_to_gmail_is_blocked_under_the_government_pack() {
+    let mut cfg = Config::default();
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.policy.pack = Some(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/policies/government.toml"),
+    );
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "agency.gov.au", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg.clone()), auth);
+    pipeline.policies = currawong_policy::load_pack(&cfg.policy).unwrap();
+    let protected = "VER=2018.6, NS=gov.au, SEC=PROTECTED, ORIGIN=officer@agency.gov.au";
+    let send = |to: &str| {
+        let mut env = envelope("officer@agency.gov.au");
+        env.direction = Direction::Outbound;
+        env.rcpt_to = vec![to.into()];
+        env
+    };
+
+    let to_gmail = send("someone@gmail.com");
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "someone@gmail.com",
+    );
+    let (report, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    let marking = report.marking.as_ref().unwrap();
+    assert_eq!(
+        marking.classification,
+        Some(currawong_core::Classification::Protected)
+    );
+    assert!(
+        matches!(&verdict, Verdict::Reject { reason, .. } if reason == "pspf-protected-external"),
+        "{verdict:?}"
+    );
+
+    // The same message to a government domain is delivered.
+    let to_gov = send("officer@finance.gov.au");
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "officer@finance.gov.au",
+    );
+    let (_, verdict) = pipeline.evaluate(&to_gov, &raw, None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+
+    // A PROTECTED header under an OFFICIAL subject is a mismatch and held.
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=OFFICIAL]",
+        "officer@finance.gov.au",
+    );
+    let (report, verdict) = pipeline.evaluate(&to_gov, &raw, None).await;
+    assert!(report.marking.as_ref().unwrap().mismatch);
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "pspf-mismatch"),
+        "{verdict:?}"
+    );
+
+    // Subject-only PROTECTED marking still blocks external mail.
+    let raw = marked_message(None, "Brief [SEC=PROTECTED]", "someone@gmail.com");
+    let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    assert!(matches!(verdict, Verdict::Reject { .. }), "{verdict:?}");
+
+    // Government tenants must mark outbound mail: unmarked mail is held.
+    let raw = marked_message(None, "Lunch", "someone@gmail.com");
+    let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "pspf-required"),
+        "{verdict:?}"
+    );
+
+    // Mixed recipients are decided one by one: gov.au delivers, gmail is refused.
+    let mut mixed = send("officer@finance.gov.au");
+    mixed.rcpt_to.push("someone@gmail.com".into());
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "officer@finance.gov.au",
+    );
+    let (_, decision) = pipeline.assess(&mixed, &raw, None).await;
+    let verdicts: Vec<(String, bool)> = decision
+        .decisions
+        .iter()
+        .map(|d| (d.recipient.clone(), matches!(d.verdict, Verdict::Deliver)))
+        .collect();
+    assert!(
+        verdicts.contains(&("officer@finance.gov.au".into(), true)),
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts.contains(&("someone@gmail.com".into(), false)),
+        "{verdicts:?}"
+    );
+}
+
+#[tokio::test]
+async fn bec_inbound_spoof_is_quarantined_and_a_weak_one_marked_through_the_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().join("directory.csv");
+    std::fs::write(
+        &directory,
+        "email,name,vip\njane.smith@acme.test,Jane Smith,true\nbob@acme.test,Bob Jones,false\n",
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.enabled = false;
+    cfg.classify.bayes_database = dir.path().join("bayes.sqlite");
+    cfg.classify.history_database = dir.path().join("history.sqlite");
+    cfg.classify.directory_csv = Some(directory);
+    cfg.domains.accept = vec!["acme.test".into()];
+    cfg.relay
+        .tenants
+        .push(currawong_core::config::TenantConfig {
+            id: "acme".into(),
+            domains: vec!["acme.test".into()],
+            trusted_cidrs: Vec::new(),
+        });
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let mut env = envelope("someone@gmail.com");
+    env.rcpt_to = vec!["finance@acme.test".into()];
+
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/bec/ceo-gift-cards.eml"
+    ))
+    .unwrap();
+    let (report, verdict) = pipeline.evaluate(&env, &raw, None).await;
+    let bec = report.bec.as_ref().expect("inbound mail is scored");
+    assert!(bec
+        .reasons
+        .contains(&currawong_core::BecReason::DisplayNameSpoof));
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "bec-quarantine"),
+        "{verdict:?}"
+    );
+
+    // A non-VIP colleague's name with no request is marked, not held.
+    let raw = b"From: \"Bob Jones\" <bob.jones.home@gmail.com>\r\nTo: finance@acme.test\r\nSubject: hi\r\n\r\nSee you soon.\r\n";
+    let (_, decision) = pipeline.assess(&env, raw, None).await;
+    let d = &decision.decisions[0];
+    assert!(matches!(d.verdict, Verdict::Deliver), "{:?}", d.verdict);
+    assert!(
+        d.actions.iter().any(|a| matches!(a, currawong_policy::Action::AddHeader { name, .. } if name == "X-Currawong-Warning")),
+        "{:?}",
+        d.actions
+    );
+
+    // Unauthenticated mail is never remembered as a known sender.
+    assert_eq!(pipeline.history_sender(&env, raw, &report), None);
+
+    // Outbound mail is not BEC-scored.
+    let mut outbound = env.clone();
+    outbound.direction = Direction::Outbound;
+    let (report, _) = pipeline.evaluate(&outbound, raw, None).await;
+    assert!(report.bec.is_none());
 }

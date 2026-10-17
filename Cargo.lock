@@ -1154,6 +1154,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-security",
  "url",
 ]
 
@@ -1162,6 +1163,7 @@ name = "currawong-dlp"
 version = "0.0.1"
 dependencies = [
  "currawong-core",
+ "mail-parser",
  "serde_json",
 ]
 
@@ -1327,15 +1329,18 @@ dependencies = [
  "hickory-resolver",
  "ipnet",
  "libc",
+ "mail-auth",
  "mail-builder 0.4.4",
  "mail-send",
  "metrics",
  "pin-project-lite",
  "rand 0.8.8",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",
@@ -1346,6 +1351,9 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "ulid",
+ "url",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -1,0 +1,132 @@
+# Business email compromise lexicon (Australian English). Each phrase is
+# matched case-insensitively on word boundaries in the subject and body.
+# Text and phrases are folded first (lower case, confusables mapped,
+# punctuation and line breaks become single spaces), so `Gift-Cards` and a
+# hard-wrapped `new bank\n details` still match.
+# category: payment_change, invoice, gift_card, urgency, secrecy.
+# payment_change counts with bank details (BSB or account number), a second
+# payment_change phrase, or an invoice phrase. invoice alone never counts.
+
+[[phrase]]
+text = "change of bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "bank details have changed"
+category = "payment_change"
+
+[[phrase]]
+text = "new bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "updated bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "new account details"
+category = "payment_change"
+
+[[phrase]]
+text = "changed our bank"
+category = "payment_change"
+
+[[phrase]]
+text = "update your records"
+category = "payment_change"
+
+[[phrase]]
+text = "remittance advice"
+category = "invoice"
+
+[[phrase]]
+text = "outstanding invoice"
+category = "invoice"
+
+[[phrase]]
+text = "gift card"
+category = "gift_card"
+
+[[phrase]]
+text = "gift cards"
+category = "gift_card"
+
+[[phrase]]
+text = "itunes card"
+category = "gift_card"
+
+[[phrase]]
+text = "google play card"
+category = "gift_card"
+
+[[phrase]]
+text = "scratch the back"
+category = "gift_card"
+
+[[phrase]]
+text = "urgent"
+category = "urgency"
+
+[[phrase]]
+text = "urgently"
+category = "urgency"
+
+[[phrase]]
+text = "as soon as possible"
+category = "urgency"
+
+[[phrase]]
+text = "today before"
+category = "urgency"
+
+[[phrase]]
+text = "are you at your desk"
+category = "urgency"
+
+[[phrase]]
+text = "keep this confidential"
+category = "secrecy"
+
+[[phrase]]
+text = "keep this between us"
+category = "secrecy"
+
+[[phrase]]
+text = "do not tell"
+category = "secrecy"
+
+[[phrase]]
+text = "don't call"
+category = "secrecy"
+
+[[phrase]]
+text = "in a meeting"
+category = "secrecy"
+
+[[phrase]]
+text = "giftcard"
+category = "gift_card"
+
+[[phrase]]
+text = "giftcards"
+category = "gift_card"
+
+[[phrase]]
+text = "gift voucher"
+category = "gift_card"
+
+[[phrase]]
+text = "gift vouchers"
+category = "gift_card"
+
+[[phrase]]
+text = "change of account details"
+category = "payment_change"
+
+[[phrase]]
+text = "new banking details"
+category = "payment_change"
+
+[[phrase]]
+text = "payment details have changed"
+category = "payment_change"

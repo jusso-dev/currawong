@@ -33,8 +33,13 @@ pub struct MessageView {
     /// Header names and decoded values (RFC 2047), in message order.
     pub headers: Vec<(String, String)>,
     pub from: Vec<String>,
+    /// Display names on From, decoded, in the same order as `from`.
+    pub from_names: Vec<String>,
     pub reply_to: Vec<String>,
     pub body: String,
+    /// The last `MAX_BODY_CHARS` of the text when the body is longer, so
+    /// padding cannot push a request out of view. Empty otherwise.
+    pub body_tail: String,
     pub urls: Vec<String>,
     /// Hosts of every link in the text and HTML bodies, first seen first.
     pub hosts: Vec<String>,
@@ -128,6 +133,7 @@ impl MessageView {
             }
         }
         let mut body = link_text.clone();
+        let body_tail = tail(&link_text, MAX_BODY_CHARS);
         truncate(&mut body, MAX_BODY_CHARS);
         for part in message.html_bodies() {
             if let Some(text) = part.text_contents() {
@@ -142,8 +148,22 @@ impl MessageView {
         Some(Self {
             headers,
             from: addresses(message.from()),
+            from_names: message
+                .from()
+                .map(|list| {
+                    list.iter()
+                        .filter(|addr| addr.address().is_some())
+                        .map(|addr| {
+                            let mut name = addr.name().unwrap_or_default().to_string();
+                            truncate(&mut name, MAX_HEADER_CHARS);
+                            name
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             reply_to: addresses(message.reply_to()),
             body,
+            body_tail,
             urls,
             hosts,
             truncated: false,
@@ -160,6 +180,18 @@ impl MessageView {
             .filter(move |(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
+}
+
+/// The first From address of a raw message, from its headers only.
+pub fn from_address(raw: &[u8]) -> Option<String> {
+    let head = &raw[..raw.len().min(MAX_RAW_BYTES)];
+    let message = MessageParser::new().parse_headers(head)?;
+    let found = message
+        .from()?
+        .iter()
+        .find_map(|addr| addr.address())
+        .map(|address| address.to_ascii_lowercase());
+    found
 }
 
 /// The domain of an address, without a trailing `>` or dot.
@@ -226,6 +258,17 @@ pub fn too_nested(raw: &[u8]) -> bool {
     let multipart = MULTIPART.get_or_init(|| BytesRegex::new(r"(?i)multipart/").expect("regex"));
     embedded.find_iter(raw).nth(MAX_EMBEDDED_MESSAGES).is_some()
         || multipart.find_iter(raw).nth(MAX_MULTIPARTS).is_some()
+}
+
+fn tail(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return String::new();
+    }
+    let mut start = text.len() - max;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    text[start..].to_string()
 }
 
 fn truncate(text: &mut String, max: usize) {
