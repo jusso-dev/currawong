@@ -89,8 +89,10 @@ async fn spam_released_from_a_digest_link_is_delivered_and_audited() {
     let mx = sink(tx).await;
     let mut cfg = Config::default();
     cfg.spool.dir = dir.path().join("spool");
+    // The quarantine comes from policy; scanning is not under test here.
+    cfg.scanner.enabled = false;
     cfg.scanner.clamd.address.clear();
-    cfg.scanner.worker_binary = None;
+    cfg.scanner.clamd.required = false;
     cfg.gateway.hostname = "mx.example.test".into();
     cfg.domains.accept = vec!["example.test".into()];
     cfg.domains.routes = vec![DomainRoute {

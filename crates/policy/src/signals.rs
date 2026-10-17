@@ -150,5 +150,6 @@ fn part_flag(flag: PartFlag) -> &'static str {
         PartFlag::HasOleObject => "has_ole_object",
         PartFlag::Executable => "executable",
         PartFlag::LimitExceeded => "limit_exceeded",
+        PartFlag::Unscannable => "unscannable",
     }
 }

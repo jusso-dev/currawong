@@ -8,12 +8,14 @@ mod scheduler;
 
 pub use dmarc::{is_public, send_dmarc_reports, supervise, BimiJob, BimiWorker, BIMI_QUEUE};
 
-pub use health::{checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable};
+pub use health::{
+    checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable, WorkerReady,
+};
 pub use periodic::{
     config_digest, prune_reports, record_spool_depth, report_due, report_signing_key, report_tick,
     residency_reports, spool_depth, write_report, LastReport, ReportHealth, REPORT_CHECK,
 };
-pub use pipeline::Pipeline;
+pub use pipeline::{worker_binary, worker_pool, Pipeline};
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};
 
 use currawong_core::{config::Config, residency::ResidencyGuard, Config as CoreConfig};
@@ -25,6 +27,7 @@ use std::{path::Path, sync::Arc};
 pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     let cfg = Config::load(path).map_err(|err| err.to_string())?;
     cfg.validate().map_err(|err| err.to_string())?;
+    cfg.check_clamd().map_err(|err| err.to_string())?;
     if cfg.classify.enabled {
         currawong_classify::check_config(&cfg.classify).map_err(|err| err.to_string())?;
     }

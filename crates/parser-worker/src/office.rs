@@ -32,7 +32,9 @@ pub fn ooxml_macro_bytes(bytes: &[u8]) -> bool {
     let mut names = Vec::new();
     for index in 0..archive.len() {
         if let Ok(file) = archive.by_index(index) {
-            names.push(file.name().to_string());
+            if let Ok(name) = file.name() {
+                names.push(name.to_string());
+            }
         }
     }
     ooxml_macro(&names)
@@ -45,17 +47,12 @@ pub fn ooxml_macro(names: &[String]) -> bool {
     })
 }
 
+/// Any `\obj...` control word (`\object`, `\objdata`, `\objemb` and so
+/// on), anywhere in the document. Padding does not hide it.
 pub fn rtf_has_object(bytes: &[u8]) -> bool {
-    let lower: Vec<u8> = bytes
-        .iter()
-        .take(1024 * 1024)
-        .map(|b| b.to_ascii_lowercase())
-        .collect();
-    contains_token(&lower, br"\object") || contains_token(&lower, br"\objdata")
-}
-
-fn contains_token(hay: &[u8], needle: &[u8]) -> bool {
-    hay.windows(needle.len()).any(|window| window == needle)
+    bytes
+        .windows(4)
+        .any(|window| window.eq_ignore_ascii_case(br"\obj"))
 }
 
 /// Tokens from the same message, bounded. Used only as candidate archive

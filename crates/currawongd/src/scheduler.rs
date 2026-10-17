@@ -4,6 +4,7 @@ use currawong_policy::{canonical_domain, Action, Decision};
 use currawong_quarantine::{Hold, QuarantineStore, RELEASE_HAM_PIPELINE, RELEASE_PIPELINE};
 use currawong_smtp::delivery::{build_dsn, is_null_sender};
 use currawong_spool::{Envelope, RcptStatus, Spool, SpoolState};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::PathBuf};
@@ -36,11 +37,13 @@ struct Plan {
 }
 
 /// One failing message is logged and skipped; it does not stall the rest.
+/// Up to `scanner.worker_pool_size` messages are classified at once.
 pub async fn classify_pending(
     spool: &Spool,
     pipeline: &mut Pipeline,
     quarantine: &QuarantineStore,
 ) -> Result<(), String> {
+    let pipeline = &*pipeline;
     let incoming = spool
         .list(SpoolState::Incoming)
         .await
@@ -63,15 +66,16 @@ pub async fn classify_pending(
                     env
                 }),
         );
-    let mut released = Vec::new();
-    for env in due {
-        let id = env.id.clone();
-        if is_release(&env) {
-            released.push(env);
-        } else if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
-            tracing::error!(%id, %err, "classification failed");
-        }
-    }
+    let (released, due): (Vec<_>, Vec<_>) = due.partition(is_release);
+    let parallel = pipeline.cfg.scanner.worker_pool_size.max(1);
+    futures::stream::iter(due)
+        .for_each_concurrent(parallel, |env| async move {
+            let id = env.id.clone();
+            if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
+                tracing::error!(%id, %err, "classification failed");
+            }
+        })
+        .await;
     for env in released {
         let id = env.id.clone();
         if let Err(err) = deliver_released(spool, pipeline, env).await {
@@ -115,7 +119,7 @@ async fn deliver_released(
 
 async fn classify_one(
     spool: &Spool,
-    pipeline: &mut Pipeline,
+    pipeline: &Pipeline,
     quarantine: &QuarantineStore,
     mut env: Envelope,
 ) -> Result<(), String> {
@@ -254,7 +258,18 @@ async fn act(
                 .map_err(|err| err.to_string())
         }
     };
-    match &decision.verdict {
+    // A message the scanner keeps deferring is held rather than retried forever.
+    let capped;
+    let verdict = match &decision.verdict {
+        Verdict::Defer { reason } if env.attempts >= cfg.scanner.max_scan_deferrals => {
+            capped = Verdict::Quarantine {
+                reason: format!("scan deferred {} times: {reason}", env.attempts),
+            };
+            &capped
+        }
+        verdict => verdict,
+    };
+    match verdict {
         Verdict::Deliver => {
             apply_actions(&mut env, decision, cfg, raw);
             env.pipeline = "deliver".into();

@@ -1,135 +1,145 @@
 //! Isolated parser worker. Reads length-prefixed JSON requests on stdin.
+//! Inherited descriptors are closed and the limits and sandbox installed
+//! before the async runtime starts any thread. If any of that fails the
+//! worker reports it in a `startup` frame and exits; otherwise it sends a
+//! `ready` frame and then answers one frame per request.
+//!
+//! `--probe` installs the same sandbox, tries what a compromised worker would
+//! try, prints `{"name": errno}` as one JSON line and exits (tests).
 use bytes::Bytes;
-use currawong_parser::{parse_request, yara::RulesCache, LoadRules, ParseRequest, ParseResponse};
-use futures::StreamExt;
+use currawong_parser::ipc::{codec, MAX_FRAME, READY_ID, STARTUP_ID};
+use currawong_parser::sandbox::{self, SandboxConfig, WorkerLimits};
+use currawong_parser::yara::RulesCache;
+use currawong_parser::{parse_request, LoadRules, ParseRequest, ParseResponse};
+use futures::{SinkExt, StreamExt};
 use std::io;
-use tokio::io::{AsyncWriteExt, BufWriter};
-use tokio_util::codec::{FramedRead, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    if let Err(err) = apply_limits() {
-        let _ = write_one(&ParseResponse::failed("startup", err.to_string())).await;
-        std::process::exit(1);
+fn main() {
+    sandbox::close_inherited_fds();
+    let limits = WorkerLimits::from_env();
+    let cfg = SandboxConfig::from_env();
+    let setup = sandbox::apply_limits(&limits)
+        .map_err(|err| format!("resource limits: {err}"))
+        .and_then(|()| sandbox::install(&cfg).map_err(|err| format!("sandbox: {err}")));
+    if std::env::args().any(|arg| arg == "--probe") {
+        let mut report = serde_json::Map::new();
+        report.insert(
+            "setup".into(),
+            setup.as_ref().err().cloned().unwrap_or_default().into(),
+        );
+        if setup.is_ok() {
+            for (name, errno) in sandbox::probe(&cfg) {
+                report.insert(name.into(), errno.into());
+            }
+        }
+        println!("{}", serde_json::Value::Object(report));
+        return;
     }
-    install_sandbox();
-    let stdin = tokio::io::stdin();
-    let codec = LengthDelimitedCodec::builder()
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(_) => std::process::exit(1),
+    };
+    runtime.block_on(serve(limits, setup));
+}
+
+async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
+    let mut writer = FramedWrite::new(tokio::io::stdout(), codec());
+    match setup {
+        Err(reason) => {
+            let _ = writer
+                .send(encode(&ParseResponse::failed(STARTUP_ID, reason)))
+                .await;
+            std::process::exit(1);
+        }
+        Ok(warnings) => {
+            let mut ready = ParseResponse::failed(READY_ID, "");
+            ready.error = None;
+            ready.warnings = warnings;
+            if writer.send(encode(&ready)).await.is_err() {
+                return;
+            }
+        }
+    }
+    // Requests are small, but YARA rule frames can be large.
+    let request_codec = LengthDelimitedCodec::builder()
         .max_frame_length(LoadRules::MAX_FRAME_BYTES)
         .new_codec();
-    let mut reader = FramedRead::new(stdin, codec);
+    let mut reader = FramedRead::new(tokio::io::stdin(), request_codec);
     let mut rules = RulesCache::default();
     while let Some(frame) = reader.next().await {
         let frame = match frame {
             Ok(frame) => frame,
             Err(err) => {
-                let _ = write_one(&ParseResponse::failed("frame", err.to_string())).await;
+                let _ = writer
+                    .send(encode(&ParseResponse::failed("frame", err.to_string())))
+                    .await;
                 break;
             }
         };
         if let Ok(load) = serde_json::from_slice::<LoadRules>(&frame) {
-            if write_one(&rules.load(&load)).await.is_err() {
+            if send(&mut writer, &rules.load(&load)).await.is_err() {
                 break;
             }
             continue;
         }
         let response = match serde_json::from_slice::<ParseRequest>(&frame) {
-            Ok(request) => parse_request(&request, &mut rules),
+            Ok(request) => match sandbox::start_job(&limits) {
+                Ok(()) => parse_on_big_stack(request, &mut rules),
+                Err(err) => ParseResponse::failed(&request.id, format!("cpu limit: {err}")),
+            },
             Err(err) => ParseResponse::failed("request", err.to_string()),
         };
-        if write_one(&response).await.is_err() {
+        if send(&mut writer, &response).await.is_err() {
             break;
         }
     }
 }
 
-async fn write_one(response: &ParseResponse) -> io::Result<()> {
-    let bytes = serde_json::to_vec(response)
-        .unwrap_or_else(|_| br#"{"id":"","parts":[],"urls":[],"error":"encode"}"#.to_vec());
-    let mut codec_out = bytes::BytesMut::new();
-    {
-        use tokio_util::codec::Encoder;
-        let mut codec = LengthDelimitedCodec::new();
-        codec.encode(Bytes::from(bytes), &mut codec_out)?;
-    }
-    let mut stdout = BufWriter::new(tokio::io::stdout());
-    stdout.write_all(&codec_out).await?;
-    stdout.flush().await
+/// Parsers recurse; give them a stack well past the default 8 MiB. It is
+/// virtual memory, so it counts against the address-space limit.
+const PARSE_STACK: usize = 64 * 1024 * 1024;
+
+fn parse_on_big_stack(request: ParseRequest, rules: &mut RulesCache) -> ParseResponse {
+    let id = request.id.clone();
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("parse".into())
+            .stack_size(PARSE_STACK)
+            .spawn_scoped(scope, || parse_request(&request, rules))
+            .map_err(|err| format!("parse thread: {err}"))
+            .and_then(|handle| handle.join().map_err(|_| "parser panicked".to_string()))
+    })
+    .unwrap_or_else(|reason| ParseResponse::failed(id, reason))
 }
 
-fn apply_limits() -> io::Result<()> {
-    let mem_mib: u64 = std::env::var("CURRAWONG_WORKER_AS_MIB")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(512);
-    let cpu: u64 = std::env::var("CURRAWONG_WORKER_CPU_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
-    let bytes = mem_mib.saturating_mul(1024 * 1024);
-    rlimit::setrlimit(rlimit::Resource::AS, bytes, bytes).or_else(|err| {
-        if err.kind() == io::ErrorKind::InvalidInput {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    })?;
-    rlimit::setrlimit(rlimit::Resource::CPU, cpu, cpu).or_else(|err| {
-        if err.kind() == io::ErrorKind::InvalidInput {
-            Ok(())
-        } else {
-            Err(err)
-        }
-    })?;
-    Ok(())
+/// A response too big for one frame becomes a failure for the same job.
+async fn send<W>(
+    writer: &mut FramedWrite<W, LengthDelimitedCodec>,
+    response: &ParseResponse,
+) -> io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut bytes = encode(response);
+    if bytes.len() > MAX_FRAME {
+        bytes = encode(&ParseResponse::failed(
+            &response.id,
+            format!(
+                "parse result is {} bytes, over the frame limit",
+                bytes.len()
+            ),
+        ));
+    }
+    writer.send(bytes).await
 }
 
-fn install_sandbox() {
-    #[cfg(target_os = "linux")]
-    linux::apply();
-}
-
-#[cfg(target_os = "linux")]
-mod linux {
-    pub fn apply() {
-        use seccompiler::{SeccompAction, SeccompFilter, TargetArch};
-        use std::env::consts::ARCH;
-        let arch = match ARCH {
-            "x86_64" => TargetArch::x86_64,
-            "aarch64" => TargetArch::aarch64,
-            _ => return,
-        };
-        let names = ["socket", "connect", "execve", "execveat", "ptrace"];
-        let mut rules = std::collections::BTreeMap::new();
-        for name in names {
-            if let Some(nr) = syscall_nr(name) {
-                rules.insert(nr, vec![]);
-            }
-        }
-        let filter = match SeccompFilter::new(
-            rules,
-            SeccompAction::Allow,
-            SeccompAction::Errno(libc::EPERM as u32),
-            arch,
-        ) {
-            Ok(filter) => filter,
-            Err(_) => return,
-        };
-        let bpf = match filter.try_into() {
-            Ok(prog) => prog,
-            Err(_) => return,
-        };
-        let _ = seccompiler::apply_filter(&bpf);
-    }
-
-    fn syscall_nr(name: &str) -> Option<i64> {
-        match name {
-            "socket" => Some(libc::SYS_socket as i64),
-            "connect" => Some(libc::SYS_connect as i64),
-            "execve" => Some(libc::SYS_execve as i64),
-            "execveat" => Some(libc::SYS_execveat as i64),
-            "ptrace" => Some(libc::SYS_ptrace as i64),
-            _ => None,
-        }
-    }
+fn encode(response: &ParseResponse) -> Bytes {
+    Bytes::from(
+        serde_json::to_vec(response)
+            .unwrap_or_else(|_| br#"{"id":"","parts":[],"urls":[],"error":"encode"}"#.to_vec()),
+    )
 }

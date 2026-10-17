@@ -91,7 +91,12 @@ pub async fn spawn_gateway(overrides: impl FnOnce(&mut Config)) -> TestGateway {
     cfg.domains.accept = vec!["example.test".into()];
     cfg.gateway.hostname = "mx.example.test".into();
     cfg.scanner.clamd.address.clear();
-    cfg.scanner.worker_binary = None;
+    cfg.scanner.clamd.required = false;
+    // Parsing only ever happens in the worker; `cargo test --workspace`
+    // builds it next to the test binaries.
+    cfg.scanner.worker_binary = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("currawong-parser-worker")));
     cfg.listeners = vec![ListenerConfig {
         name: "test".into(),
         bind: "127.0.0.1:0".into(),
