@@ -14,6 +14,7 @@ use std::path::Path;
 pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     let cfg = Config::load(path).map_err(|err| err.to_string())?;
     cfg.validate().map_err(|err| err.to_string())?;
+    currawong_policy::load_pack(&cfg.policy).map_err(|err| err.to_string())?;
     let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
     guard
         .enforce_startup(&cfg.residency.content_endpoints)
