@@ -285,7 +285,7 @@ async fn act(
             if plan.bounce && !env.dsn_sent {
                 let dsn = bounce(&env, cfg);
                 if spool.load(&dsn.id).await.is_err() {
-                    let body = build_dsn(&cfg.gateway.hostname, &env, raw, &detail);
+                    let body = build_dsn(&cfg.gateway.hostname, &env, raw, &env.rcpt_status);
                     spool
                         .accept(dsn, Cursor::new(body))
                         .await

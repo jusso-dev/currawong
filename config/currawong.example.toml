@@ -164,11 +164,37 @@ next_hop = "127.0.0.1:2526"
 
 # delivery.poll_secs: how often deferred mail is retried.
 # delivery.max_age_days: then a DSN, never to the null sender.
-# delivery.require_tls: hook only. MTA-STS and DANE are not enforced in M1.
+# delivery.max_concurrent: messages delivered at once in one pass.
+# delivery.max_per_destination: sessions open at once to one recipient domain.
+# delivery.allow_private_mx: accept MX answers that point at loopback or
+# private addresses. Leave off unless the next hops are internal by design.
+# Outbound TLS, in order of precedence for MX delivery:
+# delivery.dane: DANE (RFC 7672). DNSSEC is validated locally, so the system
+#   resolver must pass DNSSEC records through. A TLSA mismatch defers.
+# delivery.mta_sts: MTA-STS (RFC 8461). In enforce mode a bad certificate or
+#   an unlisted MX defers.
+# Otherwise STARTTLS is used when offered, with the certificate verified; a
+# host whose certificate does not verify gets the message without TLS.
+# delivery.require_tls: instead, defer unless STARTTLS verifies. Applies to
+#   domains.routes next hops too.
+# delivery.tls_database: MTA-STS policy cache and TLS-RPT results.
 [delivery]
 poll_secs = 30
 max_age_days = 5
 require_tls = false
+max_concurrent = 16
+max_per_destination = 4
+allow_private_mx = false
+dane = true
+mta_sts = true
+tls_database = "/var/lib/currawong/tls.sqlite"
+
+# delivery.tls_rpt: daily RFC 8460 reports to domains that publish an
+# _smtp._tls record. contact empty means postmaster@gateway.hostname.
+[delivery.tls_rpt]
+enabled = true
+organisation = "Example Pty Ltd"
+contact = ""
 
 # checks.*_enabled: each pre-DATA check can be turned off.
 # checks.allow_cidrs: skip rate limits, DNSBL, greylisting and reputation.
