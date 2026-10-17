@@ -206,6 +206,8 @@ pub struct DeliveryConfig {
     pub require_tls: bool,
     /// Messages delivered at once in one pass.
     pub max_concurrent: usize,
+    /// Sessions open at once to one recipient domain.
+    pub max_per_destination: usize,
     /// Allow MX answers that point at loopback, private or other non-public
     /// addresses. Off by default so DNS cannot aim delivery inward.
     pub allow_private_mx: bool,
@@ -437,6 +439,7 @@ impl Default for DeliveryConfig {
             max_age_days: 5,
             require_tls: false,
             max_concurrent: 16,
+            max_per_destination: 4,
             allow_private_mx: false,
             dane: true,
             mta_sts: true,

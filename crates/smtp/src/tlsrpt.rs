@@ -1,7 +1,10 @@
 //! TLS-RPT (RFC 8460). Delivery records the TLS outcome of each session made
 //! under a DANE or MTA-STS policy; once a UTC day is over, each policy domain
 //! that publishes `_smtp._tls` gets one JSON report at its `rua`.
-use crate::dns::{normalise, DnsLookup};
+use crate::{
+    delivery::{outbound_tls::checked_url, route::valid_domain},
+    dns::{normalise, DnsLookup},
+};
 use currawong_core::{config::Config, Direction};
 use currawong_spool::{Envelope, Spool, SpoolState};
 use mail_auth::{
@@ -13,8 +16,18 @@ use mail_auth::{
     },
 };
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
 use std::{collections::BTreeMap, io::Write, net::IpAddr, path::PathBuf};
 use time::{macros::format_description, Date};
+
+/// Bounds on what a domain's records and our own counters can make a report.
+const MAX_RUA: usize = 5;
+const MAX_POLICY_STRINGS: usize = 64;
+const MAX_POLICIES: usize = 20;
+const MAX_FAILURE_DETAILS: usize = 50;
+const MAX_REPORT_BYTES: usize = 1024 * 1024;
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// One failed session, for `failure-details`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +55,12 @@ impl TlsRpt {
     ) -> Result<(), String> {
         let db = self.db.clone();
         let domain = normalise(&policy.policy_domain);
-        let policy = serde_json::to_string(policy).map_err(|err| err.to_string())?;
+        let mut policy = policy.clone();
+        policy.policy_string.truncate(MAX_POLICY_STRINGS);
+        policy.mx_host.truncate(MAX_POLICY_STRINGS);
+        let policy = serde_json::to_string(&policy).map_err(|err| err.to_string())?;
+        // Rows are keyed by a digest; the policy text lives once in its own table.
+        let key = hex::encode(Sha256::digest(policy.as_bytes()));
         let (result, mx, ip) = match failure {
             Some(failure) => (
                 serde_json::to_string(&failure.result).map_err(|err| err.to_string())?,
@@ -55,16 +73,21 @@ impl TlsRpt {
             None => (String::new(), String::new(), String::new()),
         };
         blocking(move || {
-            open(&db)?
-                .execute(
-                    "INSERT INTO tlsrpt_result
-                       (day, domain, policy, result, receiving_mx, receiving_ip, count)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
-                     ON CONFLICT(day, domain, policy, result, receiving_mx, receiving_ip)
-                     DO UPDATE SET count = count + 1",
-                    rusqlite::params![day.to_string(), domain, policy, result, mx, ip],
-                )
-                .map_err(|err| err.to_string())?;
+            let conn = open(&db)?;
+            conn.execute(
+                "INSERT OR IGNORE INTO tlsrpt_policy (key, policy) VALUES (?1, ?2)",
+                rusqlite::params![key, policy],
+            )
+            .map_err(|err| err.to_string())?;
+            conn.execute(
+                "INSERT INTO tlsrpt_session
+                   (day, domain, policy_key, result, receiving_mx, receiving_ip, count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)
+                 ON CONFLICT(day, domain, policy_key, result, receiving_mx, receiving_ip)
+                 DO UPDATE SET count = count + 1",
+                rusqlite::params![day.to_string(), domain, key, result, mx, ip],
+            )
+            .map_err(|err| err.to_string())?;
             Ok(())
         })
         .await
@@ -85,8 +108,10 @@ impl TlsRpt {
             let conn = open(&db)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT policy, result, receiving_mx, receiving_ip, count FROM tlsrpt_result
-                     WHERE day = ?1 AND domain = ?2",
+                    "SELECT p.policy, s.result, s.receiving_mx, s.receiving_ip, s.count
+                     FROM tlsrpt_session s JOIN tlsrpt_policy p ON p.key = s.policy_key
+                     WHERE s.day = ?1 AND s.domain = ?2
+                     ORDER BY s.count DESC",
                 )
                 .map_err(|err| err.to_string())?;
             let rows = stmt
@@ -110,8 +135,10 @@ impl TlsRpt {
         }
         let mut policies: BTreeMap<String, Policy> = BTreeMap::new();
         for (policy_json, result, mx, ip, count) in rows {
+            let full = policies.len() >= MAX_POLICIES;
             let entry = match policies.entry(policy_json) {
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(_) if full => continue,
                 std::collections::btree_map::Entry::Vacant(entry) => {
                     let details: PolicyDetails =
                         serde_json::from_str(entry.key()).map_err(|err| err.to_string())?;
@@ -130,6 +157,10 @@ impl TlsRpt {
                 continue;
             }
             entry.summary.total_failure += count;
+            // Totals stay exact; only the most frequent failures are detailed.
+            if entry.failure_details.len() >= MAX_FAILURE_DETAILS {
+                continue;
+            }
             let result_type: ResultType =
                 serde_json::from_str(&result).map_err(|err| err.to_string())?;
             let mut detail = FailureDetails::new(result_type);
@@ -160,7 +191,7 @@ impl TlsRpt {
             let conn = open(&db)?;
             let mut stmt = conn
                 .prepare(
-                    "SELECT DISTINCT r.day, r.domain FROM tlsrpt_result r
+                    "SELECT DISTINCT r.day, r.domain FROM tlsrpt_session r
                      LEFT JOIN tlsrpt_sent s ON s.day = r.day AND s.domain = r.domain
                      WHERE r.day < ?1 AND s.day IS NULL",
                 )
@@ -196,10 +227,16 @@ impl TlsRpt {
                 rusqlite::params![day.to_string(), domain],
             )
             .map_err(|err| err.to_string())?;
-            conn.execute("DELETE FROM tlsrpt_result WHERE day < ?1", [&old])
+            conn.execute("DELETE FROM tlsrpt_session WHERE day < ?1", [&old])
                 .map_err(|err| err.to_string())?;
             conn.execute("DELETE FROM tlsrpt_sent WHERE day < ?1", [&old])
                 .map_err(|err| err.to_string())?;
+            conn.execute(
+                "DELETE FROM tlsrpt_policy
+                 WHERE key NOT IN (SELECT policy_key FROM tlsrpt_session)",
+                [],
+            )
+            .map_err(|err| err.to_string())?;
             Ok(())
         })
         .await
@@ -223,38 +260,60 @@ impl TlsRpt {
             cfg.delivery.tls_rpt.contact.clone()
         };
         let mut sent = 0;
+        // One domain failing is logged and retried on a later pass; it does
+        // not hold up the others.
         for (day, domain) in self.pending(today).await? {
-            let rua = match dns.lookup_txt(&format!("_smtp._tls.{domain}")).await {
-                Ok(records) => records
-                    .iter()
-                    .filter(|record| record.starts_with("v=TLSRPTv1"))
-                    .filter_map(|record| TlsRptRecord::parse(record.as_bytes()).ok())
-                    .flat_map(|record| record.rua)
-                    .collect::<Vec<_>>(),
-                Err(err) => {
-                    // Try again on the next pass.
-                    tracing::debug!(%err, %domain, "TLS-RPT TXT lookup failed");
-                    continue;
-                }
-            };
-            if !rua.is_empty() {
-                if let Some(report) = self
-                    .report(
-                        day,
-                        &domain,
-                        &cfg.delivery.tls_rpt.organisation,
-                        &contact,
-                        hostname,
-                    )
-                    .await?
-                {
-                    deliver_report(&report, &domain, &rua, hostname, spool, http).await?;
-                    sent += 1;
-                }
+            match self
+                .send_one(day, &domain, cfg, &contact, dns, spool, http)
+                .await
+            {
+                Ok(true) => sent += 1,
+                Ok(false) => {}
+                Err(err) => tracing::warn!(%domain, %day, %err, "TLS-RPT report not sent"),
             }
-            self.mark_sent(day, &domain).await?;
         }
         Ok(sent)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_one(
+        &self,
+        day: Date,
+        domain: &str,
+        cfg: &Config,
+        contact: &str,
+        dns: &dyn DnsLookup,
+        spool: &Spool,
+        http: Option<&reqwest::Client>,
+    ) -> Result<bool, String> {
+        let hostname = &cfg.gateway.hostname;
+        if !valid_domain(domain) {
+            self.mark_sent(day, domain).await?;
+            return Ok(false);
+        }
+        let rua: Vec<ReportUri> = dns
+            .lookup_txt(&format!("_smtp._tls.{domain}"))
+            .await
+            .map_err(|err| format!("TXT lookup: {err}"))?
+            .iter()
+            .filter(|record| record.starts_with("v=TLSRPTv1"))
+            .filter_map(|record| TlsRptRecord::parse(record.as_bytes()).ok())
+            .flat_map(|record| record.rua)
+            .take(MAX_RUA)
+            .collect();
+        let mut delivered = false;
+        if !rua.is_empty() {
+            let organisation = &cfg.delivery.tls_rpt.organisation;
+            if let Some(report) = self
+                .report(day, domain, organisation, contact, hostname)
+                .await?
+            {
+                deliver_report(&report, domain, &rua, hostname, spool, http).await?;
+                delivered = true;
+            }
+        }
+        self.mark_sent(day, domain).await?;
+        Ok(delivered)
     }
 }
 
@@ -266,11 +325,17 @@ async fn deliver_report(
     spool: &Spool,
     http: Option<&reqwest::Client>,
 ) -> Result<(), String> {
+    let json = report.to_json();
+    if json.len() > MAX_REPORT_BYTES {
+        return Err(format!("report is {} bytes, over the cap", json.len()));
+    }
     let mail: Vec<&str> = rua
         .iter()
         .filter_map(|uri| match uri {
-            ReportUri::Mail(addr) => Some(addr.as_str()),
-            ReportUri::Http(_) => None,
+            ReportUri::Mail(addr) if crate::delivery::client::valid_path(addr) => {
+                Some(addr.as_str())
+            }
+            _ => None,
         })
         .collect();
     if !mail.is_empty() {
@@ -307,27 +372,36 @@ async fn deliver_report(
             .await
             .map_err(|err| err.to_string())?;
     }
+    // Uploads go one at a time, each bounded by the client's timeouts and
+    // this one.
     if let Some(client) = http {
         for uri in rua {
             let ReportUri::Http(url) = uri else {
                 continue;
             };
+            let url = match checked_url(url) {
+                Ok(url) => url,
+                Err(err) => {
+                    tracing::warn!(%err, "TLS-RPT upload address refused");
+                    continue;
+                }
+            };
             let mut gz = GzEncoder::new(Vec::new(), Compression::default());
-            gz.write_all(report.to_json().as_bytes())
+            gz.write_all(json.as_bytes())
                 .map_err(|err| err.to_string())?;
             let body = gz.finish().map_err(|err| err.to_string())?;
-            let response = client
-                .post(url)
+            let upload = client
+                .post(url.clone())
                 .header(reqwest::header::CONTENT_TYPE, "application/tlsrpt+gzip")
                 .body(body)
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.status().is_success() => {}
-                Ok(response) => {
+                .send();
+            match tokio::time::timeout(UPLOAD_TIMEOUT, upload).await {
+                Ok(Ok(response)) if response.status().is_success() => {}
+                Ok(Ok(response)) => {
                     tracing::warn!(%url, status = %response.status(), "TLS-RPT upload refused")
                 }
-                Err(err) => tracing::warn!(%url, %err, "TLS-RPT upload failed"),
+                Ok(Err(err)) => tracing::warn!(%url, %err, "TLS-RPT upload failed"),
+                Err(_) => tracing::warn!(%url, "TLS-RPT upload timed out"),
             }
         }
     }
@@ -340,15 +414,19 @@ fn open(db: &std::path::Path) -> Result<Connection, String> {
     }
     let conn = Connection::open(db).map_err(|err| err.to_string())?;
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS tlsrpt_result (
+        "CREATE TABLE IF NOT EXISTS tlsrpt_policy (
+            key TEXT PRIMARY KEY,
+            policy TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS tlsrpt_session (
             day TEXT NOT NULL,
             domain TEXT NOT NULL,
-            policy TEXT NOT NULL,
+            policy_key TEXT NOT NULL,
             result TEXT NOT NULL,
             receiving_mx TEXT NOT NULL,
             receiving_ip TEXT NOT NULL,
             count INTEGER NOT NULL,
-            PRIMARY KEY (day, domain, policy, result, receiving_mx, receiving_ip)
+            PRIMARY KEY (day, domain, policy_key, result, receiving_mx, receiving_ip)
         );
         CREATE TABLE IF NOT EXISTS tlsrpt_sent (
             day TEXT NOT NULL,
@@ -467,5 +545,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(again, 0);
+    }
+
+    #[tokio::test]
+    async fn tlsrpt_one_failing_domain_does_not_stop_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.gateway.hostname = "gw.test".into();
+        let spool = Spool::open(dir.path().join("spool")).await.unwrap();
+        let store = TlsRpt::new(dir.path().join("tls.sqlite"));
+        let today = Date::from_calendar_date(2026, time::Month::October, 17).unwrap();
+        let yesterday = today.previous_day().unwrap();
+        let mut broken = sts_policy();
+        broken.policy_domain = "broken.test".into();
+        store.record(yesterday, &broken, None).await.unwrap();
+        store.record(yesterday, &sts_policy(), None).await.unwrap();
+        let mut dns = MapDns::new();
+        dns.bogus.insert("_smtp._tls.broken.test".into());
+        // Six report addresses: only five are used.
+        let rua = (0..6)
+            .map(|i| format!("mailto:r{i}@example.test"))
+            .collect::<Vec<_>>()
+            .join(",");
+        dns.txt.insert(
+            "_smtp._tls.example.test".into(),
+            vec![format!("v=TLSRPTv1; rua={rua}")],
+        );
+        let sent = store
+            .send_due(&cfg, &dns, &spool, None, today)
+            .await
+            .unwrap();
+        assert_eq!(sent, 1);
+        let queued = spool.list(SpoolState::Incoming).await.unwrap();
+        assert_eq!(queued[0].rcpt_to.len(), MAX_RUA);
+        // The failed domain is retried on a later pass.
+        assert_eq!(store.pending(today).await.unwrap().len(), 1);
     }
 }

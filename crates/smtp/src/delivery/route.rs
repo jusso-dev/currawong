@@ -2,15 +2,23 @@
 //! (the domain's own A/AAAA, only when it has no MX records).
 use crate::dns::{normalise, DnsLookup, LookupError};
 use currawong_core::config::Config;
-use std::net::{IpAddr, SocketAddr};
+use rand::seq::SliceRandom;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// Bounds on what one domain's MX answer can make us try.
+pub const MAX_MX_HOSTS: usize = 5;
+pub const MAX_ADDRESSES: usize = 10;
 
 /// One next-hop host and its addresses, in preference order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hop {
     pub host: String,
     pub addrs: Vec<SocketAddr>,
-    /// The address records were DNSSEC-validated.
+    /// The address records (A and AAAA, and any CNAME on the way) were
+    /// DNSSEC-validated.
     pub secure: bool,
+    /// Where the host name's CNAME chain ended, if anywhere.
+    pub canonical: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +35,26 @@ pub struct Route {
 pub enum RouteError {
     Temp(String),
     Perm(String),
+}
+
+/// A plain host name: dot-separated labels of letters, digits and inner
+/// hyphens. Checked before a name goes into a DNS query or a URL, so a
+/// recipient domain cannot smuggle a port, path, user or address literal.
+pub fn valid_domain(name: &str) -> bool {
+    let name = name.strip_suffix('.').unwrap_or(name);
+    // No top-level domain is all digits, so this also rules out IPv4 literals.
+    let numeric_tld = name
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.chars().all(|ch| ch.is_ascii_digit()));
+    !numeric_tld
+        && (1..=253).contains(&name.len())
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|ch| ch.is_alphanumeric() || ch == '-')
+        })
 }
 
 pub async fn resolve_route(
@@ -69,10 +97,17 @@ pub async fn resolve_route(
     } else {
         mx
     };
-    hosts.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    // RFC 5321 5.1: hosts of equal preference are tried in random order.
+    hosts.shuffle(&mut rand::thread_rng());
+    hosts.sort_by_key(|host| host.0);
+    hosts.truncate(MAX_MX_HOSTS);
     let mut hops = Vec::new();
+    let mut budget = MAX_ADDRESSES;
     let mut last = String::new();
     for (_, host) in hosts {
+        if budget == 0 {
+            break;
+        }
         let host = normalise(&host);
         match dns.resolve_ips(&host).await {
             Ok(answer) => {
@@ -81,7 +116,9 @@ pub async fn resolve_route(
                     .into_iter()
                     .filter(|ip| cfg.delivery.allow_private_mx || is_public(ip))
                     .map(|ip| SocketAddr::new(ip, 25))
+                    .take(budget)
                     .collect();
+                budget -= addrs.len();
                 if addrs.is_empty() {
                     last = format!("no usable public address for {host}");
                     if implicit {
@@ -94,6 +131,7 @@ pub async fn resolve_route(
                         host,
                         addrs,
                         secure: answer.secure,
+                        canonical: answer.canonical,
                     });
                 }
             }
@@ -126,6 +164,7 @@ pub fn is_public(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
+            let c = v4.octets()[2];
             !(v4.is_unspecified()
                 || v4.is_loopback()
                 || v4.is_private()
@@ -136,19 +175,43 @@ pub fn is_public(ip: &IpAddr) -> bool {
                 || a == 0
                 || a >= 240
                 || (a == 100 && (64..128).contains(&b))
-                || (a == 198 && (18..20).contains(&b)))
+                || (a == 198 && (18..20).contains(&b))
+                // IETF protocol assignments and the old 6to4 relay anycast.
+                || (a == 192 && b == 0 && c == 0)
+                || (a == 192 && b == 88 && c == 99))
         }
         IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_public(&IpAddr::V4(v4));
             }
-            let first = v6.segments()[0];
+            let s = v6.segments();
+            let embedded = |hi: u16, lo: u16| {
+                is_public(&IpAddr::V4(Ipv4Addr::new(
+                    (hi >> 8) as u8,
+                    hi as u8,
+                    (lo >> 8) as u8,
+                    lo as u8,
+                )))
+            };
+            // NAT64 (64:ff9b::/96) and 6to4 (2002::/16) carry an IPv4
+            // address that must itself be public.
+            if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+                return embedded(s[6], s[7]);
+            }
+            if s[0] == 0x2002 {
+                return embedded(s[1], s[2]);
+            }
             !(v6.is_unspecified()
                 || v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unicast_link_local()
                 || v6.is_unique_local()
-                || (first == 0x2001 && v6.segments()[1] == 0x0db8))
+                // IPv4-compatible ::/96, deprecated site-local fec0::/10,
+                // Teredo 2001::/32 and documentation 2001:db8::/32, 3fff::/20.
+                || s[..6] == [0; 6]
+                || (s[0] & 0xffc0) == 0xfec0
+                || (s[0] == 0x2001 && (s[1] == 0 || s[1] == 0x0db8))
+                || (s[0] == 0x3fff && s[1] < 0x1000))
         }
     }
 }
@@ -159,6 +222,7 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
             host: addr.ip().to_string(),
             addrs: vec![addr],
             secure: false,
+            canonical: None,
         });
     }
     if let Ok(ip) = next_hop.parse::<IpAddr>() {
@@ -166,6 +230,7 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
             host: ip.to_string(),
             addrs: vec![SocketAddr::new(ip, 25)],
             secure: false,
+            canonical: None,
         });
     }
     let (host, port) = match next_hop.rsplit_once(':') {
@@ -193,6 +258,7 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
             .collect(),
         host,
         secure: answer.secure,
+        canonical: answer.canonical,
     })
 }
 
@@ -231,7 +297,7 @@ mod tests {
     async fn no_mx_falls_back_to_address() {
         let mut dns = MapDns::new();
         dns.ips
-            .insert("plain.test".into(), vec!["192.0.0.9".parse().unwrap()]);
+            .insert("plain.test".into(), vec!["93.184.216.34".parse().unwrap()]);
         let route = resolve_route("plain.test", &cfg(), &dns).await.unwrap();
         assert_eq!(route.hops[0].host, "plain.test");
         assert!(route.via_mx);
@@ -243,7 +309,7 @@ mod tests {
         dns.mx
             .insert("mx.test".into(), vec![(10, "missing.mx.test".into())]);
         dns.ips
-            .insert("mx.test".into(), vec!["192.0.0.9".parse().unwrap()]);
+            .insert("mx.test".into(), vec!["93.184.216.34".parse().unwrap()]);
         let err = resolve_route("mx.test", &cfg(), &dns).await.unwrap_err();
         assert!(matches!(err, RouteError::Temp(_)), "{err:?}");
     }
@@ -274,10 +340,60 @@ mod tests {
 
     #[test]
     fn public_addresses_pass() {
-        assert!(is_public(&"192.0.0.9".parse().unwrap()));
+        assert!(is_public(&"93.184.216.34".parse().unwrap()));
         assert!(is_public(&"2606:4700::1".parse().unwrap()));
         assert!(!is_public(&"100.64.0.1".parse().unwrap()));
         assert!(!is_public(&"169.254.1.1".parse().unwrap()));
         assert!(!is_public(&"fe80::1".parse().unwrap()));
+        for special in [
+            "192.0.0.9",
+            "192.88.99.1",
+            "64:ff9b::a00:1",
+            "2002:7f00:1::",
+            "2001:0:4136:e378::1",
+            "::127.0.0.1",
+            "fec0::1",
+            "3fff::1",
+        ] {
+            assert!(!is_public(&special.parse().unwrap()), "{special}");
+        }
+        assert!(is_public(&"64:ff9b::5db8:d822".parse().unwrap()));
+        assert!(is_public(&"2002:5db8:d822::".parse().unwrap()));
+    }
+
+    #[test]
+    fn domains_are_plain_host_names() {
+        assert!(valid_domain("example.test"));
+        assert!(valid_domain("xn--bcher-kva.test."));
+        for bad in [
+            "",
+            "evil.test:8443",
+            "evil.test/path",
+            "user@evil.test",
+            "[127.0.0.1]",
+            "127.0.0.1",
+            "-x.test",
+            "a..test",
+            "a b.test",
+        ] {
+            assert!(!valid_domain(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn mx_hosts_and_addresses_are_capped() {
+        let mut dns = MapDns::new();
+        let hosts: Vec<(u16, String)> = (0..8).map(|i| (10, format!("mx{i}.big.test"))).collect();
+        for (_, host) in &hosts {
+            let ips = (1..=4)
+                .map(|n| format!("93.184.216.{n}").parse().unwrap())
+                .collect();
+            dns.ips.insert(host.clone(), ips);
+        }
+        dns.mx.insert("big.test".into(), hosts);
+        let route = resolve_route("big.test", &cfg(), &dns).await.unwrap();
+        assert!(route.hops.len() <= MAX_MX_HOSTS);
+        let addresses: usize = route.hops.iter().map(|hop| hop.addrs.len()).sum();
+        assert_eq!(addresses, MAX_ADDRESSES);
     }
 }

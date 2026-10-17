@@ -36,6 +36,7 @@ mail-auth = { workspace = true }
 rustls-webpki = { workspace = true }
 webpki-roots = { workspace = true }
 reqwest = { workspace = true }
+url = { workspace = true }
 pin-project-lite = { workspace = true }
 rand = { workspace = true }
 metrics = { workspace = true }

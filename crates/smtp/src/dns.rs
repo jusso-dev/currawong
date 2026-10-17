@@ -1,6 +1,7 @@
 //! DNS lookups used by routing and DNSBLs. Tests supply a map; production uses hickory.
 use async_trait::async_trait;
 use hickory_resolver::{
+    config::LookupIpStrategy,
     lookup::Lookup,
     net::{DnsError, NetError},
     proto::{
@@ -35,6 +36,9 @@ pub enum LookupError {
 pub struct Answer<T> {
     pub records: T,
     pub secure: bool,
+    /// Where a CNAME chain ended, when it ended somewhere other than the name
+    /// asked for. DANE looks for TLSA records there first (RFC 7672 2.2.2).
+    pub canonical: Option<String>,
 }
 
 impl<T> Answer<T> {
@@ -42,6 +46,7 @@ impl<T> Answer<T> {
         Self {
             records,
             secure: false,
+            canonical: None,
         }
     }
 }
@@ -112,6 +117,8 @@ pub struct MapDns {
     pub secure: HashSet<String>,
     /// Names whose answers fail DNSSEC validation.
     pub bogus: HashSet<String>,
+    /// Address lookups for a key follow the CNAME to its value.
+    pub cname: HashMap<String, String>,
 }
 
 impl MapDns {
@@ -134,6 +141,7 @@ impl MapDns {
         Ok(Answer {
             records: map.get(&name).cloned().unwrap_or_default(),
             secure: self.secure.contains(&name),
+            canonical: None,
         })
     }
 }
@@ -153,7 +161,14 @@ impl DnsLookup for MapDns {
     }
 
     async fn resolve_ips(&self, name: &str) -> Result<Answer<Vec<IpAddr>>, LookupError> {
-        self.answer(&self.ips, name)
+        let Some(target) = self.cname.get(&normalise(name)) else {
+            return self.answer(&self.ips, name);
+        };
+        let alias = self.answer(&HashMap::<String, Vec<IpAddr>>::new(), name)?;
+        let mut answer = self.answer(&self.ips, target)?;
+        answer.secure &= alias.secure;
+        answer.canonical = Some(normalise(target));
+        Ok(answer)
     }
 
     async fn resolve_tlsa(&self, name: &str) -> Result<Answer<Vec<Tlsa>>, LookupError> {
@@ -197,37 +212,41 @@ impl DnsLookup for Arc<MapDns> {
 }
 
 pub struct HickoryDns {
+    /// DNSBL checks and policy TXT records.
     resolver: TokioResolver,
-    /// Validates DNSSEC itself from the root trust anchor. Used for delivery
-    /// lookups when DANE is on; the system resolver must pass RRSIGs through.
-    validating: Option<TokioResolver>,
+    /// Delivery lookups: A and AAAA both, DNSSEC-validated when `validating`.
+    delivery: TokioResolver,
+    /// The delivery resolver validates DNSSEC itself from the root trust
+    /// anchor; the system resolver must pass RRSIGs through.
+    validating: bool,
 }
 
 impl HickoryDns {
     pub fn system() -> Result<Self, String> {
         Ok(Self {
-            resolver: build(false)?,
-            validating: None,
+            resolver: build(false, false)?,
+            delivery: build(false, true)?,
+            validating: false,
         })
     }
 
     /// System resolver plus a DNSSEC-validating one for delivery.
     pub fn validating() -> Result<Self, String> {
         Ok(Self {
-            resolver: build(false)?,
-            validating: Some(build(true)?),
+            resolver: build(false, false)?,
+            delivery: build(true, true)?,
+            validating: true,
         })
-    }
-
-    fn delivery(&self) -> &TokioResolver {
-        self.validating.as_ref().unwrap_or(&self.resolver)
     }
 }
 
-fn build(validate: bool) -> Result<TokioResolver, String> {
+fn build(validate: bool, both_families: bool) -> Result<TokioResolver, String> {
     let mut builder =
         TokioResolver::builder_tokio().map_err(|err| format!("system DNS resolver: {err}"))?;
     builder.options_mut().validate = validate;
+    if both_families {
+        builder.options_mut().ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+    }
     builder
         .build()
         .map_err(|err| format!("system DNS resolver: {err}"))
@@ -253,34 +272,40 @@ impl DnsLookup for HickoryDns {
     }
 
     async fn resolve_mx(&self, name: &str) -> Result<Answer<Vec<(u16, String)>>, LookupError> {
-        let found = present(self.delivery().mx_lookup(name).await)?;
+        let found = present(self.delivery.mx_lookup(name).await, self.validating)?;
         Ok(Answer {
             records: mx_records(found.lookup.as_ref()),
             secure: found.secure,
+            canonical: None,
         })
     }
 
     async fn resolve_ips(&self, name: &str) -> Result<Answer<Vec<IpAddr>>, LookupError> {
-        match self.delivery().lookup_ip(name).await {
-            Ok(lookup) => Ok(Answer {
-                records: lookup.iter().collect(),
-                secure: all_secure(lookup.as_lookup()),
-            }),
+        match self.delivery.lookup_ip(name).await {
+            Ok(lookup) => {
+                let found = present(Ok(lookup.as_lookup().clone()), self.validating)?;
+                Ok(Answer {
+                    records: lookup.iter().collect(),
+                    secure: found.secure,
+                    canonical: found.lookup.as_ref().and_then(|l| canonical(l, name)),
+                })
+            }
             Err(err) => {
-                let found = present(Err(err))?;
+                let found = present(Err(err), self.validating)?;
                 Ok(Answer {
                     records: Vec::new(),
                     secure: found.secure,
+                    canonical: None,
                 })
             }
         }
     }
 
     async fn resolve_tlsa(&self, name: &str) -> Result<Answer<Vec<Tlsa>>, LookupError> {
-        let Some(resolver) = &self.validating else {
+        if !self.validating {
             return Ok(Answer::insecure(Vec::new()));
-        };
-        let found = match present(resolver.lookup(name, RecordType::TLSA).await) {
+        }
+        let found = match present(self.delivery.lookup(name, RecordType::TLSA).await, true) {
             // A proven-absent name has no TLSA records either.
             Err(LookupError::NxDomain) => return Ok(Answer::insecure(Vec::new())),
             other => other?,
@@ -302,11 +327,12 @@ impl DnsLookup for HickoryDns {
         Ok(Answer {
             records,
             secure: found.secure,
+            canonical: None,
         })
     }
 
     async fn lookup_txt(&self, name: &str) -> Result<Vec<String>, LookupError> {
-        let found = match present(self.resolver.txt_lookup(name).await) {
+        let found = match present(self.resolver.txt_lookup(name).await, false) {
             Err(LookupError::NxDomain) => return Ok(Vec::new()),
             other => other?,
         };
@@ -333,9 +359,15 @@ struct Found {
 }
 
 /// NODATA becomes an empty `Found`; NXDOMAIN, bogus answers and failures
-/// become errors.
-fn present(result: Result<Lookup, NetError>) -> Result<Found, LookupError> {
+/// become errors. From a validating resolver, an answer whose proof is
+/// indeterminate counts as bogus, never as merely insecure.
+fn present(result: Result<Lookup, NetError>, validating: bool) -> Result<Found, LookupError> {
+    let doubtful =
+        |proof: Proof| validating && matches!(proof, Proof::Bogus | Proof::Indeterminate);
     match result {
+        Ok(lookup) if lookup.answers().iter().any(|record| doubtful(record.proof)) => {
+            Err(LookupError::Bogus)
+        }
         Ok(lookup) => Ok(Found {
             secure: all_secure(&lookup),
             lookup: Some(lookup),
@@ -348,7 +380,7 @@ fn present(result: Result<Lookup, NetError>) -> Result<Found, LookupError> {
         Err(NetError::Dns(DnsError::Nsec {
             response, proof, ..
         })) => {
-            if proof == Proof::Bogus {
+            if proof == Proof::Bogus || doubtful(proof) {
                 Err(LookupError::Bogus)
             } else if response.response_code == ResponseCode::NXDomain {
                 Err(LookupError::NxDomain)
@@ -373,6 +405,19 @@ fn all_secure(lookup: &Lookup) -> bool {
             .answers()
             .iter()
             .all(|record| record.proof == Proof::Secure)
+}
+
+/// The end of the CNAME chain in `lookup`, if it moved away from `name`.
+fn canonical(lookup: &Lookup, name: &str) -> Option<String> {
+    let target = lookup
+        .answers()
+        .iter()
+        .rev()
+        .find_map(|record| match &record.data {
+            RData::CNAME(cname) => Some(normalise(&cname.0.to_string())),
+            _ => None,
+        })?;
+    (target != normalise(name)).then_some(target)
 }
 
 fn mx_records(lookup: Option<&Lookup>) -> Vec<(u16, String)> {
@@ -407,7 +452,7 @@ mod tests {
 
     #[test]
     fn nodata_is_an_empty_answer() {
-        let found = present(Err(no_records(ResponseCode::NoError))).unwrap();
+        let found = present(Err(no_records(ResponseCode::NoError)), true).unwrap();
         assert!(mx_records(found.lookup.as_ref()).is_empty());
         assert!(!found.secure);
     }
@@ -415,7 +460,7 @@ mod tests {
     #[test]
     fn nxdomain_is_distinct() {
         assert_eq!(
-            present(Err(no_records(ResponseCode::NXDomain))).err(),
+            present(Err(no_records(ResponseCode::NXDomain)), true).err(),
             Some(LookupError::NxDomain)
         );
     }
@@ -423,8 +468,68 @@ mod tests {
     #[test]
     fn servfail_is_temporary_and_bogus_is_bogus() {
         let err = NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail));
-        assert!(matches!(present(Err(err)), Err(LookupError::Temp(_))));
+        assert!(matches!(present(Err(err), true), Err(LookupError::Temp(_))));
         let err = NetError::Dns(DnsError::DnssecBogus);
-        assert!(matches!(present(Err(err)), Err(LookupError::Bogus)));
+        assert!(matches!(present(Err(err), true), Err(LookupError::Bogus)));
+    }
+
+    fn lookup(proof: Proof, cname: bool) -> Lookup {
+        use hickory_resolver::proto::rr::{
+            rdata::{A, CNAME},
+            Name, Record,
+        };
+        let alias = Name::from_ascii("mx.example.test.").unwrap();
+        let target = Name::from_ascii("host.provider.test.").unwrap();
+        let mut answers = Vec::new();
+        if cname {
+            answers.push(Record::from_rdata(
+                alias.clone(),
+                60,
+                RData::CNAME(CNAME(target.clone())),
+            ));
+        }
+        answers.push(Record::from_rdata(
+            target,
+            60,
+            RData::A(A::new(192, 0, 2, 1)),
+        ));
+        for record in &mut answers {
+            record.proof = proof;
+        }
+        Lookup::new_with_max_ttl(Query::query(alias, RecordType::A), answers)
+    }
+
+    #[test]
+    fn indeterminate_is_bogus_only_when_validating() {
+        let doubtful = lookup(Proof::Indeterminate, false);
+        assert!(matches!(
+            present(Ok(doubtful.clone()), true),
+            Err(LookupError::Bogus)
+        ));
+        let found = present(Ok(doubtful), false).unwrap();
+        assert!(!found.secure);
+        assert!(
+            present(Ok(lookup(Proof::Secure, false)), true)
+                .unwrap()
+                .secure
+        );
+        assert!(
+            !present(Ok(lookup(Proof::Insecure, false)), true)
+                .unwrap()
+                .secure
+        );
+    }
+
+    #[test]
+    fn cname_chain_end_is_canonical() {
+        let chained = lookup(Proof::Secure, true);
+        assert_eq!(
+            canonical(&chained, "mx.example.test"),
+            Some("host.provider.test".into())
+        );
+        assert_eq!(
+            canonical(&lookup(Proof::Secure, false), "mx.example.test"),
+            None
+        );
     }
 }

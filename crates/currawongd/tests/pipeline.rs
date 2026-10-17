@@ -114,33 +114,38 @@ async fn one_unreadable_message_does_not_block_the_rest() {
     cfg.spool.dir = dir.path().join("spool");
     cfg.scanner.clamd.address.clear();
     let spool = Arc::new(Spool::open(&cfg.spool.dir).await.unwrap());
-    for id in [
-        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
-        "01ARZ3NDEKTSV4RRFFQ69G5FA3",
-    ] {
+    // Eight unreadable and eight good messages, interleaved by id. Stopping
+    // at the first failure could only classify every good one if the spool
+    // happened to list all eight before all the bad ones (1 order in 12,870),
+    // so the result does not rest on directory order.
+    let mut good = Vec::new();
+    for n in 0..16 {
         let mut env = envelope("user@example.test");
-        env.id = currawong_core::MessageId(id.into());
+        env.id = currawong_core::MessageId(format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}"));
         spool
-            .accept(env, Cursor::new(text_message()))
+            .accept(env.clone(), Cursor::new(text_message()))
             .await
             .unwrap();
-        // The body vanishes, so reading it fails for this message.
-        let eml = spool.root().join("incoming").join(format!("{id}.eml"));
-        std::fs::remove_file(eml).unwrap();
+        if n % 2 == 0 {
+            // The body vanishes, so reading it fails for this message.
+            let eml = spool
+                .root()
+                .join("incoming")
+                .join(format!("{}.eml", env.id));
+            std::fs::remove_file(eml).unwrap();
+        } else {
+            good.push(env.id);
+        }
     }
-    let good = envelope("user@example.test");
-    spool
-        .accept(good.clone(), Cursor::new(text_message()))
-        .await
-        .unwrap();
     let auth = AuthChecker::offline("currawong.example.test").unwrap();
     let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
     let quarantine = QuarantineStore::open(dir.path().join("held")).unwrap();
     classify_pending(&spool, &mut pipeline, &quarantine)
         .await
         .unwrap();
-    assert!(ready_to_deliver(&spool.load(&good.id).await.unwrap()));
+    for id in good {
+        assert!(ready_to_deliver(&spool.load(&id).await.unwrap()), "{id}");
+    }
 }
 
 #[test]

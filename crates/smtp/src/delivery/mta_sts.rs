@@ -1,13 +1,18 @@
 //! MTA-STS (RFC 8461): discover a domain's policy from `_mta-sts` TXT and
 //! `https://mta-sts.<domain>/.well-known/mta-sts.txt`, cache it in the
 //! `mta_sts_policy` table for `max_age`, and say which MX hosts it allows.
+use super::route::valid_domain;
 use crate::dns::{normalise, DnsLookup};
 use async_trait::async_trait;
 use mail_auth::{
     common::parse::TxtRecordParser, mta_sts::MtaSts as StsRecord, report::tlsrpt::ResultType,
 };
 use rusqlite::Connection;
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 /// RFC 8461 section 3.2: max_age is at most one year.
 const MAX_AGE_LIMIT: u64 = 31_557_600;
@@ -122,9 +127,10 @@ impl HttpsFetcher {
 impl PolicyFetcher for HttpsFetcher {
     async fn fetch(&self, domain: &str) -> Result<String, String> {
         let url = format!("https://mta-sts.{domain}/.well-known/mta-sts.txt");
+        let checked = super::outbound_tls::checked_url(&url)?;
         let mut response = self
             .client
-            .get(&url)
+            .get(checked)
             .send()
             .await
             .map_err(|err| format!("{url}: {err}"))?;
@@ -173,21 +179,48 @@ pub enum Discovery {
     },
 }
 
+/// How long a failed fetch is remembered before the next try.
+const NEGATIVE_SECS: i64 = 300;
+
 pub struct MtaSts {
     fetcher: Box<dyn PolicyFetcher>,
     db: PathBuf,
+    /// One discovery per domain at a time; the others wait and use its result.
+    inflight: dashmap::DashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    /// Recent fetch failures: until when, and what to report.
+    failures: Mutex<HashMap<String, (i64, ResultType, String)>>,
 }
 
 impl MtaSts {
     pub fn new(fetcher: Box<dyn PolicyFetcher>, db: PathBuf) -> Self {
-        Self { fetcher, db }
+        Self {
+            fetcher,
+            db,
+            inflight: dashmap::DashMap::new(),
+            failures: Mutex::new(HashMap::new()),
+        }
     }
 
     /// RFC 8461 section 5.1: a cached, unexpired policy wins unless the TXT
-    /// id has changed; a failed refresh keeps the cached policy.
+    /// id has changed. It is refreshed once half its max_age has passed, and
+    /// a failed refresh keeps it.
     pub async fn discover(&self, domain: &str, dns: &dyn DnsLookup, now: i64) -> Discovery {
         let domain = normalise(domain);
-        let cached = match self.cached(&domain, now).await {
+        if !valid_domain(&domain) {
+            return Discovery::NoPolicy;
+        }
+        let gate = Arc::clone(self.inflight.entry(domain.clone()).or_default().value());
+        let held = gate.lock().await;
+        let found = self.discover_one(&domain, dns, now).await;
+        drop(held);
+        // The map and `gate` are the only holders when nobody else waits.
+        self.inflight
+            .remove_if(&domain, |_, entry| Arc::strong_count(entry) <= 2);
+        found
+    }
+
+    async fn discover_one(&self, domain: &str, dns: &dyn DnsLookup, now: i64) -> Discovery {
+        let cached = match self.cached(domain, now).await {
             Ok(cached) => cached,
             Err(err) => {
                 tracing::warn!(%err, %domain, "MTA-STS cache read failed");
@@ -202,46 +235,81 @@ impl MtaSts {
             }
         };
         let Some(id) = id else {
-            return found_or_none(cached);
+            return found_or_none(cached.map(|(policy, _)| policy));
         };
-        if let Some(policy) = &cached {
-            if policy.id == id {
-                return found_or_none(cached);
+        if let Some((policy, fetched_at)) = &cached {
+            let fresh = now < fetched_at.saturating_add(policy.max_age as i64 / 2);
+            if policy.id == id && fresh {
+                return found_or_none(cached.map(|(policy, _)| policy));
             }
         }
-        let fetched = match self.fetcher.fetch(&domain).await {
-            Ok(text) => parse_policy(&id, &text).map_err(|err| (ResultType::StsPolicyInvalid, err)),
-            Err(err) => Err((ResultType::StsPolicyFetchError, err)),
+        let recent_failure = self
+            .failures
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .get(domain)
+            .filter(|(until, _, _)| now < *until)
+            .cloned();
+        let fetched = match recent_failure {
+            Some((_, result, detail)) => Err((result, detail)),
+            None => {
+                let fetched = match self.fetcher.fetch(domain).await {
+                    Ok(text) => {
+                        parse_policy(&id, &text).map_err(|err| (ResultType::StsPolicyInvalid, err))
+                    }
+                    Err(err) => Err((ResultType::StsPolicyFetchError, err)),
+                };
+                let mut failures = self.failures.lock().unwrap_or_else(|err| err.into_inner());
+                match &fetched {
+                    Ok(_) => {
+                        failures.remove(domain);
+                    }
+                    Err((result, detail)) => {
+                        tracing::info!(%domain, %detail, "MTA-STS policy unavailable");
+                        failures.retain(|_, (until, _, _)| now < *until);
+                        let until = now + NEGATIVE_SECS;
+                        failures.insert(domain.to_string(), (until, *result, detail.clone()));
+                    }
+                }
+                fetched
+            }
         };
         match fetched {
             Ok(policy) => {
-                if let Err(err) = self.store(&domain, &policy, now).await {
+                if let Err(err) = self.store(domain, &policy, now).await {
                     tracing::warn!(%err, %domain, "MTA-STS cache write failed");
                 }
                 found_or_none(Some(policy))
             }
-            Err((result, detail)) => {
-                tracing::info!(%domain, %detail, "MTA-STS policy unavailable");
-                match cached {
-                    Some(policy) => found_or_none(Some(policy)),
-                    None => Discovery::Failed { result, detail },
-                }
-            }
+            Err((result, detail)) => match cached {
+                Some((policy, _)) => found_or_none(Some(policy)),
+                None => Discovery::Failed { result, detail },
+            },
         }
     }
 
-    async fn cached(&self, domain: &str, now: i64) -> Result<Option<Policy>, String> {
+    /// The unexpired cached policy and when it was fetched.
+    async fn cached(&self, domain: &str, now: i64) -> Result<Option<(Policy, i64)>, String> {
         let db = self.db.clone();
         let domain = domain.to_string();
         blocking(move || {
             let conn = open(&db)?;
             let row = conn.query_row(
-                "SELECT id, policy FROM mta_sts_policy WHERE domain = ?1 AND expires_at > ?2",
+                "SELECT id, policy, fetched_at FROM mta_sts_policy
+                 WHERE domain = ?1 AND expires_at > ?2",
                 rusqlite::params![domain, now],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             );
             match row {
-                Ok((id, text)) => Ok(parse_policy(&id, &text).ok()),
+                Ok((id, text, fetched_at)) => Ok(parse_policy(&id, &text)
+                    .ok()
+                    .map(|policy| (policy, fetched_at))),
                 Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
                 Err(err) => Err(err.to_string()),
             }
@@ -396,26 +464,49 @@ mod tests {
         );
         let found = sts.discover("example.test", &dns("1"), 1_000).await;
         assert!(matches!(found, Discovery::Found(_)), "{found:?}");
-        let again = sts.discover("example.test", &dns("1"), 1_500).await;
+        let again = sts.discover("example.test", &dns("1"), 1_200).await;
         assert_eq!(again, found);
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "cached");
+        // Past half of max_age (300 s) the same id is refreshed early.
+        sts.discover("example.test", &dns("1"), 1_301).await;
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2, "refreshed");
         // TXT gone: the cached policy still applies until it expires.
-        let gone = sts.discover("example.test", &MapDns::new(), 1_550).await;
+        let gone = sts.discover("example.test", &MapDns::new(), 1_850).await;
         assert!(matches!(gone, Discovery::Found(_)));
         assert_eq!(
-            sts.discover("example.test", &MapDns::new(), 1_601).await,
+            sts.discover("example.test", &MapDns::new(), 1_902).await,
             Discovery::NoPolicy
         );
         // New id: fetched again.
-        sts.discover("example.test", &dns("2"), 1_700).await;
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
-        // A failed refresh keeps the cached policy.
+        sts.discover("example.test", &dns("2"), 2_000).await;
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 3);
+        // A failed refresh keeps the cached policy, and is not retried at
+        // once.
         *fetcher.body.lock().unwrap() = Err("down".into());
-        let kept = sts.discover("example.test", &dns("3"), 1_800).await;
+        let kept = sts.discover("example.test", &dns("3"), 2_100).await;
         assert!(
             matches!(kept, Discovery::Found(ref p) if p.id == "2"),
             "{kept:?}"
         );
+        sts.discover("example.test", &dns("3"), 2_200).await;
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 4, "negative cache");
+        sts.discover("example.test", &dns("3"), 2_401).await;
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn concurrent_discoveries_fetch_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = fake(Ok(POLICY));
+        let sts = MtaSts::new(
+            Box::new(Arc::clone(&fetcher)),
+            dir.path().join("tls.sqlite"),
+        );
+        let dns = dns("1");
+        let runs = (0..8).map(|_| sts.discover("example.test", &dns, 1_000));
+        let found = futures::future::join_all(runs).await;
+        assert!(found.iter().all(|d| matches!(d, Discovery::Found(_))));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

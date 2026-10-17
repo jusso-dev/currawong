@@ -230,6 +230,8 @@ struct Setup {
     _dir: tempfile::TempDir,
     dns: MapDns,
     policy: Option<String>,
+    /// Send a TLS-RPT report (null sender, TLS-Report-Domain header).
+    report_mail: bool,
 }
 
 async fn setup() -> Setup {
@@ -250,6 +252,7 @@ async fn setup() -> Setup {
         _dir: dir,
         dns,
         policy: None,
+        report_mail: false,
     }
 }
 
@@ -308,7 +311,11 @@ impl Setup {
         let env = Envelope {
             id: Envelope::new_id(),
             tenant_id: None,
-            mail_from: "sender@outside.test".into(),
+            mail_from: if self.report_mail {
+                String::new()
+            } else {
+                "sender@outside.test".into()
+            },
             rcpt_to: vec!["user@example.test".into()],
             received_at: time::OffsetDateTime::now_utc(),
             remote_ip: "203.0.113.8".parse().unwrap(),
@@ -324,11 +331,13 @@ impl Setup {
             dsn_sent: false,
             pipeline: "deliver".into(),
         };
+        let body: &[u8] = if self.report_mail {
+            b"TLS-Report-Domain: example.test\r\nSubject: x\r\n\r\nx\r\n"
+        } else {
+            b"Subject: x\r\n\r\nx\r\n"
+        };
         self.spool
-            .accept(
-                env.clone(),
-                std::io::Cursor::new(b"Subject: x\r\n\r\nx\r\n".to_vec()),
-            )
+            .accept(env.clone(), std::io::Cursor::new(body.to_vec()))
             .await
             .unwrap();
         let dns = std::mem::take(&mut self.dns);
@@ -576,6 +585,91 @@ async fn dane_requires_starttls() {
         done.detail()
     );
     assert!(!sink.next().await.sent_mail());
+}
+
+#[tokio::test]
+async fn dane_with_only_unusable_tlsa_records_defers() {
+    let identity = Identity::self_signed(MX);
+    // PKIX-EE(1): published, signed, and not usable for SMTP.
+    let record = tlsa(1, 1, identity.spki_sha256());
+    let mut sink = sink(Some(identity)).await;
+    let mut setup = setup().await;
+    setup.dane(vec![record]);
+    let done = setup.deliver(&sink, OutboundTls::webpki()).await;
+    assert!(
+        matches!(done.outcome, DeliveryOutcome::TempFail(_)),
+        "{:?}",
+        done.outcome
+    );
+    assert!(
+        done.detail().contains("no usable TLSA record"),
+        "{}",
+        done.detail()
+    );
+    assert!(sink.drain().await.is_empty(), "the host was contacted");
+    assert_eq!(
+        failure_types(&done.report().await),
+        vec!["tlsa-invalid".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn dane_follows_a_secure_cname_to_its_tlsa() {
+    let identity = Identity::self_signed("anything.invalid");
+    let record = tlsa(3, 1, identity.spki_sha256());
+    let mut sink = sink(Some(identity)).await;
+    let mut setup = setup().await;
+    setup.dane(vec![]);
+    let target = "host.provider.test";
+    setup.dns.cname.insert(MX.into(), target.into());
+    setup
+        .dns
+        .ips
+        .insert(target.into(), vec!["127.0.0.1".parse().unwrap()]);
+    let expanded = format!("_25._tcp.{target}");
+    setup.dns.tlsa.insert(expanded.clone(), vec![record]);
+    for name in [target, expanded.as_str()] {
+        setup.dns.secure.insert(name.to_string());
+    }
+    let done = setup.deliver(&sink, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    assert!(sink.next().await.tls);
+}
+
+#[tokio::test]
+async fn tlsrpt_report_deliveries_are_not_themselves_reported() {
+    let identity = Identity::self_signed(MX);
+    let record = tlsa(3, 1, identity.spki_sha256());
+    let mut sink = sink(Some(identity)).await;
+    let mut setup = setup().await;
+    setup.dane(vec![record]);
+    setup.report_mail = true;
+    let done = setup.deliver(&sink, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    assert!(sink.next().await.tls);
+    let store = TlsRpt::new(done.cfg.delivery.tls_database.clone());
+    let today = time::OffsetDateTime::now_utc().date();
+    let report = store
+        .report(
+            today,
+            "example.test",
+            "Org",
+            "postmaster@gw.test",
+            "gw.test",
+        )
+        .await
+        .unwrap();
+    assert!(report.is_none(), "{report:?}");
 }
 
 #[tokio::test]

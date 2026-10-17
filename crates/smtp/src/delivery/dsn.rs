@@ -44,7 +44,7 @@ pub fn build_dsn(
         .from(("Mail Delivery Subsystem", daemon.as_str()))
         .to(env.mail_from.as_str())
         .subject("Delivery Status Notification (Failure)")
-        .header("Auto-Submitted", Text::new("auto-replied"))
+        .header("Auto-Submitted", Text::new("auto-generated"))
         .header("X-Currawong-DSN", Text::new("1"))
         .body(MimePart::new(
             ContentType::new("multipart/report").attribute("report-type", "delivery-status"),
@@ -128,7 +128,7 @@ fn fallback_dsn(hostname: &str, env: &Envelope) -> Vec<u8> {
         "From: Mail Delivery Subsystem <mailer-daemon@{hostname}>\r\n\
          To: {to}\r\n\
          Subject: Delivery Status Notification (Failure)\r\n\
-         Auto-Submitted: auto-replied\r\n\
+         Auto-Submitted: auto-generated\r\n\
          X-Currawong-DSN: 1\r\n\
          MIME-Version: 1.0\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\

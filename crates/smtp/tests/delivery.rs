@@ -59,7 +59,11 @@ struct Sink {
 }
 
 async fn sink(script: Script) -> Sink {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    sink_at("127.0.0.1:0", script).await
+}
+
+async fn sink_at(bind: &str, script: Script) -> Sink {
+    let listener = TcpListener::bind(bind).await.unwrap();
     let addr = listener.local_addr().unwrap();
     let hits = Arc::new(AtomicUsize::new(0));
     let (tx, sessions) = mpsc::unbounded_channel();
@@ -176,7 +180,7 @@ fn envelope(from: &str, rcpts: &[&str]) -> Envelope {
         attempts: 0,
         next_attempt_at: None,
         state: SpoolState::Incoming,
-        direction: currawong_core::Direction::Inbound,
+        direction: currawong_core::Direction::Outbound,
         tls_version: None,
         tls_cipher: None,
         rcpt_status: Vec::new(),
@@ -444,7 +448,7 @@ async fn expired_message_bounces_every_pending_recipient() {
         dsn.contains("Final-Recipient: rfc822; late@example.test"),
         "{dsn}"
     );
-    assert!(dsn.contains("Status: 4.4.7"), "{dsn}");
+    assert!(dsn.contains("Status: 5.4.7"), "{dsn}");
     assert!(dsn.contains("450 busy"), "{dsn}");
 }
 
@@ -565,4 +569,186 @@ async fn mx_pointing_inward_is_refused_unless_allowed() {
     deliverer.mx_port = mx.addr.port();
     let outcome = deliverer.deliver(&env.id).await.unwrap();
     assert_eq!(outcome, DeliveryOutcome::Delivered);
+}
+
+/// Two MX hosts on the same port: 127.0.0.1 (preference 10) and ::1 (20).
+async fn two_mx(first: Script, second: Script) -> (Sink, Sink, MapDns) {
+    let one = sink(first).await;
+    let two = sink_at(&format!("[::1]:{}", one.addr.port()), second).await;
+    let mut dns = MapDns::new();
+    dns.mx.insert(
+        "example.test".into(),
+        vec![
+            (10, "mx1.example.test".into()),
+            (20, "mx2.example.test".into()),
+        ],
+    );
+    dns.ips
+        .insert("mx1.example.test".into(), vec![one.addr.ip()]);
+    dns.ips
+        .insert("mx2.example.test".into(), vec![two.addr.ip()]);
+    (one, two, dns)
+}
+
+fn mx_deliverer(h: &Harness, dns: MapDns, port: u16) -> Deliverer<MapDns> {
+    let mut cfg = h.cfg.clone();
+    cfg.delivery.allow_private_mx = true;
+    let mut deliverer = Deliverer::new(Arc::clone(&h.spool), Arc::new(cfg), Arc::new(dns));
+    deliverer.mx_port = port;
+    deliverer
+}
+
+fn greeting(reply: &[u8]) -> Script {
+    Script {
+        greeting: Some(reply.to_vec()),
+        ..Script::ok()
+    }
+}
+
+#[tokio::test]
+async fn a_4xx_on_the_first_mx_tries_the_next() {
+    let h = harness().await;
+    let (busy, mut good, dns) = two_mx(
+        Script::rcpt(|_| b"451 4.3.0 try later\r\n".to_vec()),
+        Script::ok(),
+    )
+    .await;
+    let deliverer = mx_deliverer(&h, dns, busy.addr.port());
+    let env = queue(&h.spool, envelope("a@outside.test", &["b@example.test"])).await;
+    let outcome = deliverer.deliver(&env.id).await.unwrap();
+    assert_eq!(outcome, DeliveryOutcome::Delivered);
+    assert_eq!(busy.hits.load(Ordering::SeqCst), 1);
+    let data = good.sessions.recv().await.unwrap().data;
+    assert!(data.ends_with(b"hello\r\n"));
+}
+
+#[tokio::test]
+async fn permanent_only_when_every_host_failed_permanently() {
+    let h = harness().await;
+    let (one, _two, dns) = two_mx(
+        greeting(b"554 5.7.1 go away\r\n"),
+        greeting(b"421 4.3.2 busy\r\n"),
+    )
+    .await;
+    let deliverer = mx_deliverer(&h, dns, one.addr.port());
+    let env = queue(&h.spool, envelope("a@outside.test", &["b@example.test"])).await;
+    let outcome = deliverer.deliver(&env.id).await.unwrap();
+    assert!(
+        matches!(outcome, DeliveryOutcome::TempFail(_)),
+        "{outcome:?}"
+    );
+
+    let (one, _two, dns) = two_mx(
+        greeting(b"554 5.7.1 go away\r\n"),
+        greeting(b"554 5.7.1 no\r\n"),
+    )
+    .await;
+    let deliverer = mx_deliverer(&h, dns, one.addr.port());
+    let env = queue(&h.spool, envelope("a@outside.test", &["b@example.test"])).await;
+    let outcome = deliverer.deliver(&env.id).await.unwrap();
+    assert!(
+        matches!(outcome, DeliveryOutcome::PermFail(_)),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn failures_bounce_only_to_trusted_senders() {
+    let h = harness().await;
+    let mx = sink(Script::rcpt(|_| b"550 5.1.1 no such user\r\n".to_vec())).await;
+    let mut cfg = h.cfg.clone();
+    route(&mut cfg, "example.test", mx.addr);
+    let deliverer = Deliverer::new(Arc::clone(&h.spool), Arc::new(cfg), Arc::new(MapDns::new()));
+
+    // Unauthenticated inbound mail: no DSN, the failure is only logged.
+    let mut inbound = envelope("forged@outside.test", &["gone@example.test"]);
+    inbound.direction = currawong_core::Direction::Inbound;
+    let inbound = queue(&h.spool, inbound).await;
+    deliverer.deliver(&inbound.id).await.unwrap();
+    assert!(dsns(&h.spool).await.is_empty());
+    let stored = h.spool.load(&inbound.id).await.unwrap();
+    assert_eq!(status(&stored, "gone@example.test").status, "bounced");
+    assert_eq!(stored.state, SpoolState::Done);
+
+    // The same mail, but SPF passed for the sender: bounced.
+    let mut verified = envelope("real@outside.test", &["gone@example.test"]);
+    verified.direction = currawong_core::Direction::Inbound;
+    verified.prepend_headers =
+        vec!["Authentication-Results: gw.test; spf=pass smtp.mailfrom=outside.test\r\n".into()];
+    let verified = queue(&h.spool, verified).await;
+    deliverer.deliver(&verified.id).await.unwrap();
+    assert_eq!(dsns(&h.spool).await.len(), 1);
+
+    // Automatic mail is never bounced, even from our own users.
+    let auto = envelope("robot@outside.test", &["gone@example.test"]);
+    let body = b"Auto-Submitted: auto-replied\r\nSubject: x\r\n\r\nx\r\n".to_vec();
+    h.spool
+        .accept(auto.clone(), std::io::Cursor::new(body))
+        .await
+        .unwrap();
+    deliverer.deliver(&auto.id).await.unwrap();
+    assert_eq!(dsns(&h.spool).await.len(), 1);
+}
+
+#[tokio::test]
+async fn dsns_to_one_sender_are_rate_limited() {
+    let h = harness().await;
+    let mx = sink(Script::rcpt(|_| b"550 5.1.1 no such user\r\n".to_vec())).await;
+    let mut cfg = h.cfg.clone();
+    route(&mut cfg, "example.test", mx.addr);
+    let deliverer = Deliverer::new(Arc::clone(&h.spool), Arc::new(cfg), Arc::new(MapDns::new()));
+    for _ in 0..12 {
+        let env = queue(
+            &h.spool,
+            envelope("loud@outside.test", &["gone@example.test"]),
+        )
+        .await;
+        deliverer.deliver(&env.id).await.unwrap();
+    }
+    assert_eq!(dsns(&h.spool).await.len(), 10);
+}
+
+#[tokio::test]
+async fn a_failing_message_backs_off() {
+    let h = harness().await;
+    let boom = queue(&h.spool, envelope("a@outside.test", &["x@boom.test"])).await;
+    let deliverer = Deliverer::new(
+        Arc::clone(&h.spool),
+        Arc::new(h.cfg.clone()),
+        Arc::new(PanicDns(MapDns::new())),
+    );
+    deliverer.poll_due().await.unwrap();
+    let stored = h.spool.load(&boom.id).await.unwrap();
+    assert_eq!(stored.attempts, 1);
+    assert!(stored.next_attempt_at.unwrap() > time::OffsetDateTime::now_utc());
+}
+
+#[tokio::test]
+async fn clear_text_delivery_is_noted_in_received() {
+    let h = harness().await;
+    let mut mx = sink(Script::ok()).await;
+    let mut cfg = h.cfg.clone();
+    route(&mut cfg, "example.test", mx.addr);
+    let env = queue(&h.spool, envelope("a@outside.test", &["b@example.test"])).await;
+    let deliverer = Deliverer::new(Arc::clone(&h.spool), Arc::new(cfg), Arc::new(MapDns::new()));
+    deliverer.deliver(&env.id).await.unwrap();
+    let data = String::from_utf8(mx.sessions.recv().await.unwrap().data).unwrap();
+    let received = data.split("\r\n\r\n").next().unwrap();
+    assert!(received.contains("(relayed onward without TLS)"), "{data}");
+}
+
+#[tokio::test]
+async fn bad_recipient_domains_never_reach_dns() {
+    let h = harness().await;
+    let deliverer = Deliverer::new(
+        Arc::clone(&h.spool),
+        Arc::new(h.cfg.clone()),
+        Arc::new(PanicDns(MapDns::new())),
+    );
+    let env = queue(&h.spool, envelope("a@outside.test", &["x@[127.0.0.1]"])).await;
+    let outcome = deliverer.deliver(&env.id).await.unwrap();
+    assert!(
+        matches!(&outcome, DeliveryOutcome::PermFail(d) if d.starts_with("5.1.2")),
+        "{outcome:?}"
+    );
 }

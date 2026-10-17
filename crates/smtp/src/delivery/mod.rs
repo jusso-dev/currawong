@@ -18,12 +18,24 @@ use currawong_spool::{next_retry, Envelope, RcptStatus, Spool, SpoolError, Spool
 use futures::{FutureExt, StreamExt};
 use mail_auth::report::tlsrpt::{PolicyDetails, PolicyType, ResultType};
 use mta_sts::{Discovery, HttpsFetcher, Mode, MtaSts};
-use route::Hop;
+use route::{valid_domain, Hop};
 use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha256};
-use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    panic::AssertUnwindSafe,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 use time::OffsetDateTime;
-use tokio::time::Instant;
+use tokio::{sync::Semaphore, time::Instant};
+
+/// Wall-clock bound on one `deliver` call, across all its domains.
+pub const DELIVER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// DSNs per hour to one sender address, and to one sender domain.
+const DSN_PER_SENDER: u32 = 10;
+const DSN_PER_DOMAIN: u32 = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeliveryOutcome {
@@ -80,19 +92,33 @@ pub struct Deliverer<D: DnsLookup> {
     pub tlsrpt: Option<Arc<TlsRpt>>,
     /// For TLS-RPT uploads to `https:` report addresses.
     pub http: Option<reqwest::Client>,
+    /// One semaphore per recipient domain (`delivery.max_per_destination`).
+    destinations: dashmap::DashMap<String, Arc<Semaphore>>,
+    /// DSNs sent this hour, per sender address and per sender domain.
+    dsn_counts: Mutex<HashMap<String, (Instant, u32)>>,
 }
 
 /// The TLS rule for one MX host, chosen in RFC 7672 / RFC 8461 order.
 enum Plan {
-    Dane(Vec<crate::dns::Tlsa>),
+    /// Usable records, and the TLSA base domain they were found at.
+    Dane(Vec<crate::dns::Tlsa>, String),
     Sts(Arc<mta_sts::Policy>),
     Opportunistic,
+}
+
+/// The bytes for one message, with our `Received` header in two forms.
+struct Outbound {
+    received_tls: Vec<u8>,
+    received_clear: Vec<u8>,
+    rest: Vec<u8>,
+    /// A TLS-RPT report: its own delivery is not reported (RFC 8460 5.3).
+    is_report: bool,
 }
 
 impl<D: DnsLookup> Deliverer<D> {
     pub fn new(spool: Arc<Spool>, cfg: Arc<Config>, dns: Arc<D>) -> Self {
         let tls = OutboundTls::webpki();
-        let http = match tls.http_client() {
+        let http = match tls.http_client(cfg.delivery.allow_private_mx) {
             Ok(client) => Some(client),
             Err(err) => {
                 tracing::error!(%err, "HTTPS client for MTA-STS and TLS-RPT failed");
@@ -122,6 +148,8 @@ impl<D: DnsLookup> Deliverer<D> {
             mta_sts,
             tlsrpt,
             http,
+            destinations: dashmap::DashMap::new(),
+            dsn_counts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -176,15 +204,27 @@ impl<D: DnsLookup> Deliverer<D> {
                     .filter(|detail| !detail.is_empty())
                     .unwrap_or_else(|| "none".into());
                 let detail = format!(
-                    "4.4.7 message expired after {} days; last error: {last}",
+                    "5.4.7 message expired after {} days; last error: {last}",
                     self.cfg.delivery.max_age_days
                 );
                 set_status(&mut env, rcpt, PERM, &detail);
             }
         } else if !pending.is_empty() {
-            let message = outbound_bytes(&env, &body, &self.cfg.gateway.hostname);
+            let message = outbound(&env, &body, &self.cfg.gateway.hostname);
+            let deadline = Instant::now() + DELIVER_TIMEOUT;
             for (domain, rcpts) in group_by_domain(&pending) {
-                for (rcpt, result) in self.deliver_domain(&env, &message, &domain, &rcpts).await {
+                let attempt = self.deliver_domain(&env, &message, &domain, &rcpts);
+                let results = match tokio::time::timeout_at(deadline, attempt).await {
+                    Ok(results) => results,
+                    Err(_) => rcpts
+                        .iter()
+                        .map(|rcpt| {
+                            let detail = "4.4.2 delivery attempt ran out of time".to_string();
+                            (rcpt.clone(), DeliveryOutcome::TempFail(detail))
+                        })
+                        .collect(),
+                };
+                for (rcpt, result) in results {
                     match result {
                         DeliveryOutcome::Delivered => set_status(&mut env, &rcpt, DELIVERED, "250"),
                         DeliveryOutcome::TempFail(detail) => {
@@ -199,6 +239,12 @@ impl<D: DnsLookup> Deliverer<D> {
                         }
                     }
                 }
+                // Saved per domain, so a crash later in this pass cannot send
+                // the same copy to this domain again.
+                self.spool
+                    .update(&env)
+                    .await
+                    .map_err(|err| err.to_string())?;
             }
         }
         // Persist results before bouncing, so a crash here leaves `perm`
@@ -253,8 +299,20 @@ impl<D: DnsLookup> Deliverer<D> {
             return Ok(None);
         };
         let detail = first.detail.clone();
-        if !is_null_sender(&env.mail_from) && client::valid_path(&env.mail_from) {
-            let dsn_id = dsn_id(&env.id, &failed);
+        let dsn_id = dsn_id(&env.id, &failed);
+        let send = if !bounce_allowed(env, body) {
+            tracing::info!(id = %env.id, sender = %env.mail_from, "sender not trusted, failure not bounced");
+            false
+        } else if self.spool.load(&dsn_id).await.is_ok() {
+            // Already spooled before a crash: finish without counting it again.
+            true
+        } else if !self.dsn_quota(&env.mail_from) {
+            tracing::warn!(id = %env.id, sender = %env.mail_from, "DSN rate limit reached, failure not bounced");
+            false
+        } else {
+            true
+        };
+        if send {
             let exists = match self.spool.load(&dsn_id).await {
                 Ok(_) => true,
                 Err(SpoolError::NotFound(_)) => false,
@@ -294,10 +352,49 @@ impl<D: DnsLookup> Deliverer<D> {
         Ok(Some(detail))
     }
 
+    /// Count one DSN against the sender's and the sender domain's hourly
+    /// allowance. False when either is spent.
+    fn dsn_quota(&self, sender: &str) -> bool {
+        let sender = sender.to_ascii_lowercase();
+        let domain = sender
+            .rsplit_once('@')
+            .map(|(_, domain)| format!("@{domain}"))
+            .unwrap_or_default();
+        let now = Instant::now();
+        let hour = Duration::from_secs(3600);
+        let mut counts = self
+            .dsn_counts
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if counts.len() > 10_000 {
+            counts.retain(|_, (start, _)| now.duration_since(*start) < hour);
+        }
+        let mut current = |key: &str| {
+            let entry = counts.entry(key.to_string()).or_insert((now, 0));
+            if now.duration_since(entry.0) >= hour {
+                *entry = (now, 0);
+            }
+            entry.1
+        };
+        if current(&sender) >= DSN_PER_SENDER || current(&domain) >= DSN_PER_DOMAIN {
+            return false;
+        }
+        for key in [sender, domain] {
+            if let Some(entry) = counts.get_mut(&key) {
+                entry.1 += 1;
+            }
+        }
+        true
+    }
+
+    /// Try the domain's hosts in order. Recipients a host accepted or refused
+    /// for good are settled; the rest (4xx, or the host failing) go on to
+    /// the next host. A recipient fails permanently only when every host that
+    /// was tried failed permanently.
     async fn deliver_domain(
         &self,
         env: &Envelope,
-        message: &[u8],
+        message: &Outbound,
         domain: &str,
         rcpts: &[String],
     ) -> Vec<(String, DeliveryOutcome)> {
@@ -306,6 +403,23 @@ impl<D: DnsLookup> Deliverer<D> {
                 .iter()
                 .map(|rcpt| (rcpt.clone(), outcome.clone()))
                 .collect()
+        };
+        if !valid_domain(domain) {
+            let detail = format!("5.1.2 bad recipient domain {}", client::sanitise(domain));
+            return all(DeliveryOutcome::PermFail(detail));
+        }
+        let gate = Arc::clone(
+            &self
+                .destinations
+                .entry(domain.to_string())
+                .or_insert_with(|| {
+                    Arc::new(Semaphore::new(self.cfg.delivery.max_per_destination.max(1)))
+                }),
+        );
+        let Ok(_permit) = gate.acquire().await else {
+            return all(DeliveryOutcome::TempFail(
+                "4.3.0 delivery shutting down".into(),
+            ));
         };
         let route = match resolve_route(domain, &self.cfg, self.dns.as_ref()).await {
             Ok(mut route) => {
@@ -319,12 +433,7 @@ impl<D: DnsLookup> Deliverer<D> {
             Err(RouteError::Temp(detail)) => return all(DeliveryOutcome::TempFail(detail)),
             Err(RouteError::Perm(detail)) => return all(DeliveryOutcome::PermFail(detail)),
         };
-        let tx = Transaction {
-            helo: &self.cfg.gateway.hostname,
-            mail_from: &env.mail_from,
-            rcpts,
-            message,
-        };
+        let report = !message.is_report;
         let sts = match (&self.mta_sts, route.via_mx) {
             (Some(sts), true) => {
                 let now = self.clock.now().unix_timestamp();
@@ -334,33 +443,71 @@ impl<D: DnsLookup> Deliverer<D> {
         };
         if let Discovery::Failed { result, .. } = &sts {
             let policy = PolicyDetails::new(PolicyType::Sts, domain);
-            self.record(&policy, Some(failure(*result, "", None))).await;
+            self.record(report, &policy, Some(failure(*result, "", None)))
+                .await;
         }
+        let mut settled = Vec::new();
+        let mut remaining = rcpts.to_vec();
+        let mut deferred: HashMap<String, String> = HashMap::new();
         let mut last = HostFailure::temp(format!("4.4.1 no host accepted mail for {domain}"));
-        for hop in &route.hops {
-            let plan = match self.plan(domain, &route, hop, &sts).await {
+        let mut all_permanent = true;
+        'hosts: for hop in &route.hops {
+            let plan = match self.plan(domain, &route, hop, &sts, report).await {
                 Ok(plan) => plan,
                 Err(failure) => {
                     tracing::info!(host = %hop.host, detail = %failure.detail, "MX host ruled out");
+                    all_permanent &= failure.permanent;
                     last = failure;
                     continue;
                 }
             };
             for addr in &hop.addrs {
-                match self.attempt(domain, hop, *addr, &plan, &tx).await {
-                    Ok(results) => return results,
+                let tx = Transaction {
+                    helo: &self.cfg.gateway.hostname,
+                    mail_from: &env.mail_from,
+                    rcpts: &remaining,
+                    received_tls: &message.received_tls,
+                    received_clear: &message.received_clear,
+                    message: &message.rest,
+                };
+                match self.attempt(domain, hop, *addr, &plan, &tx, report).await {
+                    Ok(results) => {
+                        all_permanent = false;
+                        remaining.clear();
+                        for (rcpt, outcome) in results {
+                            match outcome {
+                                DeliveryOutcome::TempFail(detail) => {
+                                    deferred.insert(rcpt.clone(), detail);
+                                    remaining.push(rcpt);
+                                }
+                                other => settled.push((rcpt, other)),
+                            }
+                        }
+                        if remaining.is_empty() {
+                            break 'hosts;
+                        }
+                        // A 4xx from this host: the next host may take them.
+                        continue 'hosts;
+                    }
                     Err(failure) => {
                         tracing::debug!(host = %hop.host, %addr, detail = %failure.detail, "delivery attempt failed");
+                        all_permanent &= failure.permanent;
                         last = failure;
                     }
                 }
             }
         }
-        if last.permanent {
-            all(DeliveryOutcome::PermFail(last.detail))
-        } else {
-            all(DeliveryOutcome::TempFail(last.detail))
+        for rcpt in remaining {
+            let outcome = match deferred.remove(&rcpt) {
+                Some(detail) => DeliveryOutcome::TempFail(detail),
+                None if all_permanent && last.permanent => {
+                    DeliveryOutcome::PermFail(last.detail.clone())
+                }
+                None => DeliveryOutcome::TempFail(last.detail.clone()),
+            };
+            settled.push((rcpt, outcome));
         }
+        settled
     }
 
     /// DANE when the MX and address answers are DNSSEC-secure and usable
@@ -372,38 +519,52 @@ impl<D: DnsLookup> Deliverer<D> {
         route: &route::Route,
         hop: &Hop,
         sts: &Discovery,
+        report: bool,
     ) -> Result<Plan, HostFailure> {
         if !route.via_mx {
             return Ok(Plan::Opportunistic);
         }
         if self.cfg.delivery.dane && route.mx_secure && hop.secure {
-            let name = format!("_25._tcp.{}", hop.host);
-            match self.dns.resolve_tlsa(&name).await {
-                Ok(answer) if answer.secure => {
-                    let usable = dane::usable(&answer.records);
-                    if !usable.is_empty() {
-                        return Ok(Plan::Dane(usable));
+            // RFC 7672 2.2.2: the CNAME-expanded name first, then the original.
+            let bases = hop.canonical.iter().chain(std::iter::once(&hop.host));
+            for base in bases {
+                let name = format!("_25._tcp.{base}");
+                let ruled_out = |result: ResultType, reason: String| HostFailure {
+                    detail: format!("4.7.5 DANE: {reason}"),
+                    permanent: false,
+                    tls: Some(result),
+                };
+                let failed = match self.dns.resolve_tlsa(&name).await {
+                    Ok(answer) if answer.secure && !answer.records.is_empty() => {
+                        let usable = dane::usable(&answer.records);
+                        if !usable.is_empty() {
+                            return Ok(Plan::Dane(usable, base.clone()));
+                        }
+                        // Published but none usable: the domain asked for
+                        // DANE, so this host is not used without it.
+                        ruled_out(
+                            ResultType::TlsaInvalid,
+                            format!("no usable TLSA record at {name}"),
+                        )
                     }
-                }
-                Ok(_) | Err(crate::dns::LookupError::NxDomain) => {}
-                // Fail closed: a TLSA answer that cannot be trusted rules the
-                // host out rather than letting delivery fall back.
-                Err(err) => {
-                    let result = if err == crate::dns::LookupError::Bogus {
-                        ResultType::DnssecInvalid
-                    } else {
-                        ResultType::TlsaInvalid
-                    };
-                    let mut policy = PolicyDetails::new(PolicyType::Tlsa, domain);
-                    policy.mx_host = vec![hop.host.clone()];
-                    self.record(&policy, Some(failure(result, &hop.host, None)))
-                        .await;
-                    return Err(HostFailure {
-                        detail: format!("4.7.5 DANE: TLSA lookup for {name} failed: {err}"),
-                        permanent: false,
-                        tls: Some(result),
-                    });
-                }
+                    Ok(_) | Err(crate::dns::LookupError::NxDomain) => continue,
+                    // Fail closed: a TLSA answer that cannot be trusted rules
+                    // the host out rather than letting delivery fall back.
+                    Err(err) => {
+                        let result = if err == crate::dns::LookupError::Bogus {
+                            ResultType::DnssecInvalid
+                        } else {
+                            ResultType::TlsaInvalid
+                        };
+                        ruled_out(result, format!("TLSA lookup for {name} failed: {err}"))
+                    }
+                };
+                let mut policy = PolicyDetails::new(PolicyType::Tlsa, domain);
+                policy.mx_host = vec![hop.host.clone()];
+                let result = failed.tls.unwrap_or_default();
+                self.record(report, &policy, Some(failure(result, &hop.host, None)))
+                    .await;
+                return Err(failed);
             }
         }
         let Discovery::Found(policy) = sts else {
@@ -414,7 +575,7 @@ impl<D: DnsLookup> Deliverer<D> {
         }
         let details = sts_policy(domain, policy);
         let result = ResultType::ValidationFailure;
-        self.record(&details, Some(failure(result, &hop.host, None)))
+        self.record(report, &details, Some(failure(result, &hop.host, None)))
             .await;
         if policy.mode == Mode::Enforce {
             return Err(HostFailure {
@@ -440,13 +601,17 @@ impl<D: DnsLookup> Deliverer<D> {
         addr: SocketAddr,
         plan: &Plan,
         tx: &Transaction<'_>,
+        record: bool,
     ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure> {
         let server_name = ServerName::try_from(hop.host.clone())
             .map_err(|_| HostFailure::temp(format!("4.7.5 bad host name {}", hop.host)))?;
         let webpki = || self.tls.webpki_config().map_err(HostFailure::temp);
         let (starttls, fallback, report) = match plan {
-            Plan::Dane(records) => {
-                let names = [hop.host.as_str(), domain]
+            Plan::Dane(records, base) => {
+                // Reference names for DANE-TA (RFC 7672 3.2.2).
+                let mut names: Vec<&str> = vec![base, &hop.host, domain];
+                names.dedup();
+                let names = names
                     .iter()
                     .filter_map(|name| ServerName::try_from(name.to_string()).ok())
                     .collect();
@@ -490,19 +655,24 @@ impl<D: DnsLookup> Deliverer<D> {
         let result = client::send(stream, tx, Some(&starttls)).await;
         if let Some(policy) = &report {
             match &result {
-                Ok(_) => self.record(policy, None).await,
+                Ok(_) => self.record(record, policy, None).await,
                 Err(HostFailure {
                     tls: Some(result), ..
                 }) => {
                     let failed = failure(*result, &hop.host, Some(addr));
-                    self.record(policy, Some(failed)).await;
+                    self.record(record, policy, Some(failed)).await;
                 }
                 Err(_) => {}
             }
         }
         match result {
             Err(failure) if failure.tls.is_some() && fallback => {
-                tracing::info!(host = %hop.host, detail = %failure.detail, "TLS did not verify; delivering without TLS");
+                let reason = if report.is_some() {
+                    "sts_testing"
+                } else {
+                    "tls_failed"
+                };
+                client::cleartext_fallback(&starttls, reason, &failure.detail);
                 let stream = client::connect(addr).await?;
                 client::send(stream, tx, None).await
             }
@@ -510,7 +680,15 @@ impl<D: DnsLookup> Deliverer<D> {
         }
     }
 
-    async fn record(&self, policy: &PolicyDetails, failure: Option<crate::tlsrpt::Failure>) {
+    async fn record(
+        &self,
+        enabled: bool,
+        policy: &PolicyDetails,
+        failure: Option<crate::tlsrpt::Failure>,
+    ) {
+        if !enabled {
+            return;
+        }
         if let Some(store) = &self.tlsrpt {
             let day = self.clock.now().date();
             if let Err(err) = store.record(day, policy, failure.as_ref()).await {
@@ -521,8 +699,11 @@ impl<D: DnsLookup> Deliverer<D> {
 
     /// The delivery pass the daemon runs: every scanned message whose retry
     /// time has come, a bounded number at once. One message failing or
-    /// panicking cannot stop the others.
+    /// panicking cannot stop the others, and it backs off like a deferral
+    /// so a poison message is not retried on every pass.
     pub async fn poll_due(&self) -> Result<(), String> {
+        self.destinations
+            .retain(|_, gate| Arc::strong_count(gate) > 1);
         let now = self.clock.now();
         let mut due = Vec::new();
         for state in [SpoolState::Incoming, SpoolState::Deferred] {
@@ -541,13 +722,27 @@ impl<D: DnsLookup> Deliverer<D> {
         futures::stream::iter(due)
             .for_each_concurrent(limit, |id| async move {
                 match AssertUnwindSafe(self.deliver(&id)).catch_unwind().await {
-                    Ok(Ok(_)) => {}
+                    Ok(Ok(_)) => return,
                     Ok(Err(err)) => tracing::error!(%id, %err, "delivery failed"),
                     Err(_) => tracing::error!(%id, "delivery panicked"),
                 }
+                self.back_off(&id).await;
             })
             .await;
         Ok(())
+    }
+
+    async fn back_off(&self, id: &MessageId) {
+        let Ok(mut env) = self.spool.load(id).await else {
+            return;
+        };
+        env.attempts = env.attempts.saturating_add(1);
+        let wait = time::Duration::try_from(next_retry(env.attempts))
+            .unwrap_or(time::Duration::minutes(5));
+        env.next_attempt_at = Some(self.clock.now() + wait);
+        if let Err(err) = self.spool.update(&env).await {
+            tracing::error!(%id, %err, "could not schedule a retry");
+        }
     }
 }
 
@@ -621,7 +816,63 @@ pub fn is_null_sender(mail_from: &str) -> bool {
     trimmed.is_empty() || trimmed == "<>"
 }
 
-fn received_header(env: &Envelope, hostname: &str) -> String {
+/// Bounce only to a sender we can stand behind, so failures are not
+/// backscatter: mail our own users submitted, or a sender that SPF or DMARC
+/// passed. Never the null sender, a malformed address or automatic mail.
+pub fn bounce_allowed(env: &Envelope, body: &[u8]) -> bool {
+    if is_null_sender(&env.mail_from) || !client::valid_path(&env.mail_from) {
+        return false;
+    }
+    let automatic = header_values(body, "auto-submitted")
+        .iter()
+        .any(|value| !value.eq_ignore_ascii_case("no"));
+    if automatic {
+        return false;
+    }
+    let submitted = env.direction == currawong_core::Direction::Outbound || env.tenant_id.is_some();
+    // The pipeline's own Authentication-Results, never one from the sender.
+    let verified = env.prepend_headers.iter().any(|header| {
+        let header = header.to_ascii_lowercase();
+        header.starts_with("authentication-results:")
+            && header
+                .split(|ch: char| ch == ';' || ch.is_whitespace())
+                .any(|token| token == "spf=pass" || token == "dmarc=pass")
+    });
+    submitted || verified
+}
+
+/// Unfolded values of a header in the message's top header block.
+fn header_values(body: &[u8], name: &str) -> Vec<String> {
+    let mut values: Vec<String> = Vec::new();
+    let mut current = false;
+    for line in body.split(|&byte| byte == b'\n') {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            if current {
+                if let Some(last) = values.last_mut() {
+                    last.push(' ');
+                    last.push_str(line.trim());
+                }
+            }
+            continue;
+        }
+        current = false;
+        if let Some((field, value)) = line.split_once(':') {
+            if field.trim().eq_ignore_ascii_case(name) {
+                current = true;
+                values.push(value.trim().to_string());
+            }
+        }
+    }
+    values
+}
+
+/// `note` is a comment appended to the header, or empty.
+fn received_header(env: &Envelope, hostname: &str, note: &str) -> String {
     let tls = match &env.tls_version {
         Some(version) => format!(
             "\r\n\t(using {} with cipher {})",
@@ -635,7 +886,7 @@ fn received_header(env: &Envelope, hostname: &str) -> String {
         .format(&time::format_description::well_known::Rfc2822)
         .unwrap_or_else(|_| "Thu, 01 Jan 1970 00:00:00 +0000".into());
     format!(
-        "Received: from {} ([{}]) by {} with ESMTP id {}{tls};\r\n\t{date}\r\n",
+        "Received: from {} ([{}]) by {} with ESMTP id {}{tls}{note};\r\n\t{date}\r\n",
         sanitise_token(&env.helo),
         env.remote_ip,
         hostname,
@@ -650,17 +901,23 @@ fn sanitise_token(value: &str) -> String {
         .collect()
 }
 
-pub fn outbound_bytes(env: &Envelope, body: &[u8], hostname: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(received_header(env, hostname).as_bytes());
+fn outbound(env: &Envelope, body: &[u8], hostname: &str) -> Outbound {
+    let mut rest = Vec::new();
     for header in &env.prepend_headers {
-        out.extend_from_slice(header.as_bytes());
+        rest.extend_from_slice(header.as_bytes());
         if !header.ends_with("\r\n") {
-            out.extend_from_slice(b"\r\n");
+            rest.extend_from_slice(b"\r\n");
         }
     }
-    out.extend_from_slice(body);
-    out
+    rest.extend_from_slice(body);
+    Outbound {
+        received_tls: received_header(env, hostname, "").into_bytes(),
+        received_clear: received_header(env, hostname, "\r\n\t(relayed onward without TLS)")
+            .into_bytes(),
+        rest,
+        is_report: is_null_sender(&env.mail_from)
+            && !header_values(body, "tls-report-domain").is_empty(),
+    }
 }
 
 #[cfg(test)]

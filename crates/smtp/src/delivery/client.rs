@@ -94,6 +94,10 @@ pub struct Transaction<'a> {
     pub helo: &'a str,
     pub mail_from: &'a str,
     pub rcpts: &'a [String],
+    /// Our `Received` header, in the form for a TLS session and the form
+    /// that records the next hop got the message in clear text.
+    pub received_tls: &'a [u8],
+    pub received_clear: &'a [u8],
     pub message: &'a [u8],
 }
 
@@ -134,7 +138,7 @@ where
     let ehlo = command(&mut conn, &format!("EHLO {}\r\n", tx.helo)).await?;
     expect_2xx(&ehlo, "EHLO")?;
     let Some(starttls) = tls else {
-        return finish(conn, tx).await;
+        return finish(conn, tx, false).await;
     };
     if !offers(&ehlo, "STARTTLS") {
         if starttls.required {
@@ -144,19 +148,21 @@ where
                 "STARTTLS not offered",
             ));
         }
-        return finish(conn, tx).await;
+        cleartext_fallback(starttls, "starttls_not_offered", "STARTTLS not offered");
+        return finish(conn, tx, false).await;
     }
     let reply = command(&mut conn, "STARTTLS\r\n").await?;
     if reply.code != 220 {
+        let reason = format!("STARTTLS refused: {}", reply.detail());
         if starttls.required {
-            let reason = format!("STARTTLS refused: {}", reply.detail());
             return Err(HostFailure::tls(
                 starttls,
                 ResultType::StartTlsNotSupported,
                 &reason,
             ));
         }
-        return finish(conn, tx).await;
+        cleartext_fallback(starttls, "starttls_refused", &reason);
+        return finish(conn, tx, false).await;
     }
     // Bytes already buffered arrived before TLS; reading them as if they
     // came over TLS is the classic STARTTLS injection.
@@ -186,7 +192,13 @@ where
     let mut conn = BufReader::new(stream);
     let ehlo = command(&mut conn, &format!("EHLO {}\r\n", tx.helo)).await?;
     expect_2xx(&ehlo, "EHLO after STARTTLS")?;
-    finish(conn, tx).await
+    finish(conn, tx, true).await
+}
+
+/// Every message that leaves without TLS is logged and counted.
+pub fn cleartext_fallback(starttls: &Starttls, reason: &'static str, detail: &str) {
+    tracing::warn!(host = %starttls.server_name.to_str(), %reason, %detail, "delivering without TLS");
+    metrics::counter!("currawong_delivery_tls_fallback_total", "reason" => reason).increment(1);
 }
 
 fn offers(ehlo: &Reply, keyword: &str) -> bool {
@@ -222,6 +234,7 @@ fn handshake_failure(err: &std::io::Error) -> (ResultType, String) {
 pub(crate) async fn finish<S>(
     mut conn: BufReader<S>,
     tx: &Transaction<'_>,
+    tls: bool,
 ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
@@ -261,7 +274,12 @@ where
     }
     let data = command(&mut conn, "DATA\r\n").await?;
     let end = if data.code == 354 {
-        let mut wire = dot_stuff(tx.message);
+        let received = if tls {
+            tx.received_tls
+        } else {
+            tx.received_clear
+        };
+        let mut wire = dot_stuff(&[received, tx.message].concat());
         wire.extend_from_slice(b".\r\n");
         write_timed(&mut conn, &wire, DATA_END_TIMEOUT).await?;
         read_reply_timed(&mut conn, DATA_END_TIMEOUT).await?
@@ -443,7 +461,8 @@ pub fn valid_path(addr: &str) -> bool {
             .all(|byte| byte > b' ' && byte != 0x7f && byte != b'<' && byte != b'>')
 }
 
-/// Dot-stuff, write CRLF line endings, and leave the buffer ending in CRLF
+/// Dot-stuff, write CRLF line endings (a lone CR or LF becomes CRLF, so no
+/// bare line end reaches the next hop), and leave the buffer ending in CRLF
 /// so the terminator is just `.` CRLF.
 pub fn dot_stuff(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + 8);
@@ -452,8 +471,14 @@ pub fn dot_stuff(bytes: &[u8]) -> Vec<u8> {
         if at_line && byte == b'.' {
             out.push(b'.');
         }
-        if byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r') {
-            out.push(b'\r');
+        match byte {
+            b'\r' if bytes.get(index + 1) != Some(&b'\n') => {
+                out.extend_from_slice(b"\r\n");
+                at_line = true;
+                continue;
+            }
+            b'\n' if index == 0 || bytes[index - 1] != b'\r' => out.push(b'\r'),
+            _ => {}
         }
         out.push(byte);
         at_line = byte == b'\n';
@@ -528,5 +553,6 @@ mod tests {
         assert_eq!(dot_stuff(b"a\r\n.b\r\n"), b"a\r\n..b\r\n");
         assert_eq!(dot_stuff(b"a\n.\n"), b"a\r\n..\r\n");
         assert_eq!(dot_stuff(b"no newline"), b"no newline\r\n");
+        assert_eq!(dot_stuff(b"a\r.\r\nb\rc"), b"a\r\n..\r\nb\r\nc\r\n");
     }
 }
