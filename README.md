@@ -56,6 +56,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/policy` | Policy engine and scoring |
 | `crates/quarantine` | Quarantine store and digests |
 | `crates/admin` | axum admin API and UI |
+| `crates/integrations` | Event export: syslog (RFC 5424, CEF), signed webhooks and Wedgetail. See [docs/events.md](docs/events.md) |
 | `crates/currawongd` | The daemon binary |
 
 ## Roadmap

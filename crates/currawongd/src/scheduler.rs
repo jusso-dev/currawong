@@ -89,6 +89,14 @@ async fn classify_one(
             tracing::info!(id = %env.id, %reason, "quarantined");
         }
     }
+    currawong_integrations::export::emit(currawong_integrations::export::Event::message_verdict(
+        env.tenant_id.as_deref(),
+        &env.id,
+        env.direction,
+        &env.mail_from,
+        &env.rcpt_to,
+        &verdict,
+    ));
     Ok(())
 }
 

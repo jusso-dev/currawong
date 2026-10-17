@@ -1,0 +1,1 @@
+CEF:0|Currawong|Currawong Gateway|0.0.1|url_click|URL click|7|rt=1792195260000 externalId=01JA0000000000000000000002 cs1Label=tenant cs1=tenant-a cs2Label=messageId cs2=01JA00000000000000000000M1 act=blocked duser=ap@example.com.au request=https://login.example.net/a?b\=c|d
