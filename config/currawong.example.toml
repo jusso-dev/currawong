@@ -184,3 +184,22 @@ seal_arc = true
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
 [auth]
 authserv_id = "currawong.example.test"
+
+# dlp: TFN, Medicare, ABN, ACN, driver's licence and payment card detection.
+# Outbound mail is scanned; set scan_inbound to scan inbound mail too.
+# dlp.min_confidence: 0 to 100. Context words such as "TFN" near a number add 30.
+# dlp.review_thresholds: distinct identifiers of one kind that quarantine the
+# message for review. 0 never triggers. ABNs and ACNs are public, so 0.
+# Logs and events carry counts and redacted samples (`123 *** ***`) only.
+[dlp]
+enabled = true
+scan_inbound = false
+min_confidence = 50
+
+[dlp.review_thresholds]
+tfn = 5
+medicare = 5
+abn = 0
+acn = 0
+driver_licence = 5
+card = 5

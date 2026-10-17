@@ -17,6 +17,9 @@ pub struct ParseResponse {
     pub parts: Vec<PartInfo>,
     pub urls: Vec<String>,
     pub error: Option<String>,
+    /// Extracted text for DLP, bounded by `text::MAX_TEXT_BYTES`.
+    #[serde(default)]
+    pub text: String,
 }
 
 impl ParseResponse {
@@ -26,6 +29,7 @@ impl ParseResponse {
             parts: Vec::new(),
             urls: Vec::new(),
             error: Some(reason.into()),
+            text: String::new(),
         }
     }
 }

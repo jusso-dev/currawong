@@ -28,6 +28,7 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
     let mut parts = Vec::new();
     let mut urls = Vec::new();
     let mut text = String::new();
+    let mut dlp_text = String::new();
     for part in message
         .attachments()
         .chain(message.text_bodies())
@@ -40,6 +41,7 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
             .unwrap_or_else(|| "application/octet-stream".into());
         let bytes = part.contents();
         collect_text(&part.body, &mut text);
+        crate::text::extract(&part.body, &mut dlp_text);
         urls.extend(crate::fuzz::urls_in(bytes).into_iter().take(64));
         let kind = filetype::detect(bytes);
         let mut flags = filetype::flags_for(bytes, filename.as_deref(), &kind);
@@ -77,6 +79,7 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
         parts,
         urls,
         error: None,
+        text: dlp_text,
     }
 }
 

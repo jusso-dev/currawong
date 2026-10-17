@@ -1,7 +1,19 @@
-//! Identifier and protective-marking parsers used by the fuzzer.
-//! Blocking on these findings is an M2 policy. M1 only recognises them.
+//! Australian identifier detection with checksum validation, and the
+//! protective-marking parser used by the fuzzer.
 //!
-//! `123456782` is a published TFN checksum sample, not a real identifier.
+//! `scan` returns counts and redacted samples only. Full identifiers stay in
+//! memory for the length of the scan and are never logged or stored.
+pub mod detectors;
+
+pub use currawong_core::config::DlpProfile;
+pub use currawong_core::{DlpKind, DlpReport, DlpSample, Error};
+pub use detectors::Match;
+
+use std::collections::HashSet;
+
+/// Text beyond this is not scanned. The parser bounds extraction too.
+pub const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SAMPLES_PER_KIND: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectiveMarking {
@@ -24,52 +36,96 @@ pub fn parse_pspf(value: &str) -> Option<ProtectiveMarking> {
     }
 }
 
-/// ATO modulus-11 check. Weights are 1, 4, 3, 7, 5, 8, 6, 9, 10.
-pub fn tfn_checksum(digits: &[u8; 9]) -> bool {
-    const WEIGHTS: [u32; 9] = [1, 4, 3, 7, 5, 8, 6, 9, 10];
-    let sum: u32 = digits
-        .iter()
-        .zip(WEIGHTS)
-        .map(|(digit, weight)| u32::from(*digit) * weight)
-        .sum();
-    sum.is_multiple_of(11)
+/// Every detector. Where two matches overlap the higher confidence wins, and
+/// on a tie the checksum types win over licences (earlier in this list).
+pub fn find_all(text: &str) -> Vec<Match> {
+    let text = bounded(text);
+    let mut all: Vec<(usize, Match)> = [
+        detectors::card::find(text),
+        detectors::abn::find(text),
+        detectors::medicare::find(text),
+        detectors::tfn::find(text),
+        detectors::acn::find(text),
+        detectors::licence::find(text),
+    ]
+    .into_iter()
+    .enumerate()
+    .flat_map(|(rank, found)| found.into_iter().map(move |m| (rank, m)))
+    .collect();
+    all.sort_by_key(|(rank, m)| (std::cmp::Reverse(m.confidence), *rank, m.start));
+    let mut kept: Vec<Match> = Vec::new();
+    for (_, m) in all {
+        if kept.iter().all(|k| m.end <= k.start || m.start >= k.end) {
+            kept.push(m);
+        }
+    }
+    kept.sort_by_key(|m| m.start);
+    kept
 }
 
-pub fn find_tfns(text: &str) -> Vec<String> {
-    let bytes = text.as_bytes();
-    let limit = bytes.len().min(256 * 1024);
-    let mut digits = Vec::with_capacity(9);
-    let mut found = Vec::new();
-    let mut i = 0;
-    while i < limit && found.len() < 16 {
-        let b = bytes[i];
-        if b.is_ascii_digit() {
-            digits.push(b - b'0');
-            if digits.len() == 9 {
-                let mut array = [0u8; 9];
-                array.copy_from_slice(&digits);
-                if tfn_checksum(&array) {
-                    found.push(digits.iter().map(|d| char::from(b'0' + d)).collect());
-                }
-                digits.remove(0);
-            }
-            i += 1;
+pub fn scan(text: &str, profile: &DlpProfile) -> DlpReport {
+    let text = bounded(text);
+    let mut report = DlpReport::default();
+    let mut seen = HashSet::new();
+    for m in find_all(text) {
+        if m.confidence < profile.min_confidence {
             continue;
         }
-        if b == b' ' || b == b'-' {
-            i += 1;
+        let value: String = text[m.start..m.end]
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        // The same identifier in the text and HTML parts counts once.
+        if !seen.insert((m.kind, value)) {
             continue;
         }
-        digits.clear();
-        i += 1;
+        *report.counts.entry(m.kind).or_default() += 1;
+        if report.samples.iter().filter(|s| s.kind == m.kind).count() < MAX_SAMPLES_PER_KIND {
+            report.samples.push(DlpSample {
+                kind: m.kind,
+                redacted: redact(&text[m.start..m.end]),
+                confidence: m.confidence,
+            });
+        }
     }
-    found
+    report.review = report
+        .counts
+        .iter()
+        .filter(|(kind, count)| {
+            let threshold = profile.review_thresholds.get(**kind);
+            threshold > 0 && **count >= threshold
+        })
+        .map(|(kind, _)| *kind)
+        .collect();
+    report
+}
+
+/// Keeps the first three characters and masks the rest in groups of three:
+/// `123 456 782` becomes `123 *** ***`.
+pub fn redact(value: &str) -> String {
+    let chars: Vec<char> = value.chars().filter(char::is_ascii_alphanumeric).collect();
+    let mut out: String = chars.iter().take(3).collect();
+    for i in 0..chars.len().saturating_sub(3) {
+        if i % 3 == 0 {
+            out.push(' ');
+        }
+        out.push('*');
+    }
+    out
+}
+
+fn bounded(text: &str) -> &str {
+    let mut end = text.len().min(MAX_SCAN_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 pub fn fuzz_scan(data: &[u8]) {
     let end = data.len().min(64 * 1024);
     let text = String::from_utf8_lossy(&data[..end]);
-    let _ = find_tfns(&text);
+    let _ = scan(&text, &DlpProfile::default());
     let _ = parse_pspf(&text);
 }
 
@@ -78,13 +134,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn published_tfn_sample_passes_and_pspf_values_parse() {
-        assert!(tfn_checksum(&[1, 2, 3, 4, 5, 6, 7, 8, 2]));
-        assert!(!tfn_checksum(&[1, 2, 3, 4, 5, 6, 7, 8, 3]));
-        assert_eq!(
-            find_tfns("sample 123456782 only"),
-            vec!["123456782".to_string()]
-        );
+    fn published_tfn_sample_is_redacted_and_pspf_values_parse() {
+        let report = scan("TFN 123 456 782 only", &DlpProfile::default());
+        assert_eq!(report.counts.get(&DlpKind::Tfn), Some(&1));
+        assert_eq!(report.samples[0].redacted, "123 *** ***");
         assert_eq!(
             parse_pspf("OFFICIAL: Sensitive"),
             Some(ProtectiveMarking::OfficialSensitive)

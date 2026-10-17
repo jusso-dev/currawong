@@ -1,6 +1,7 @@
-//! M1 policy. Spam, phishing, BEC and DLP blocking stay in M2.
+//! M1 policy. Spam, phishing and BEC blocking stay in M2.
 //! A message is quarantined for malware, active content, a fail-closed scan,
-//! or a DMARC `p=reject` failure. Anything else is delivered.
+//! a DMARC `p=reject` failure, or a DLP review threshold. Anything else is
+//! delivered.
 use currawong_core::{ScanReport, Verdict};
 
 pub fn decide(report: &ScanReport) -> Verdict {
@@ -34,6 +35,18 @@ pub fn decide(report: &ScanReport) -> Verdict {
                 reason: "dmarc p=reject".into(),
             };
         }
+    }
+    // Default DLP rule: hold for review once a kind reaches its threshold.
+    // The reason carries counts only, never identifiers.
+    if let Some(dlp) = report.dlp.as_ref().filter(|dlp| !dlp.review.is_empty()) {
+        let kinds: Vec<String> = dlp
+            .review
+            .iter()
+            .map(|kind| format!("{} x{}", kind.as_str(), dlp.counts.get(kind).unwrap_or(&0)))
+            .collect();
+        return Verdict::Quarantine {
+            reason: format!("dlp review: {}", kinds.join(", ")),
+        };
     }
     Verdict::Deliver
 }

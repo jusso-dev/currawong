@@ -135,3 +135,86 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
         "{err}"
     );
 }
+
+/// Captures formatted log lines so the test can check what was logged.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `123456782` is the ATO's published sample; the others are synthetic
+/// values built to pass the checksum.
+const TFNS: [&str; 5] = [
+    "123456782",
+    "876543210",
+    "100000060",
+    "200000010",
+    "300000070",
+];
+
+fn tfn_message(tfns: &[&str]) -> Vec<u8> {
+    let lines: Vec<String> = tfns.iter().map(|t| format!("TFN: {t}")).collect();
+    format!(
+        "From: payroll@example.test\r\nTo: agent@external.test\r\nSubject: staff\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\n{}\r\n",
+        lines.join("\r\n")
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
+    let logs = LogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut cfg = Config::default();
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let mut env = envelope("payroll@example.test");
+    env.direction = Direction::Outbound;
+
+    let (held, verdict) = pipeline.evaluate(&env, &tfn_message(&TFNS), None).await;
+    let Verdict::Quarantine { reason } = verdict else {
+        panic!("{verdict:?}");
+    };
+    assert_eq!(reason, "dlp review: tfn x5");
+    let dlp = held.dlp.as_ref().unwrap();
+    assert_eq!(dlp.counts.get(&currawong_core::DlpKind::Tfn), Some(&5));
+
+    // Four is under the default threshold. Inbound is not scanned by default.
+    let (_, verdict) = pipeline
+        .evaluate(&env, &tfn_message(&TFNS[..4]), None)
+        .await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    let mut inbound = env.clone();
+    inbound.direction = Direction::Inbound;
+    let (report, verdict) = pipeline.evaluate(&inbound, &tfn_message(&TFNS), None).await;
+    assert!(report.dlp.is_none());
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("dlp findings"), "{logged}");
+    let event = serde_json::to_string(&held).unwrap();
+    for tfn in TFNS {
+        for haystack in [&logged, &event, &reason] {
+            assert!(!haystack.contains(tfn), "{tfn} leaked: {haystack}");
+            assert!(!haystack.contains(&tfn[3..]), "{tfn} leaked: {haystack}");
+        }
+    }
+    assert!(event.contains("123 *** ***"), "{event}");
+}

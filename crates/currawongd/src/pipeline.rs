@@ -1,6 +1,8 @@
-//! Auth, parse, scan and the M1 policy decision.
+//! Auth, parse, scan, DLP and the M1 policy decision.
 use currawong_auth::AuthChecker;
-use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
+use currawong_core::{
+    config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
 use currawong_scan::{
@@ -39,12 +41,15 @@ impl Pipeline {
         let auth = self.auth.check(raw, env).await;
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
+            // No parser: scan the raw message, which covers plain text bodies.
+            self.scan_dlp(env, &String::from_utf8_lossy(raw), &mut report);
             let verdict = decide(&report);
             return (report, verdict);
         }
         let parsed = self.parse(env, raw, body_path).await;
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
+        self.scan_dlp(env, &parsed.text, &mut report);
         let parser_failed = parsed.error.is_some();
         if let Some(err) = parsed.error {
             report.notes.push(err);
@@ -104,6 +109,19 @@ impl Pipeline {
         }
         let verdict = decide(&report);
         (report, verdict)
+    }
+
+    /// Outbound mail, and inbound when configured. Logs counts only.
+    fn scan_dlp(&self, env: &Envelope, text: &str, report: &mut ScanReport) {
+        let profile = &self.cfg.dlp;
+        if !profile.enabled || (env.direction == Direction::Inbound && !profile.scan_inbound) {
+            return;
+        }
+        let dlp = currawong_dlp::scan(text, profile);
+        if !dlp.counts.is_empty() {
+            tracing::info!(id = %env.id, counts = ?dlp.counts, review = ?dlp.review, "dlp findings");
+        }
+        report.dlp = Some(dlp);
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {

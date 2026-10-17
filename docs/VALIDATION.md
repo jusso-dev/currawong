@@ -21,6 +21,16 @@ Unit tests use fakes for DNS, clamd and the downstream SMTP sink. They bind port
 - seccomp. The parser worker installs a seccompiler filter only on Linux. This machine is macOS, so workers run unsandboxed. The Linux filter is untested here.
 - 7z extraction. 7z is recognised by magic and flagged, and it is not unpacked (no `sevenz` crate in the workspace). zip, tar, gz and a minimal ISO walk are implemented. RAR is detected and not extracted.
 
+## DLP (Australian identifiers)
+
+Tests use the ATO's published TFN (`123 456 782`) and ABN (`51 824 753 556`) samples, ASIC's published ACN examples, the common Medicare sample (`2123 45670 1`), card scheme test numbers, and synthetic values built to pass a checksum. No real person's identifier is in the repository.
+
+- Single-digit changes. TFN, ABN and card (Luhn) checks reject every single-digit change. The Medicare check digit covers only the first eight digits, so changes to the issue number or IRN are not detectable. ASIC's ACN check uses even weights, so a change of 5 at weights 8, 6, 4 or 2 gives another valid ACN. `crates/dlp/tests/detectors.rs` asserts exactly that.
+- Driver's licences have no check digit. They are matched only next to a context word, and the state formats overlap, so the kind is "driver's licence", not a specific state.
+- Text extraction covers text and HTML bodies, forwarded messages, and top-level docx, xlsx and PDF attachments, using documents built in `crates/parser-worker/tests/text.rs`. Documents inside zip or other archives are not text-extracted. Real-world Office and PDF files from other producers were not tested; scanned (image-only) PDFs yield no text.
+- `cargo deny check` with `pdf-extract` and `calamine` added: bans, licences and sources pass. Advisories fail on new 2026 entries against `rustls` 0.23.45 and `zip` 2.4.2 and 8.6.0, which were already in the lockfile (`zip` 8.6.0 through `mail-auth`; `calamine` shares it). The `zip` advisories concern `extract()` to a directory, which neither the parser nor `calamine` calls. Upgrading those crates is left to a separate change.
+- The quarantine-for-review rule is in the M1 `currawong-policy::decide` so the default holds outbound mail at 5 distinct TFNs (`dlp.review_thresholds`). The policy engine rewrite (#37) should carry it into its default pack.
+
 ## ADR 0002 and the worker transport
 
 ADR 0002 says the supervisor talks to parser workers over a Unix socket. Issue #23 specifies length-prefixed JSON on stdin and stdout. M1 follows the issue: `LengthDelimitedCodec` on the worker's standard streams. The ADR decision is unchanged. The transport should be reconciled in a later ADR update rather than silently rewritten.

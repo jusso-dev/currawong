@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub dlp: DlpProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +271,45 @@ pub struct AuthConfig {
     pub authserv_id: String,
 }
 
+/// `[dlp]`: Australian identifier detection on outbound mail, and inbound
+/// mail when `scan_inbound` is set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DlpProfile {
+    pub enabled: bool,
+    pub scan_inbound: bool,
+    /// Matches below this confidence (0 to 100) are not counted.
+    pub min_confidence: u8,
+    pub review_thresholds: DlpThresholds,
+}
+
+/// Distinct identifiers of one kind that send a message to review.
+/// 0 never triggers review.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DlpThresholds {
+    pub tfn: u32,
+    pub medicare: u32,
+    pub abn: u32,
+    pub acn: u32,
+    pub driver_licence: u32,
+    pub card: u32,
+}
+
+impl DlpThresholds {
+    pub fn get(&self, kind: crate::DlpKind) -> u32 {
+        use crate::DlpKind;
+        match kind {
+            DlpKind::Tfn => self.tfn,
+            DlpKind::Medicare => self.medicare,
+            DlpKind::Abn => self.abn,
+            DlpKind::Acn => self.acn,
+            DlpKind::DriverLicence => self.driver_licence,
+            DlpKind::Card => self.card,
+        }
+    }
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -440,6 +480,31 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for DlpProfile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_inbound: false,
+            min_confidence: 50,
+            review_thresholds: DlpThresholds::default(),
+        }
+    }
+}
+
+impl Default for DlpThresholds {
+    /// ABNs and ACNs are on public registers, so they do not trigger review.
+    fn default() -> Self {
+        Self {
+            tfn: 5,
+            medicare: 5,
+            abn: 0,
+            acn: 0,
+            driver_licence: 5,
+            card: 5,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -483,6 +548,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            dlp: DlpProfile::default(),
         }
     }
 }
