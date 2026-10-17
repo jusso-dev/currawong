@@ -8,8 +8,9 @@ pub mod telemetry;
 
 pub use config::{Config, ConfigError};
 pub use report::{
-    AuthMethodResult, AuthResults, DlpKind, DlpReport, DlpSample, EngineFinding, LookalikeFinding,
-    LookalikeTechnique, PartFlag, PartInfo, RuleHit, ScanReport, SpamReport, YaraMatch,
+    AuthMethodResult, AuthResults, Classification, DlpKind, DlpReport, DlpSample, EngineFinding,
+    LookalikeFinding, LookalikeTechnique, MarkingReport, PartFlag, PartInfo, RuleHit, ScanReport,
+    SpamReport, YaraMatch,
 };
 pub use residency::{ResidencyError, ResidencyGuard, SignedReport};
 pub use secret::Secret;

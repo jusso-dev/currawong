@@ -344,6 +344,7 @@ impl Pipeline {
                 .push("dmarc temperror: policy DNS unreachable".into());
         }
         report.auth = Some(auth);
+        report.marking = Some(currawong_dlp::pspf::inspect(raw));
         if !self.cfg.scanner.enabled {
             // No worker: decoded text bodies only; documents mark it incomplete.
             // In-process mail-parser would overflow the stack on a deeply nested
