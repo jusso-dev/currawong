@@ -4,7 +4,7 @@ Currawong is an open source email security gateway written in Rust, built for Au
 
 It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint or Mimecast, but memory safe, self-hostable and aware of Australian rules such as PSPF protective markings and Australian identifiers like TFNs and Medicare numbers.
 
-> Status: M1 relay. The gateway accepts mail for configured domains, spools it, checks SPF, DKIM, DMARC and ARC, scans with ClamAV when clamd is configured, and quarantines malware, active content (renamed executables and macros) and DMARC `p=reject`. Official ClamAV signatures are the baseline, not a complete detector: add on-premises supplemental signatures and keep the file-type checks on. See [docs/adr/0005-malware-engines.md](docs/adr/0005-malware-engines.md). Outbound delivery enforces DANE and MTA-STS, uses verified opportunistic STARTTLS otherwise, and sends daily TLS-RPT reports; see [docs/outbound-tls.md](docs/outbound-tls.md). Spam, phishing, BEC and DLP blocking are not in this milestone. Checks that need a live clamd, a live MX or a second signature set are listed in [docs/VALIDATION.md](docs/VALIDATION.md).
+> Status: M1 relay. The gateway accepts mail for configured domains, spools it, checks SPF, DKIM, DMARC and ARC, DKIM signs outbound tenant mail and ARC seals delivered mail once keys exist (`currawongd dkim generate`), scans with ClamAV when clamd is configured, and quarantines malware, active content (renamed executables and macros) and DMARC `p=reject`. Official ClamAV signatures are the baseline, not a complete detector: add on-premises supplemental signatures and keep the file-type checks on. See [docs/adr/0005-malware-engines.md](docs/adr/0005-malware-engines.md). YARA rules in `scanner.yara.rules_dir` (yara-x) are matched against the message, every part and every archive member inside the parser worker, reload without a restart, and appear on the scan report for policy; starter rules are in [rules/yara/](rules/yara/). Outbound delivery enforces DANE and MTA-STS, uses verified opportunistic STARTTLS otherwise, and sends daily TLS-RPT reports; see [docs/outbound-tls.md](docs/outbound-tls.md). Spam, phishing, BEC and DLP blocking are not in this milestone. Checks that need a live clamd, a live MX or a second signature set are listed in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Why
 
@@ -17,7 +17,7 @@ It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint 
 | Area | What it does |
 | --- | --- |
 | SMTP gateway | Inbound and outbound relay on tokio, STARTTLS, MTA-STS, DANE, TLS-RPT, greylisting, rate limits, DNSBLs, connection reputation |
-| Sender authentication | SPF, DKIM, DMARC, ARC and BIMI via Stalwart's `mail-auth` |
+| Sender authentication | SPF, DKIM, DMARC and ARC via Stalwart's `mail-auth`, daily DMARC aggregate (RUA) reports, BIMI logo lookup |
 | Malware | ClamAV (clamd), YARA, true file type checks, nested archive extraction with limits, macro and OLE detection, sandbox detonation hook |
 | Phishing | URL rewriting with time-of-click checks, lookalike and homoglyph domains, HTML smuggling, QR code phishing |
 | BEC | Display name spoofing, payment and invoice change detection, optional pluggable LLM classifier |

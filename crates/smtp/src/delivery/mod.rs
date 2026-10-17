@@ -901,6 +901,14 @@ fn sanitise_token(value: &str) -> String {
         .collect()
 }
 
+/// The bytes a TLS session sends: our `Received` header, the pipeline's
+/// headers, then the message. A clear-text session differs only by a
+/// comment in `Received`.
+pub fn outbound_bytes(env: &Envelope, body: &[u8], hostname: &str) -> Vec<u8> {
+    let message = outbound(env, body, hostname);
+    [message.received_tls, message.rest].concat()
+}
+
 fn outbound(env: &Envelope, body: &[u8], hostname: &str) -> Outbound {
     let mut rest = Vec::new();
     for header in &env.prepend_headers {

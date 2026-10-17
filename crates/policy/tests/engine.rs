@@ -60,6 +60,7 @@ fn spoofed() -> AuthResults {
         dmarc: fail(),
         arc: AuthMethodResult::none(),
         dmarc_policy: "reject".into(),
+        dmarc_domain: "example.com.au".into(),
         header: String::new(),
     }
 }
@@ -847,4 +848,42 @@ fn load_seeds_the_database_once() {
         currawong_policy::load(&file_only).unwrap().policies.len(),
         1
     );
+}
+
+#[test]
+fn yara_matches_are_signals_policies_can_act_on() {
+    let mut r = report();
+    r.yara.push(currawong_core::YaraMatch {
+        rule: "Currawong_Bank_Detail_Change".into(),
+        namespace: "bec".into(),
+        tags: vec!["bec".into(), "finance".into()],
+        part: "body".into(),
+    });
+    let signals = Signals::from_report(&r);
+    assert!(signals.flags.contains("yara"));
+    assert!(signals.flags.contains("yara.bec"));
+    assert!(signals.flags.contains("yara.finance"));
+    assert_eq!(signals.counts.get("yara"), Some(&1));
+    assert!(!Signals::from_report(&report()).flags.contains("yara"));
+
+    let mut p = policy(
+        "hold-bec",
+        Scope::Global,
+        1,
+        vec![Action::Quarantine("bec".into())],
+    );
+    p.conditions = vec![Condition::Flag("yara.bec".into())];
+    let pack = set(vec![p]);
+    let hit = evaluate(&signals, &ctx("pay@example.com.au"), &pack);
+    assert!(
+        matches!(hit.verdict, Verdict::Quarantine { .. }),
+        "{:?}",
+        hit.verdict
+    );
+    let clean = evaluate(
+        &Signals::from_report(&report()),
+        &ctx("pay@example.com.au"),
+        &pack,
+    );
+    assert_eq!(clean.verdict, Verdict::Deliver);
 }

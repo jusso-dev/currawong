@@ -176,3 +176,143 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn yara_matches_reach_the_report_and_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.yara.rules_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rules/yara");
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    assert!(pipeline.yara.is_some());
+
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        currawong_scan::eicar(),
+    );
+    let raw = format!(
+        "From: a@example.test\r\nTo: b@example.test\r\nSubject: test\r\nMIME-Version: 1.0\r\nContent-Type: application/octet-stream; name=\"eicar.com\"\r\nContent-Disposition: attachment; filename=\"eicar.com\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n"
+    );
+    let env = envelope("a@example.test");
+    let (report, verdict) = pipeline.evaluate(&env, raw.as_bytes(), None).await;
+    assert!(
+        report
+            .yara
+            .iter()
+            .any(|hit| hit.rule == "Currawong_EICAR_Test_File" && hit.part == "eicar.com"),
+        "{report:?}"
+    );
+    assert!(report.malware);
+    assert!(report.engines.iter().any(|f| f.engine == "yara"));
+    assert!(matches!(verdict, Verdict::Quarantine { reason } if reason == "malware"));
+
+    // A `bec` match is recorded for policy and does not quarantine by itself.
+    let bec = b"From: a@example.test\r\nTo: b@example.test\r\nSubject: invoice\r\n\r\nPlease note our change of bank details. BSB 000-000.\r\n";
+    let (report, verdict) = pipeline.evaluate(&env, bec, None).await;
+    let hit = report
+        .yara
+        .iter()
+        .find(|hit| hit.rule == "Currawong_Bank_Detail_Change")
+        .expect("bec rule matched");
+    assert_eq!(hit.tags, vec!["bec".to_string()]);
+    assert!(!report.malware && !report.active_content, "{report:?}");
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+}
+
+#[test]
+fn yara_broken_rules_fail_check_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = dir.path().join("yara");
+    std::fs::create_dir(&rules).unwrap();
+    std::fs::write(rules.join("broken.yar"), "rule Broken { condition: }").unwrap();
+    let path = dir.path().join("cfg.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "[spool]\ndir = \"/var/spool/currawong\"\n[scanner.yara]\nrules_dir = \"{}\"\n",
+            rules.display()
+        ),
+    )
+    .unwrap();
+    let err = check_config(&path).unwrap_err();
+    assert!(err.contains("broken.yar"), "{err}");
+}
+
+/// See `crates/scan/tests/yara.rs`: built by `cargo test --workspace`.
+fn worker_binary() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let bin = target.join("debug/currawong-parser-worker");
+    assert!(
+        bin.is_file(),
+        "parser worker missing at {}: run `cargo build -p currawong-parser-worker`",
+        bin.display()
+    );
+    bin
+}
+
+#[tokio::test]
+async fn yara_matches_through_the_isolated_worker() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = Some(worker_binary());
+    cfg.scanner.yara.rules_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rules/yara");
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    assert!(pipeline.pool.is_some());
+
+    let encoded = base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        currawong_scan::eicar(),
+    );
+    let raw = format!(
+        "From: a@example.test\r\nTo: b@example.test\r\nSubject: test\r\nMIME-Version: 1.0\r\nContent-Type: application/octet-stream; name=\"eicar.com\"\r\nContent-Disposition: attachment; filename=\"eicar.com\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n"
+    );
+    let body = dir.path().join("body.eml");
+    std::fs::write(&body, &raw).unwrap();
+    let env = envelope("a@example.test");
+    let (report, verdict) = pipeline.evaluate(&env, raw.as_bytes(), Some(&body)).await;
+    assert!(
+        report
+            .yara
+            .iter()
+            .any(|hit| hit.rule == "Currawong_EICAR_Test_File" && hit.part == "eicar.com"),
+        "{report:?}"
+    );
+    assert!(matches!(verdict, Verdict::Quarantine { reason } if reason == "malware"));
+}
+
+#[tokio::test]
+async fn yara_rules_that_cannot_load_fail_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let rules = dir.path().join("yara");
+    std::fs::create_dir(&rules).unwrap();
+    std::fs::write(rules.join("broken.yar"), "rule Broken { condition: }").unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.yara.rules_dir = rules;
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    assert!(pipeline.yara.is_none());
+    assert!(pipeline.yara_error.is_some());
+    let env = envelope("user@example.test");
+    let (report, verdict) = pipeline.evaluate(&env, &text_message(), None).await;
+    assert!(report.fail_closed, "{report:?}");
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("rules unavailable")),
+        "{report:?}"
+    );
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+}

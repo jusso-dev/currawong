@@ -10,6 +10,8 @@ jobs:
         with: { components: "clippy, rustfmt" }
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # xmllint checks DMARC aggregate reports against testdata/dmarc/rua.xsd.
+      - run: sudo apt-get install -y libxml2-utils
       - run: cargo test --workspace
       - run: cargo install cargo-deny --locked
       - run: cargo deny check

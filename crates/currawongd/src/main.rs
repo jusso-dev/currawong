@@ -1,13 +1,16 @@
 //! currawongd: SMTP listeners, the scan pipeline and outbound delivery.
 use clap::Parser;
-use currawong_auth::AuthChecker;
+use currawong_auth::{AuthChecker, DmarcEventStore};
 use currawong_core::residency::{load_or_create_signing_key, sign_report, ResidencyGuard};
 use currawong_smtp::{
     checks::CheckStack, delivery::Deliverer, dns::HickoryDns, relay::Relay, server::SmtpServer,
     session::SessionContext, tls::TlsManager,
 };
 use currawong_spool::Spool;
-use currawongd::{check_config, checks_for, classify_pending, Pipeline};
+use currawongd::{
+    check_config, checks_for, classify_pending, send_dmarc_reports, supervise, BimiWorker,
+    Pipeline, BIMI_QUEUE,
+};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -21,6 +24,15 @@ struct Args {
     /// Load and validate the configuration, then exit.
     #[arg(long)]
     check_config: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Manage DKIM and ARC signing keys.
+    #[command(subcommand)]
+    Dkim(currawongd::dkim::DkimCommand),
 }
 
 #[tokio::main]
@@ -34,7 +46,27 @@ async fn main() {
         }
     };
     if args.check_config {
+        if let Ok(Some(summary)) = currawongd::yara_summary(&cfg) {
+            println!("yara: {summary}");
+            for warning in &summary.warnings {
+                println!("yara warning: {warning}");
+            }
+        }
         println!("configuration ok");
+        return;
+    }
+    if let Some(Command::Dkim(command)) = args.command {
+        let result = match AuthChecker::new(&cfg.auth.authserv_id) {
+            Ok(dns) => currawongd::dkim::run(&cfg, command, &dns).await,
+            Err(err) => Err(err),
+        };
+        match result {
+            Ok(out) => print!("{out}"),
+            Err(err) => {
+                eprintln!("currawongd: {err}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     currawongd::install_tracing(&cfg);
@@ -97,10 +129,34 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    // Keys exist once `currawongd dkim generate` has run; until then nothing is signed.
+    if (cfg.dkim.sign_outbound || cfg.dkim.seal_arc) && cfg.dkim.database.exists() {
+        let keys = currawong_auth::KeyStore::open(&cfg.dkim.database, &cfg.dkim.kek_path)?;
+        pipeline = pipeline.with_keys(keys);
+    } else if cfg.dkim.sign_outbound || cfg.dkim.seal_arc {
+        tracing::warn!(database = %cfg.dkim.database.display(), "no DKIM key store; outbound mail is not signed");
+    }
     pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
+    if cfg.auth.dmarc_reports.enabled {
+        let store = DmarcEventStore::open(&cfg.auth.dmarc_reports)?;
+        pipeline = pipeline.with_dmarc_events(store.clone());
+        spawn_dmarc_reports(
+            Arc::clone(&cfg),
+            Arc::clone(&spool),
+            store,
+            shutdown.clone(),
+        )?;
+    }
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
+    if cfg.auth.bimi {
+        // Its own resolver and queue: lookups never wait in the classify loop.
+        let (jobs, queue) = tokio::sync::mpsc::channel(BIMI_QUEUE);
+        pipeline = pipeline.with_bimi(jobs);
+        let txt = AuthChecker::new(&cfg.auth.authserv_id)?;
+        tokio::spawn(BimiWorker::default().run(txt, quarantine.clone(), queue));
+    }
     // DANE needs DNSSEC-validated answers for MX, address and TLSA lookups.
     let delivery_dns = if cfg.delivery.dane {
         HickoryDns::validating()
@@ -171,6 +227,46 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         });
     }
     while set.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// The report pass runs on its own supervised task with its own resolver,
+/// so slow or hostile DNS for `rua` checks cannot stall classification or
+/// delivery, and a panic restarts it. Shutdown cancels a pass mid-way: the
+/// claim ledger makes that safe.
+fn spawn_dmarc_reports(
+    cfg: Arc<currawong_core::Config>,
+    spool: Arc<Spool>,
+    store: DmarcEventStore,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    let auth = Arc::new(AuthChecker::new(&cfg.auth.authserv_id)?);
+    let dns = Arc::new(HickoryDns::system().map_err(|err| err.to_string())?);
+    tokio::spawn(supervise(
+        "dmarc reports",
+        shutdown,
+        Duration::from_secs(5),
+        move || {
+            let (cfg, spool, store, auth, dns) = (
+                Arc::clone(&cfg),
+                Arc::clone(&spool),
+                store.clone(),
+                Arc::clone(&auth),
+                Arc::clone(&dns),
+            );
+            async move {
+                loop {
+                    let now = time::OffsetDateTime::now_utc();
+                    if let Err(err) =
+                        send_dmarc_reports(&spool, &auth, &store, &cfg, dns.as_ref(), now).await
+                    {
+                        tracing::error!(%err, "dmarc report pass failed");
+                    }
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                }
+            }
+        },
+    ));
     Ok(())
 }
 

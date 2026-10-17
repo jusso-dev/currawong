@@ -1,10 +1,10 @@
 //! Outbound DKIM signing and ARC sealing.
-use crate::keys::StoredKey;
+use crate::keys::{now_secs, KeyStore, StoredKey};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use mail_auth::{
     arc::ArcSealer,
     common::{
-        crypto::{Ed25519Key, RsaKey, Sha256},
+        crypto::{Ed25519Key, RsaKey, Sha256, SigningKey},
         headers::HeaderWriter,
         parse::TxtRecordParser,
         verify::DomainKey,
@@ -12,132 +12,151 @@ use mail_auth::{
     dkim::DkimSigner,
     ArcOutput, AuthenticatedMessage, AuthenticationResults,
 };
+use zeroize::Zeroizing;
 
-pub fn sign_message(raw: &[u8], key: &StoredKey) -> Result<Vec<u8>, String> {
-    let signature = match key.algorithm.as_str() {
-        "ed25519" => {
-            let signer =
-                Ed25519Key::from_pkcs8_der(&key.private_key).map_err(|err| err.to_string())?;
-            DkimSigner::from_key(signer)
-                .domain(key.domain.clone())
-                .selector(key.selector.clone())
-                .headers([
-                    "From",
-                    "From",
-                    "To",
-                    "Subject",
-                    "Date",
-                    "Message-ID",
-                    "MIME-Version",
-                    "Content-Type",
-                ])
-                .sign(raw)
-                .map_err(|err| err.to_string())?
+/// Identity and content headers are listed twice (oversigned) so a copy
+/// added in transit, including one that was absent at signing, breaks the
+/// signature.
+const SIGNED_HEADERS: [&str; 14] = [
+    "From",
+    "From",
+    "To",
+    "To",
+    "Cc",
+    "Cc",
+    "Reply-To",
+    "Reply-To",
+    "Subject",
+    "Subject",
+    "Date",
+    "Date",
+    "Message-ID",
+    "Message-ID",
+];
+const CONTENT_HEADERS: [&str; 2] = ["MIME-Version", "Content-Type"];
+const SEALED_HEADERS: [&str; 7] = [
+    "From",
+    "To",
+    "Subject",
+    "Date",
+    "Message-ID",
+    "MIME-Version",
+    "Content-Type",
+];
+
+/// One DKIM-Signature header per key (RSA and Ed25519 side by side), each
+/// ending in CRLF, to prepend to `raw`.
+pub fn sign(raw: &[u8], keys: &[StoredKey]) -> Result<String, String> {
+    let mut out = String::new();
+    for key in keys {
+        let header = match key.algorithm.as_str() {
+            "ed25519" => dkim_header(raw, key, ed25519(key)?)?,
+            _ => dkim_header(raw, key, rsa(key)?)?,
+        };
+        out.push_str(&header);
+        if !out.ends_with("\r\n") {
+            out.push_str("\r\n");
         }
-        _ => {
-            #[allow(deprecated)]
-            let signer = RsaKey::<Sha256>::from_pkcs8_der(&key.private_key)
-                .map_err(|err| err.to_string())?;
-            DkimSigner::from_key(signer)
-                .domain(key.domain.clone())
-                .selector(key.selector.clone())
-                .headers([
-                    "From",
-                    "From",
-                    "To",
-                    "Subject",
-                    "Date",
-                    "Message-ID",
-                    "MIME-Version",
-                    "Content-Type",
-                ])
-                .sign(raw)
-                .map_err(|err| err.to_string())?
-        }
-    };
-    let mut header = Vec::new();
-    signature.write(&mut header, true);
-    if !header.ends_with(b"\r\n") {
-        header.extend_from_slice(b"\r\n");
     }
-    header.extend_from_slice(raw);
-    Ok(header)
+    Ok(out)
 }
 
-pub fn seal_arc(raw: &[u8], key: &StoredKey, authserv_id: &str) -> Result<Vec<u8>, String> {
-    let message = AuthenticatedMessage::parse(raw).ok_or("ARC input did not parse")?;
-    let results = AuthenticationResults::new(authserv_id);
-    let arc_output = ArcOutput::default();
-    let set = match key.algorithm.as_str() {
-        "ed25519" => {
-            let signer =
-                Ed25519Key::from_pkcs8_der(&key.private_key).map_err(|err| err.to_string())?;
-            ArcSealer::from_key(signer)
-                .domain(key.domain.clone())
-                .selector(key.selector.clone())
-                .headers(["From", "To", "Subject", "Date"])
-                .seal(&message, &results, &arc_output)
-                .map_err(|err| err.to_string())?
-        }
-        _ => {
-            #[allow(deprecated)]
-            let signer = RsaKey::<Sha256>::from_pkcs8_der(&key.private_key)
-                .map_err(|err| err.to_string())?;
-            ArcSealer::from_key(signer)
-                .domain(key.domain.clone())
-                .selector(key.selector.clone())
-                .headers(["From", "To", "Subject", "Date"])
-                .seal(&message, &results, &arc_output)
-                .map_err(|err| err.to_string())?
-        }
-    };
-    let header = set.to_header();
-    let mut out = header.into_bytes();
+/// `raw` with DKIM-Signature headers prepended.
+pub fn sign_message(raw: &[u8], key: &StoredKey) -> Result<Vec<u8>, String> {
+    let mut out = sign(raw, std::slice::from_ref(key))?.into_bytes();
     out.extend_from_slice(raw);
     Ok(out)
 }
 
-pub fn rsa_key(bits: usize) -> Result<StoredKey, String> {
+/// DKIM-Signature headers for an outbound message, signed with every active
+/// key `tenant_id` holds for the RFC 5322 From domain. Empty when the tenant
+/// has no key for that domain.
+pub fn sign_outbound(store: &KeyStore, raw: &[u8], tenant_id: &str) -> Result<String, String> {
+    let message = AuthenticatedMessage::parse(raw).ok_or("outbound message did not parse")?;
+    let Some(domain) = message
+        .from
+        .first()
+        .and_then(|from| from.rsplit_once('@'))
+        .map(|(_, domain)| domain.to_ascii_lowercase())
+    else {
+        return Ok(String::new());
+    };
+    let keys = store.signing_keys(tenant_id, &domain, now_secs())?;
+    sign(raw, &keys)
+}
+
+fn dkim_header<T: SigningKey<Hasher = Sha256>>(
+    raw: &[u8],
+    key: &StoredKey,
+    signer: T,
+) -> Result<String, String> {
+    let signature = DkimSigner::from_key(signer)
+        .domain(key.domain.clone())
+        .selector(key.selector.clone())
+        .headers(SIGNED_HEADERS.iter().chain(CONTENT_HEADERS.iter()).copied())
+        .sign(raw)
+        .map_err(|err| err.to_string())?;
+    Ok(signature.to_header())
+}
+
+/// ARC set (`i=` one above the existing chain, `cv=` from its validation)
+/// sealing `results` onto `message`.
+pub(crate) fn seal_arc_set(
+    message: &AuthenticatedMessage<'_>,
+    results: &AuthenticationResults<'_>,
+    arc: &ArcOutput<'_>,
+    key: &StoredKey,
+) -> Result<String, String> {
+    let set = match key.algorithm.as_str() {
+        "ed25519" => ArcSealer::from_key(ed25519(key)?)
+            .domain(key.domain.clone())
+            .selector(key.selector.clone())
+            .headers(SEALED_HEADERS)
+            .seal(message, results, arc)
+            .map_err(|err| err.to_string())?
+            .to_header(),
+        _ => ArcSealer::from_key(rsa(key)?)
+            .domain(key.domain.clone())
+            .selector(key.selector.clone())
+            .headers(SEALED_HEADERS)
+            .seal(message, results, arc)
+            .map_err(|err| err.to_string())?
+            .to_header(),
+    };
+    Ok(set)
+}
+
+fn ed25519(key: &StoredKey) -> Result<Ed25519Key, String> {
+    Ed25519Key::from_pkcs8_der(&key.private_key).map_err(|err| err.to_string())
+}
+
+fn rsa(key: &StoredKey) -> Result<RsaKey<Sha256>, String> {
+    #[allow(deprecated)]
+    RsaKey::<Sha256>::from_pkcs8_der(&key.private_key).map_err(|err| err.to_string())
+}
+
+/// RSA-2048 PKCS#8 DER and its DKIM TXT record.
+pub(crate) fn rsa_material() -> Result<(Zeroizing<Vec<u8>>, String), String> {
     use rsa::pkcs8::EncodePrivateKey;
     use rsa::RsaPrivateKey;
     let mut rng = rand::rngs::OsRng;
-    let private = RsaPrivateKey::new(&mut rng, bits).map_err(|err| err.to_string())?;
+    let private = RsaPrivateKey::new(&mut rng, 2048).map_err(|err| err.to_string())?;
     let der = private.to_pkcs8_der().map_err(|err| err.to_string())?;
     #[allow(deprecated)]
     let signer = RsaKey::<Sha256>::from_pkcs8_der(der.as_bytes()).map_err(|err| err.to_string())?;
-    let public = STANDARD.encode(signer.public_key());
-    let txt = format!("v=DKIM1; k=rsa; p={public}");
+    let txt = format!("v=DKIM1; k=rsa; p={}", STANDARD.encode(signer.public_key()));
     DomainKey::parse(txt.as_bytes()).map_err(|err| format!("generated rsa record: {err}"))?;
-    Ok(StoredKey {
-        id: "generated-rsa".into(),
-        tenant_id: "local".into(),
-        domain: "example.test".into(),
-        selector: "currawong".into(),
-        algorithm: "rsa-sha256".into(),
-        private_key: der.as_bytes().to_vec(),
-        public_txt: txt,
-        created_at: crate::keys::now_secs(),
-        retired_at: None,
-        active: true,
-    })
+    Ok((Zeroizing::new(der.as_bytes().to_vec()), txt))
 }
 
-pub fn ed25519_key() -> Result<StoredKey, String> {
-    let der = Ed25519Key::generate_pkcs8().map_err(|err| err.to_string())?;
+/// Ed25519 PKCS#8 DER and its DKIM TXT record.
+pub(crate) fn ed25519_material() -> Result<(Zeroizing<Vec<u8>>, String), String> {
+    let der = Zeroizing::new(Ed25519Key::generate_pkcs8().map_err(|err| err.to_string())?);
     let signer = Ed25519Key::from_pkcs8_der(&der).map_err(|err| err.to_string())?;
-    let public = STANDARD.encode(signer.public_key());
-    let txt = format!("v=DKIM1; k=ed25519; p={public}");
+    let txt = format!(
+        "v=DKIM1; k=ed25519; p={}",
+        STANDARD.encode(signer.public_key())
+    );
     DomainKey::parse(txt.as_bytes()).map_err(|err| format!("generated ed25519 record: {err}"))?;
-    Ok(StoredKey {
-        id: "generated-ed25519".into(),
-        tenant_id: "local".into(),
-        domain: "example.test".into(),
-        selector: "ed".into(),
-        algorithm: "ed25519".into(),
-        private_key: der,
-        public_txt: txt,
-        created_at: crate::keys::now_secs(),
-        retired_at: None,
-        active: true,
-    })
+    Ok((der, txt))
 }

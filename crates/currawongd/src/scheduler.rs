@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::PathBuf};
 use time::OffsetDateTime;
 
-use crate::pipeline::{auth_header, Pipeline};
+use crate::pipeline::Pipeline;
 
 /// Tenant redirect and bcc are skipped once mail has passed through this
 /// gateway this many times. Platform and mandatory ones always apply.
@@ -20,7 +20,10 @@ const MAX_OWN_HOPS: usize = 3;
 /// deciding again under policies that may have changed.
 #[derive(Debug, Serialize, Deserialize)]
 struct Plan {
-    auth: Option<String>,
+    /// Our headers for every copy: Authentication-Results (inbound), ARC
+    /// set (modified inbound) or DKIM signatures (outbound).
+    #[serde(default)]
+    headers: Vec<String>,
     bounce: bool,
     groups: Vec<Vec<Decision>>,
 }
@@ -69,20 +72,47 @@ async fn classify_one(
         .read_body(&env.id)
         .await
         .map_err(|err| err.to_string())?;
+    let body_path = spool_body(spool, &env);
+    let raw = pipeline.strip_spooled(&raw, body_path.as_deref()).await?;
     let plan_path = plan_path(spool, &env.id);
+    let mut bimi_auth = None;
     let plan = match tokio::fs::read(&plan_path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
         Err(_) => {
-            let body_path = spool_body(spool, &env);
             let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            bimi_auth = report.auth.clone();
+            let mut groups: Vec<Vec<Decision>> = decision
+                .split()
+                .into_iter()
+                .map(|group| group.into_iter().cloned().collect())
+                .collect();
+            let delivers = groups
+                .iter()
+                .flatten()
+                .any(|d| matches!(d.verdict, Verdict::Deliver));
+            let headers = if !delivers {
+                pipeline.auth_headers(&env, &report)
+            } else {
+                match pipeline.delivery_headers(&env, &raw, &report).await {
+                    Ok(headers) => headers,
+                    // Never send a tenant's mail unsigned when it has a key.
+                    Err(reason) => {
+                        tracing::error!(id = %env.id, %reason, "outbound signing failed, deferring");
+                        for d in groups.iter_mut().flatten() {
+                            if matches!(d.verdict, Verdict::Deliver) {
+                                d.verdict = Verdict::Defer {
+                                    reason: reason.clone(),
+                                };
+                            }
+                        }
+                        Vec::new()
+                    }
+                }
+            };
             let plan = Plan {
-                auth: report.auth.as_ref().map(auth_header),
+                headers,
                 bounce: bounce_allowed(&env, &report, &raw),
-                groups: decision
-                    .split()
-                    .into_iter()
-                    .map(|group| group.into_iter().cloned().collect())
-                    .collect(),
+                groups,
             };
             if plan.groups.len() > 1 {
                 write_atomic(
@@ -125,7 +155,13 @@ async fn classify_one(
         spool.update(&env).await.map_err(|err| err.to_string())?;
         let _ = tokio::fs::remove_file(&plan_path).await;
     }
-    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await
+    let id = env.id.clone();
+    let quarantined = matches!(plan.groups[0][0].verdict, Verdict::Quarantine { .. });
+    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await?;
+    if let (true, Some(auth)) = (quarantined, bimi_auth) {
+        pipeline.queue_bimi(id, auth);
+    }
+    Ok(())
 }
 
 async fn act(
@@ -138,7 +174,9 @@ async fn act(
     plan: &Plan,
 ) -> Result<(), String> {
     tracing::info!(id = %env.id, explanation = %decision.explanation.join("; "), "policy decision");
-    env.prepend_headers.extend(plan.auth.clone());
+    // Replace, never extend: a re-evaluated deferred message must not
+    // carry a second set of our headers.
+    env.prepend_headers = plan.headers.clone();
     let finish = |env: &Envelope| {
         let id = env.id.clone();
         async move {
