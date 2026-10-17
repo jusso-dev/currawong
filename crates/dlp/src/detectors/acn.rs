@@ -1,13 +1,25 @@
 //! Australian Company Numbers: nine digits, check = (10 - weighted sum mod 10)
-//! mod 10. A one-in-ten check, so a bare ACN needs a context word to count
-//! at the default confidence.
-use super::{find_runs, weighted_sum, DlpKind, Match};
+//! mod 10. A one-in-ten check, so a bare ACN needs a context word nearby to
+//! count at the default confidence.
+use super::{find_rule, weighted_sum, DlpKind, Match, Rule, Scan};
 
 const WEIGHTS: [u32; 8] = [8, 7, 6, 5, 4, 3, 2, 1];
 const CONTEXT: &[&str] = &["acn", "arbn", "australian company number", "company number"];
 
 pub fn find(text: &str) -> Vec<Match> {
-    find_runs(text, DlpKind::Acn, 40, CONTEXT, validate)
+    find_in(&Scan::new(text))
+}
+
+pub(crate) const RULE: Rule = Rule {
+    kind: DlpKind::Acn,
+    lengths: 9..=9,
+    base: 25,
+    words: CONTEXT,
+    validate,
+};
+
+pub fn find_in(scan: &Scan) -> Vec<Match> {
+    find_rule(scan, &RULE)
 }
 
 pub fn validate(digits: &str) -> bool {

@@ -150,17 +150,25 @@ impl std::io::Write for LogBuffer {
     }
 }
 
-/// `123456782` is the ATO's published sample; the others are synthetic
-/// values built to pass the checksum.
-const TFNS: [&str; 5] = [
-    "123456782",
-    "876543210",
-    "100000060",
-    "200000010",
-    "300000070",
-];
+/// The ATO's published sample `123456782`, then checksum-valid values
+/// derived at run time by counting its leading digits down. Only the
+/// published sample is committed.
+fn sample_tfns() -> Vec<String> {
+    let mut out = vec!["123456782".to_string()];
+    let mut prefix = 12_345_678u32;
+    while out.len() < 5 {
+        prefix -= 1;
+        if let Some(t) = (0..10)
+            .map(|d| format!("{prefix}{d}"))
+            .find(|t| currawong_dlp::detectors::tfn::validate(t))
+        {
+            out.push(t);
+        }
+    }
+    out
+}
 
-fn tfn_message(tfns: &[&str]) -> Vec<u8> {
+fn tfn_message(tfns: &[String]) -> Vec<u8> {
     let lines: Vec<String> = tfns.iter().map(|t| format!("TFN: {t}")).collect();
     format!(
         "From: payroll@example.test\r\nTo: agent@external.test\r\nSubject: staff\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\n{}\r\n",
@@ -188,7 +196,8 @@ async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
     let mut env = envelope("payroll@example.test");
     env.direction = Direction::Outbound;
 
-    let (held, verdict) = pipeline.evaluate(&env, &tfn_message(&TFNS), None).await;
+    let tfns = sample_tfns();
+    let (held, verdict) = pipeline.evaluate(&env, &tfn_message(&tfns), None).await;
     let Verdict::Quarantine { reason } = verdict else {
         panic!("{verdict:?}");
     };
@@ -198,19 +207,19 @@ async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
 
     // Four is under the default threshold. Inbound is not scanned by default.
     let (_, verdict) = pipeline
-        .evaluate(&env, &tfn_message(&TFNS[..4]), None)
+        .evaluate(&env, &tfn_message(&tfns[..4]), None)
         .await;
     assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
     let mut inbound = env.clone();
     inbound.direction = Direction::Inbound;
-    let (report, verdict) = pipeline.evaluate(&inbound, &tfn_message(&TFNS), None).await;
+    let (report, verdict) = pipeline.evaluate(&inbound, &tfn_message(&tfns), None).await;
     assert!(report.dlp.is_none());
     assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
 
     let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
     assert!(logged.contains("dlp findings"), "{logged}");
     let event = serde_json::to_string(&held).unwrap();
-    for tfn in TFNS {
+    for tfn in &tfns {
         for haystack in [&logged, &event, &reason] {
             assert!(!haystack.contains(tfn), "{tfn} leaked: {haystack}");
             assert!(!haystack.contains(&tfn[3..]), "{tfn} leaked: {haystack}");

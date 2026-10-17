@@ -1,13 +1,26 @@
 //! Medicare card numbers: eight digits starting 2 to 6, a check digit, the
 //! issue number, then an optional individual reference number (IRN, 1 to 9).
-//! The check digit covers the first eight digits only.
-use super::{find_runs, weighted_sum, DlpKind, Match};
+//! The check digit covers the first eight digits only. As with TFNs, a bare
+//! number needs "Medicare" nearby or in the same text to count.
+use super::{find_rule, weighted_sum, DlpKind, Match, Rule, Scan};
 
 const WEIGHTS: [u32; 8] = [1, 3, 7, 9, 1, 3, 7, 9];
 const CONTEXT: &[&str] = &["medicare", "irn"];
 
 pub fn find(text: &str) -> Vec<Match> {
-    find_runs(text, DlpKind::Medicare, 60, CONTEXT, validate)
+    find_in(&Scan::new(text))
+}
+
+pub(crate) const RULE: Rule = Rule {
+    kind: DlpKind::Medicare,
+    lengths: 10..=11,
+    base: 40,
+    words: CONTEXT,
+    validate,
+};
+
+pub fn find_in(scan: &Scan) -> Vec<Match> {
+    find_rule(scan, &RULE)
 }
 
 pub fn validate(digits: &str) -> bool {

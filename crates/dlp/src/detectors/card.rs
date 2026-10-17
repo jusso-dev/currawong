@@ -1,6 +1,6 @@
 //! Payment cards: Luhn plus the issuer (IIN) ranges and lengths of the main
 //! schemes.
-use super::{find_runs, DlpKind, Match};
+use super::{find_rule, DlpKind, Match, Rule, Scan};
 
 const CONTEXT: &[&str] = &[
     "card",
@@ -9,17 +9,31 @@ const CONTEXT: &[&str] = &[
     "visa",
     "mastercard",
     "amex",
+    "maestro",
     "expiry",
     "cvv",
     "ccv",
 ];
 
 pub fn find(text: &str) -> Vec<Match> {
-    find_runs(text, DlpKind::Card, 70, CONTEXT, validate)
+    find_in(&Scan::new(text))
+}
+
+pub(crate) const RULE: Rule = Rule {
+    kind: DlpKind::Card,
+    lengths: 12..=19,
+    base: 70,
+    words: CONTEXT,
+    validate,
+};
+
+pub fn find_in(scan: &Scan) -> Vec<Match> {
+    find_rule(scan, &RULE)
 }
 
 pub fn validate(digits: &str) -> bool {
-    (13..=19).contains(&digits.len())
+    (12..=19).contains(&digits.len())
+        && matches!(digits.as_bytes()[0], b'2'..=b'6')
         && digits.bytes().all(|b| b.is_ascii_digit())
         && known_iin(digits)
         && luhn(digits)
@@ -48,7 +62,11 @@ fn luhn(digits: &str) -> bool {
 }
 
 fn known_iin(d: &str) -> bool {
-    let prefix = |n: usize| d[..n].parse::<u32>().unwrap_or(0);
+    let prefix = |n: usize| {
+        d.bytes()
+            .take(n)
+            .fold(0u32, |acc, b| acc * 10 + u32::from(b - b'0'))
+    };
     let len = d.len();
     if d.starts_with('4') {
         // Visa
@@ -56,6 +74,9 @@ fn known_iin(d: &str) -> bool {
     } else if (51..=55).contains(&prefix(2)) || (2221..=2720).contains(&prefix(4)) {
         // Mastercard
         len == 16
+    } else if (2200..=2204).contains(&prefix(4)) {
+        // Mir
+        (16..=19).contains(&len)
     } else if matches!(prefix(2), 34 | 37) {
         // American Express
         len == 15
@@ -69,8 +90,18 @@ fn known_iin(d: &str) -> bool {
         // JCB
         (16..=19).contains(&len)
     } else if prefix(2) == 62 {
-        // UnionPay
+        // UnionPay, and Discover's 622126 to 622925 range
         (16..=19).contains(&len)
+    } else if prefix(4) == 5610 || (560221..=560225).contains(&prefix(6)) {
+        // Australian Bankcard (withdrawn, numbers may still appear)
+        len == 16
+    } else if prefix(2) == 50
+        || (56..=58).contains(&prefix(2))
+        || matches!(prefix(4), 6304 | 6759)
+        || matches!(prefix(6), 676770 | 676774)
+    {
+        // Maestro
+        (12..=19).contains(&len)
     } else {
         false
     }

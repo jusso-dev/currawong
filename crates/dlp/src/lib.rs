@@ -7,12 +7,13 @@ pub mod detectors;
 
 pub use currawong_core::config::DlpProfile;
 pub use currawong_core::{DlpKind, DlpReport, DlpSample, Error};
-pub use detectors::Match;
+pub use detectors::{Match, Scan};
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
-/// Text beyond this is not scanned. The parser bounds extraction too.
-pub const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
+/// Text beyond this is not scanned and the report is marked incomplete.
+/// The parser bounds extraction to less than this.
+pub const MAX_SCAN_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SAMPLES_PER_KIND: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,42 +40,42 @@ pub fn parse_pspf(value: &str) -> Option<ProtectiveMarking> {
 /// Every detector. Where two matches overlap the higher confidence wins, and
 /// on a tie the checksum types win over licences (earlier in this list).
 pub fn find_all(text: &str) -> Vec<Match> {
-    let text = bounded(text);
-    let mut all: Vec<(usize, Match)> = [
-        detectors::card::find(text),
-        detectors::abn::find(text),
-        detectors::medicare::find(text),
-        detectors::tfn::find(text),
-        detectors::acn::find(text),
-        detectors::licence::find(text),
-    ]
-    .into_iter()
-    .enumerate()
-    .flat_map(|(rank, found)| found.into_iter().map(move |m| (rank, m)))
-    .collect();
+    let scan = Scan::new(bounded(text));
+    let rules = detectors::checksum_rules();
+    let mut all = detectors::find_rules(&scan, &rules);
+    all.extend(
+        detectors::licence::find_in(&scan)
+            .into_iter()
+            .map(|m| (rules.len(), m)),
+    );
     all.sort_by_key(|(rank, m)| (std::cmp::Reverse(m.confidence), *rank, m.start));
-    let mut kept: Vec<Match> = Vec::new();
+    // Kept spans never overlap, so the one starting closest before `end` is
+    // the only one that can collide.
+    let mut kept: BTreeMap<usize, Match> = BTreeMap::new();
     for (_, m) in all {
-        if kept.iter().all(|k| m.end <= k.start || m.start >= k.end) {
-            kept.push(m);
+        let clash = kept
+            .range(..m.end)
+            .next_back()
+            .is_some_and(|(_, k)| k.end > m.start);
+        if !clash {
+            kept.insert(m.start, m);
         }
     }
-    kept.sort_by_key(|m| m.start);
-    kept
+    kept.into_values().collect()
 }
 
 pub fn scan(text: &str, profile: &DlpProfile) -> DlpReport {
+    let mut report = DlpReport {
+        incomplete: text.len() > MAX_SCAN_BYTES,
+        ..DlpReport::default()
+    };
     let text = bounded(text);
-    let mut report = DlpReport::default();
     let mut seen = HashSet::new();
     for m in find_all(text) {
         if m.confidence < profile.min_confidence {
             continue;
         }
-        let value: String = text[m.start..m.end]
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
+        let value = normalised(&text[m.start..m.end]);
         // The same identifier in the text and HTML parts counts once.
         if !seen.insert((m.kind, value)) {
             continue;
@@ -83,7 +84,7 @@ pub fn scan(text: &str, profile: &DlpProfile) -> DlpReport {
         if report.samples.iter().filter(|s| s.kind == m.kind).count() < MAX_SAMPLES_PER_KIND {
             report.samples.push(DlpSample {
                 kind: m.kind,
-                redacted: redact(&text[m.start..m.end]),
+                redacted: redact(m.kind, &text[m.start..m.end]),
                 confidence: m.confidence,
             });
         }
@@ -100,18 +101,38 @@ pub fn scan(text: &str, profile: &DlpProfile) -> DlpReport {
     report
 }
 
-/// Keeps the first three characters and masks the rest in groups of three:
-/// `123 456 782` becomes `123 *** ***`.
-pub fn redact(value: &str) -> String {
-    let chars: Vec<char> = value.chars().filter(char::is_ascii_alphanumeric).collect();
-    let mut out: String = chars.iter().take(3).collect();
-    for i in 0..chars.len().saturating_sub(3) {
-        if i % 3 == 0 {
+/// Shows at most a third of the value, and at most three characters, then
+/// masks the rest in groups of three: `123 456 782` becomes `123 *** ***`.
+/// Licences have no structure worth showing and are fully masked.
+pub fn redact(kind: DlpKind, value: &str) -> String {
+    let chars: Vec<char> = normalised(value).chars().collect();
+    let shown = if kind == DlpKind::DriverLicence {
+        0
+    } else {
+        (chars.len() / 3).min(3)
+    };
+    let mut out: String = chars.iter().take(shown).collect();
+    for i in 0..chars.len() - shown {
+        if i % 3 == 0 && !out.is_empty() {
             out.push(' ');
         }
         out.push('*');
     }
     out
+}
+
+/// ASCII letters and digits only, with Unicode digits mapped to ASCII.
+fn normalised(value: &str) -> String {
+    value
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c)
+            } else {
+                detectors::digit_value(c).map(|d| char::from(b'0' + d))
+            }
+        })
+        .collect()
 }
 
 fn bounded(text: &str) -> &str {

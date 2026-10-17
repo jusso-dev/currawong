@@ -1,12 +1,24 @@
 //! Australian Business Numbers: subtract 1 from the first digit, then a
 //! weighted sum modulus 89.
-use super::{find_runs, weighted_sum, DlpKind, Match};
+use super::{find_rule, weighted_sum, DlpKind, Match, Rule, Scan};
 
 const WEIGHTS: [u32; 11] = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
 const CONTEXT: &[&str] = &["abn", "australian business number"];
 
 pub fn find(text: &str) -> Vec<Match> {
-    find_runs(text, DlpKind::Abn, 65, CONTEXT, validate)
+    find_in(&Scan::new(text))
+}
+
+pub(crate) const RULE: Rule = Rule {
+    kind: DlpKind::Abn,
+    lengths: 11..=11,
+    base: 65,
+    words: CONTEXT,
+    validate,
+};
+
+pub fn find_in(scan: &Scan) -> Vec<Match> {
+    find_rule(scan, &RULE)
 }
 
 pub fn validate(digits: &str) -> bool {

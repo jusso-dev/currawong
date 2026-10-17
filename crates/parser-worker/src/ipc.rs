@@ -1,4 +1,5 @@
 //! Length-prefixed JSON frames shared by the worker and the supervisor.
+use crate::text::DlpText;
 use currawong_core::config::ExtractLimits;
 use currawong_core::PartInfo;
 use serde::{Deserialize, Serialize};
@@ -19,7 +20,7 @@ pub struct ParseResponse {
     pub error: Option<String>,
     /// Extracted text for DLP, bounded by `text::MAX_TEXT_BYTES`.
     #[serde(default)]
-    pub text: String,
+    pub dlp: DlpText,
 }
 
 impl ParseResponse {
@@ -29,7 +30,7 @@ impl ParseResponse {
             parts: Vec::new(),
             urls: Vec::new(),
             error: Some(reason.into()),
-            text: String::new(),
+            dlp: DlpText::default(),
         }
     }
 }

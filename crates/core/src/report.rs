@@ -131,6 +131,10 @@ pub struct DlpReport {
     pub samples: Vec<DlpSample>,
     /// Kinds whose count reached the profile's review threshold.
     pub review: Vec<DlpKind>,
+    /// Some text was not scanned (size limit, or a document that could not
+    /// be extracted). Policy holds the message for review.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 impl ScanReport {

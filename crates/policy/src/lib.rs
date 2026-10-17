@@ -36,14 +36,21 @@ pub fn decide(report: &ScanReport) -> Verdict {
             };
         }
     }
-    // Default DLP rule: hold for review once a kind reaches its threshold.
-    // The reason carries counts only, never identifiers.
-    if let Some(dlp) = report.dlp.as_ref().filter(|dlp| !dlp.review.is_empty()) {
-        let kinds: Vec<String> = dlp
+    // Default DLP rule: hold for review once a kind reaches its threshold, or
+    // when some text could not be scanned. The reason carries counts only.
+    if let Some(dlp) = report
+        .dlp
+        .as_ref()
+        .filter(|dlp| !dlp.review.is_empty() || dlp.incomplete)
+    {
+        let mut kinds: Vec<String> = dlp
             .review
             .iter()
             .map(|kind| format!("{} x{}", kind.as_str(), dlp.counts.get(kind).unwrap_or(&0)))
             .collect();
+        if dlp.incomplete {
+            kinds.push("scan incomplete".into());
+        }
         return Verdict::Quarantine {
             reason: format!("dlp review: {}", kinds.join(", ")),
         };
@@ -98,5 +105,28 @@ mod tests {
         both.defer = true;
         both.malware = true;
         assert!(matches!(decide(&both), Verdict::Quarantine { .. }));
+    }
+
+    #[test]
+    fn dlp_review_and_incomplete_scans_are_held() {
+        use currawong_core::{DlpKind, DlpReport};
+        let mut found = report();
+        found.dlp = Some(DlpReport::default());
+        assert!(matches!(decide(&found), Verdict::Deliver));
+        let dlp = found.dlp.as_mut().unwrap();
+        dlp.counts.insert(DlpKind::Tfn, 5);
+        assert!(matches!(decide(&found), Verdict::Deliver));
+        found.dlp.as_mut().unwrap().review = vec![DlpKind::Tfn];
+        assert!(
+            matches!(decide(&found), Verdict::Quarantine { reason } if reason == "dlp review: tfn x5")
+        );
+        let mut partial = report();
+        partial.dlp = Some(DlpReport {
+            incomplete: true,
+            ..DlpReport::default()
+        });
+        assert!(
+            matches!(decide(&partial), Verdict::Quarantine { reason } if reason == "dlp review: scan incomplete")
+        );
     }
 }
