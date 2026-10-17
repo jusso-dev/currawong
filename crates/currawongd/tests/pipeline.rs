@@ -1,4 +1,5 @@
 use currawong_auth::{seed_txt, AuthChecker};
+use currawong_classify::{spam::Feedback, TenantContext};
 use currawong_core::{config::Config, Direction, Verdict};
 use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
@@ -118,6 +119,95 @@ async fn classify_puts_spam_and_lookalike_scores_on_the_report() {
         .await;
     assert!(clean.lookalikes.is_empty(), "{:?}", clean.lookalikes);
     assert!(clean.spam.unwrap().rules_hit.is_empty());
+}
+
+#[tokio::test]
+async fn classify_uses_the_recipient_tenant_for_bayes_and_protected_domains() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.classify.bayes_database = dir.path().join("bayes.sqlite");
+    cfg.domains.accept = vec![
+        "alphafreight.com.au".into(),
+        "bravodental.com.au".into(),
+        "default.test".into(),
+    ];
+    for (id, domain) in [
+        ("alpha", "alphafreight.com.au"),
+        ("bravo", "bravodental.com.au"),
+    ] {
+        cfg.relay
+            .tenants
+            .push(currawong_core::config::TenantConfig {
+                id: id.into(),
+                domains: vec![domain.into()],
+                trusted_cidrs: Vec::new(),
+            });
+    }
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let classifier = pipeline.classifier.clone().expect("classifier");
+    let bravo = TenantContext::tenant("bravo", &["bravodental.com.au".to_string()]);
+    let spam = b"From: promo@casino.example\r\nSubject: casino bonus jackpot\r\n\r\ncasino bonus jackpot cash\r\n";
+    let ham = b"From: staff@bravodental.com.au\r\nSubject: roster\r\n\r\nroster for the clinic\r\n";
+    for i in 0..5 {
+        classifier
+            .learn(&bravo, &format!("s{i}"), spam, Feedback::ReportedSpam)
+            .unwrap();
+        classifier
+            .learn(&bravo, &format!("h{i}"), ham, Feedback::Released)
+            .unwrap();
+    }
+    let raw = b"From: accounts@a1phafreight.com.au\r\nSubject: casino bonus jackpot\r\n\r\ncasino bonus jackpot cash\r\n";
+    let to = |rcpt: &str| {
+        let mut env = envelope("bounce@casino.example");
+        env.rcpt_to = vec![rcpt.into()];
+        env
+    };
+    let (for_bravo, _) = pipeline
+        .evaluate(&to("dr@bravodental.com.au"), raw, None)
+        .await;
+    assert!(
+        for_bravo.spam.as_ref().unwrap().bayes > 0.9,
+        "{for_bravo:?}"
+    );
+    // Alpha's domain is not named in Bravo's report.
+    assert!(
+        for_bravo.lookalikes.is_empty(),
+        "{:?}",
+        for_bravo.lookalikes
+    );
+
+    let (for_alpha, _) = pipeline
+        .evaluate(&to("ap@alphafreight.com.au"), raw, None)
+        .await;
+    assert_eq!(for_alpha.spam.as_ref().unwrap().bayes, 0.5);
+    let targets: Vec<&str> = for_alpha
+        .lookalikes
+        .iter()
+        .map(|f| f.target.as_str())
+        .collect();
+    assert_eq!(targets, vec!["alphafreight.com.au"]);
+
+    // An accepted domain without a tenant gets its own store, separate from
+    // a tenant that is literally called "default".
+    let named_default = TenantContext::tenant("default", &[]);
+    for i in 0..5 {
+        classifier
+            .learn(
+                &named_default,
+                &format!("s{i}"),
+                spam,
+                Feedback::ReportedSpam,
+            )
+            .unwrap();
+        classifier
+            .learn(&named_default, &format!("h{i}"), ham, Feedback::Released)
+            .unwrap();
+    }
+    let (unclaimed, _) = pipeline.evaluate(&to("x@default.test"), raw, None).await;
+    assert_eq!(unclaimed.spam.as_ref().unwrap().bayes, 0.5);
 }
 
 #[tokio::test]

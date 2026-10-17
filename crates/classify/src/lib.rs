@@ -9,8 +9,9 @@ use currawong_core::{
     config::{ClassifyConfig, Config},
     LookalikeFinding, SpamReport,
 };
+use lookalike::Protected;
 use message::{address_domain, url_host, MessageView};
-use spam::{Bayes, RuleSet, SpamClassifier, SpamError};
+use spam::{Bayes, Feedback, RuleSet, SpamClassifier, SpamError, Trained};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClassifyError {
@@ -20,20 +21,53 @@ pub enum ClassifyError {
     Brands(String),
 }
 
+/// Who a message is classified for. `key` partitions the Bayes store and
+/// `domains` are the tenant's own domains, protected against lookalikes in
+/// that tenant's mail only. Keys are namespaced so a configured tenant id can
+/// never collide with a recipient domain that has no tenant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantContext {
+    pub key: String,
+    pub domains: Vec<String>,
+}
+
+impl TenantContext {
+    /// A configured tenant and its domains.
+    pub fn tenant(id: &str, domains: &[String]) -> Self {
+        Self {
+            key: format!("tenant:{id}"),
+            domains: domains.to_vec(),
+        }
+    }
+
+    /// An accepted domain that no tenant claims.
+    pub fn domain(domain: &str) -> Self {
+        let domain = domain.to_ascii_lowercase();
+        Self {
+            key: format!("domain:{domain}"),
+            domains: vec![domain],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
     pub spam: SpamReport,
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Degraded scoring, for the report notes.
+    pub notes: Vec<String>,
 }
 
 pub struct Classifier {
-    protected: Vec<String>,
+    /// Brands and `classify.protected_domains`, shared by every tenant.
+    protected: Protected,
     spam: SpamClassifier,
 }
 
 impl Classifier {
     /// Rules and brands must load. A Bayes store that cannot be opened is
-    /// logged and skipped, so rules and lookalikes still score.
+    /// logged and skipped, so rules and lookalikes still score, and each
+    /// report says so.
     pub fn from_config(cfg: &Config) -> Result<Self, ClassifyError> {
         let (rules, brands) = load(&cfg.classify)?;
         let bayes = match Bayes::open(&cfg.classify.bayes_database) {
@@ -44,34 +78,57 @@ impl Classifier {
             }
         };
         let mut protected = brands;
-        protected.extend(cfg.domains.accept.iter().cloned());
-        for tenant in &cfg.relay.tenants {
-            protected.extend(tenant.domains.iter().cloned());
-        }
         protected.extend(cfg.classify.protected_domains.iter().cloned());
-        protected.sort();
-        protected.dedup();
-        Ok(Self::new(protected, SpamClassifier { bayes, rules }))
+        Ok(Self::new(&protected, SpamClassifier { bayes, rules }))
     }
 
-    pub fn new(protected: Vec<String>, spam: SpamClassifier) -> Self {
-        Self { protected, spam }
+    pub fn new(protected: &[String], spam: SpamClassifier) -> Self {
+        Self {
+            protected: Protected::new(protected),
+            spam,
+        }
     }
 
     pub fn spam(&self) -> &SpamClassifier {
         &self.spam
     }
 
-    /// Score one message. `urls` are links the parser worker found, added to
-    /// the links in the text body.
+    /// Train the tenant's Bayes store from a quarantine release or a user report.
+    pub fn learn(
+        &self,
+        tenant: &TenantContext,
+        message_id: &str,
+        raw: &[u8],
+        feedback: Feedback,
+    ) -> Result<Trained, SpamError> {
+        self.spam.learn(&tenant.key, message_id, raw, feedback)
+    }
+
+    /// Score one message for one tenant. `urls` are links the parser worker
+    /// found, added to the links in the text and HTML bodies.
     pub fn classify(
         &self,
-        tenant: &str,
+        tenant: &TenantContext,
         raw: &[u8],
         envelope_sender: &str,
         urls: &[String],
     ) -> Classification {
         let view = MessageView::parse(raw);
+        let mut notes = Vec::new();
+        if view.failed {
+            notes.push("classify could not parse the message headers".to_string());
+        }
+        if view.truncated {
+            notes.push(format!(
+                "classify read only the first {} bytes",
+                message::MAX_RAW_BYTES
+            ));
+        }
+        if self.spam.bayes.is_none() {
+            notes.push("bayes store unavailable: spam score is rules only".to_string());
+        }
+        let mut protected = self.protected.clone();
+        protected.extend(&tenant.domains);
         let mut lookalikes: Vec<LookalikeFinding> = Vec::new();
         let mut check = |source: &str, domain: &str| {
             let domain = domain.to_lowercase();
@@ -81,7 +138,7 @@ impl Classifier {
             {
                 return;
             }
-            if let Some(hit) = lookalike::score(&domain, &self.protected) {
+            if let Some(hit) = protected.score(&domain) {
                 lookalikes.push(LookalikeFinding {
                     source: source.into(),
                     domain,
@@ -106,14 +163,14 @@ impl Classifier {
                 check(source, domain);
             }
         }
-        for link in view.urls.iter().chain(urls) {
-            if let Some(host) = url_host(link) {
-                check("url", &host);
-            }
+        let worker_hosts = urls.iter().filter_map(|link| url_host(link));
+        for host in view.hosts.iter().cloned().chain(worker_hosts) {
+            check("url", &host);
         }
         Classification {
-            spam: self.spam.score(tenant, &view, urls),
+            spam: self.spam.score(&tenant.key, &view, urls),
             lookalikes,
+            notes,
         }
     }
 }
@@ -135,4 +192,19 @@ fn load(cfg: &ClassifyConfig) -> Result<(RuleSet, Vec<String>), ClassifyError> {
         None => lookalike::parse_brands(lookalike::BRANDS_AU),
     };
     Ok((rules, brands))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TenantContext;
+
+    #[test]
+    fn tenant_keys_cannot_collide_with_unclaimed_domains() {
+        let named = TenantContext::tenant("default", &[]);
+        let tricky = TenantContext::tenant("domain:example.test", &[]);
+        let unclaimed = TenantContext::domain("Example.TEST");
+        assert_ne!(named.key, unclaimed.key);
+        assert_ne!(tricky.key, unclaimed.key);
+        assert_eq!(unclaimed.domains, vec!["example.test"]);
+    }
 }

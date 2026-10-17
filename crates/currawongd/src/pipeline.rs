@@ -1,6 +1,6 @@
 //! Auth, parse, scan, classify and the policy decision.
 use currawong_auth::AuthChecker;
-use currawong_classify::Classifier;
+use currawong_classify::{message::MAX_RAW_BYTES, Classifier, TenantContext};
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
@@ -15,8 +15,10 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
-    /// Spam and lookalike scoring. `None` when `classify.enabled` is off.
-    pub classifier: Option<Classifier>,
+    /// Spam and lookalike scoring. `None` when `classify.enabled` is off or
+    /// the classifier failed to load (`classify_error`, noted on each report).
+    pub classifier: Option<Arc<Classifier>>,
+    pub classify_error: Option<String>,
 }
 
 impl Pipeline {
@@ -31,19 +33,21 @@ impl Pipeline {
         });
         // `--check-config` has already loaded the rules and brands, so a
         // failure here is logged rather than stopping the daemon.
-        let classifier = match cfg.classify.enabled.then(|| Classifier::from_config(&cfg)) {
-            Some(Ok(classifier)) => Some(classifier),
-            Some(Err(err)) => {
-                tracing::error!(%err, "classifier disabled");
-                None
-            }
-            None => None,
-        };
+        let (classifier, classify_error) =
+            match cfg.classify.enabled.then(|| Classifier::from_config(&cfg)) {
+                Some(Ok(classifier)) => (Some(Arc::new(classifier)), None),
+                Some(Err(err)) => {
+                    tracing::error!(%err, "classifier disabled");
+                    (None, Some(err.to_string()))
+                }
+                None => (None, None),
+            };
         Self {
             cfg,
             auth,
             pool,
             classifier,
+            classify_error,
         }
     }
 
@@ -57,7 +61,7 @@ impl Pipeline {
         let auth = self.auth.check(raw, env).await;
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
-            self.classify(env, raw, &mut report);
+            self.classify(env, raw, &mut report).await;
             let verdict = decide(&report);
             return (report, verdict);
         }
@@ -121,19 +125,36 @@ impl Pipeline {
                 detail: String::new(),
             });
         }
-        self.classify(env, raw, &mut report);
+        self.classify(env, raw, &mut report).await;
         let verdict = decide(&report);
         (report, verdict)
     }
 
-    fn classify(&self, env: &Envelope, raw: &[u8], report: &mut ScanReport) {
-        let Some(classifier) = &self.classifier else {
+    /// Classification is CPU and SQLite work, so it runs off the async workers.
+    async fn classify(&self, env: &Envelope, raw: &[u8], report: &mut ScanReport) {
+        let Some(classifier) = self.classifier.clone() else {
+            if let Some(err) = &self.classify_error {
+                report.notes.push(format!("classifier unavailable: {err}"));
+            }
             return;
         };
-        let tenant = env.tenant_id.as_deref().unwrap_or("default");
-        let result = classifier.classify(tenant, raw, &env.mail_from, &report.urls);
-        report.spam = Some(result.spam);
-        report.lookalikes = result.lookalikes;
+        let tenant = tenant_context(&self.cfg, env);
+        // One byte past the cap so the classifier still notes the truncation.
+        let raw = raw[..raw.len().min(MAX_RAW_BYTES + 1)].to_vec();
+        let sender = env.mail_from.clone();
+        let urls = report.urls.clone();
+        match tokio::task::spawn_blocking(move || {
+            classifier.classify(&tenant, &raw, &sender, &urls)
+        })
+        .await
+        {
+            Ok(result) => {
+                report.spam = Some(result.spam);
+                report.lookalikes = result.lookalikes;
+                report.notes.extend(result.notes);
+            }
+            Err(err) => report.notes.push(format!("classifier failed: {err}")),
+        }
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {
@@ -180,6 +201,39 @@ impl Pipeline {
         }
         parse_bytes(env.id.as_str(), raw, &self.cfg.scanner.extract)
     }
+}
+
+/// The tenant a message is classified for: the relay tenant that submitted
+/// it, else the tenant owning the first recipient domain that one claims,
+/// else the first recipient domain on its own. Per-recipient tenancy belongs
+/// to the policy engine; this only picks the Bayes store and protected domains.
+fn tenant_context(cfg: &Config, env: &Envelope) -> TenantContext {
+    let tenants = &cfg.relay.tenants;
+    if let Some(id) = &env.tenant_id {
+        let domains = tenants
+            .iter()
+            .find(|tenant| &tenant.id == id)
+            .map(|tenant| tenant.domains.clone())
+            .unwrap_or_default();
+        return TenantContext::tenant(id, &domains);
+    }
+    let recipient_domains: Vec<&str> = env
+        .rcpt_to
+        .iter()
+        .filter_map(|rcpt| rcpt.rsplit_once('@'))
+        .map(|(_, domain)| domain.trim_end_matches('>'))
+        .collect();
+    for domain in &recipient_domains {
+        if let Some(tenant) = tenants.iter().find(|tenant| {
+            tenant
+                .domains
+                .iter()
+                .any(|owned| owned.eq_ignore_ascii_case(domain))
+        }) {
+            return TenantContext::tenant(&tenant.id, &tenant.domains);
+        }
+    }
+    TenantContext::domain(recipient_domains.first().copied().unwrap_or("unknown"))
 }
 
 fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {

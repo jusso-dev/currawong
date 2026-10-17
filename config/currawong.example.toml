@@ -193,8 +193,9 @@ authserv_id = "currawong.example.test"
 # pattern, score). Leave unset for the built-in rules in rules/spam/.
 # classify.brands_file: "Name: domain ..." per line. Leave unset for the
 # built-in Australian list in rules/brands-au.txt.
-# classify.protected_domains: more domains to protect. domains.accept and
-# relay tenant domains are always protected.
+# classify.protected_domains: more domains to protect in every tenant's mail.
+# Each relay tenant's own domains are protected in that tenant's mail only;
+# an accepted domain with no tenant protects itself and has its own Bayes store.
 [classify]
 enabled = true
 bayes_database = "/var/lib/currawong/bayes.sqlite"

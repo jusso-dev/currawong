@@ -2,7 +2,7 @@
 pub mod bayes;
 pub mod rules;
 
-pub use bayes::{Bayes, Label};
+pub use bayes::{Bayes, Label, Trained};
 pub use currawong_core::{RuleHit, SpamReport};
 pub use rules::RuleSet;
 
@@ -69,13 +69,26 @@ impl SpamClassifier {
         }
     }
 
-    /// Train the tenant's classifier from a quarantine release or a user report.
-    pub fn learn(&self, tenant: &str, raw: &[u8], feedback: Feedback) -> Result<(), SpamError> {
+    /// Train the tenant's classifier from a quarantine release or a user
+    /// report. `message_id` makes repeated feedback idempotent and lets a
+    /// later report reverse an earlier one.
+    pub fn learn(
+        &self,
+        tenant: &str,
+        message_id: &str,
+        raw: &[u8],
+        feedback: Feedback,
+    ) -> Result<Trained, SpamError> {
         let store = self
             .bayes
             .as_ref()
             .ok_or_else(|| SpamError::Store("bayes store is not open".into()))?;
         let view = MessageView::parse(raw);
-        store.train(tenant, &bayes::tokens(&view, &[]), feedback.label())
+        store.train(
+            tenant,
+            message_id,
+            &bayes::tokens(&view, &[]),
+            feedback.label(),
+        )
     }
 }

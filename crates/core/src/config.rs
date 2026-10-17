@@ -282,7 +282,8 @@ pub struct ClassifyConfig {
     pub spam_rules_dir: Option<PathBuf>,
     /// Brand list, `Name: domain ...` per line. Unset uses the built-in Australian list.
     pub brands_file: Option<PathBuf>,
-    /// More domains to protect. Accepted and tenant domains are always protected.
+    /// More domains to protect in every tenant's mail. A tenant's own domains
+    /// are protected in its own mail.
     pub protected_domains: Vec<String>,
 }
 

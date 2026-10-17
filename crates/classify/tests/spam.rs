@@ -164,11 +164,23 @@ fn spam_bayes_held_out_accuracy_is_over_ninety_percent() {
     let dir = tempfile::tempdir().unwrap();
     let spam = classifier(Some(Bayes::open(&dir.path().join("bayes.sqlite")).unwrap()));
     let mut rng = Rng(0x5eed_1234_abcd_0001);
-    for _ in 0..200 {
-        spam.learn("tenant-a", &fixture(&mut rng, true), Feedback::ReportedSpam)
-            .unwrap();
-        spam.learn("tenant-a", &fixture(&mut rng, false), Feedback::Released)
-            .unwrap();
+    for i in 0..200 {
+        let id = format!("spam-{i}");
+        spam.learn(
+            "tenant-a",
+            &id,
+            &fixture(&mut rng, true),
+            Feedback::ReportedSpam,
+        )
+        .unwrap();
+        let id = format!("ham-{i}");
+        spam.learn(
+            "tenant-a",
+            &id,
+            &fixture(&mut rng, false),
+            Feedback::Released,
+        )
+        .unwrap();
     }
     let mut held_out = Rng(0x0dd_ba11_cafe_f00d);
     let mut correct = 0;
@@ -254,9 +266,10 @@ fn spam_rules_load_from_a_directory_and_bayes_adds_points() {
         rules,
     };
     let lure = b"From: a@example.test\r\nSubject: Overdue invoice\r\nList-Id: <news.example.test>\r\n\r\nPay now\r\n";
-    spam.learn("t", lure, Feedback::ReportedSpam).unwrap();
+    spam.learn("t", "m1", lure, Feedback::ReportedSpam).unwrap();
     spam.learn(
         "t",
+        "m2",
         b"From: b@example.test\r\nSubject: Lunch\r\n\r\nSandwiches at noon\r\n",
         Feedback::ReportedHam,
     )
@@ -276,7 +289,94 @@ fn spam_rules_load_from_a_directory_and_bayes_adds_points() {
 #[test]
 fn spam_learning_without_a_store_is_an_error() {
     let err = classifier(None)
-        .learn("t", b"Subject: x\r\n\r\ny\r\n", Feedback::Released)
+        .learn("t", "m", b"Subject: x\r\n\r\ny\r\n", Feedback::Released)
         .unwrap_err();
     assert!(err.to_string().contains("not open"), "{err}");
+}
+
+#[test]
+fn spam_padding_with_unknown_words_does_not_neutralise_bayes() {
+    let spam = classifier(Some(Bayes::in_memory().unwrap()));
+    let mut rng = Rng(0x5eed_1234_abcd_0001);
+    for i in 0..50 {
+        spam.learn(
+            "t",
+            &format!("s{i}"),
+            &fixture(&mut rng, true),
+            Feedback::ReportedSpam,
+        )
+        .unwrap();
+        spam.learn(
+            "t",
+            &format!("h{i}"),
+            &fixture(&mut rng, false),
+            Feedback::Released,
+        )
+        .unwrap();
+    }
+    let raw = String::from_utf8(fixture(&mut rng, true)).unwrap();
+    let plain = spam.score("t", &MessageView::parse(raw.as_bytes()), &[]);
+    assert!(plain.bayes > 0.9, "{}", plain.bayes);
+    // 2,500 never-seen words that sort before every real token.
+    let padding: Vec<String> = (1..=2500).map(|i| format!("aaa{i:05}")).collect();
+    let padded = format!("{raw}\r\n{}\r\n", padding.join(" "));
+    let report = spam.score("t", &MessageView::parse(padded.as_bytes()), &[]);
+    assert!(
+        report.bayes > 0.9,
+        "padding diluted Bayes to {}",
+        report.bayes
+    );
+}
+
+#[test]
+fn spam_long_bodies_keep_header_sender_and_url_tokens() {
+    let words: Vec<String> = (0..3000).map(|i| format!("aaa{i:05}")).collect();
+    let raw = format!(
+        "From: news@promo.example\r\nSubject: Weekly digest\r\nX-Mailer: Bulk Mail\r\n\r\nhttps://promo.example/x\r\n{}\r\n",
+        words.join(" ")
+    );
+    let tokens = currawong_classify::spam::bayes::tokens(&MessageView::parse(raw.as_bytes()), &[]);
+    for expected in [
+        "sender:promo.example",
+        "subject:digest",
+        "x-mailer:bulk",
+        "url:promo.example",
+        "header:subject",
+    ] {
+        assert!(tokens.iter().any(|t| t == expected), "{expected} missing");
+    }
+}
+
+#[test]
+fn spam_rules_see_encoded_subjects() {
+    let spam = classifier(None);
+    // "You have won a prize", base64 encoded.
+    let raw = b"From: a@promo.example\r\nSubject: =?utf-8?b?WW91IGhhdmUgd29uIGEgcHJpemU=?=\r\n\r\nhello\r\n";
+    let report = spam.score("t", &MessageView::parse(raw), &[]);
+    let names: Vec<&str> = report
+        .rules_hit
+        .iter()
+        .map(|hit| hit.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["subject_prize"]);
+}
+
+#[test]
+fn spam_degraded_scoring_is_noted() {
+    let classifier = currawong_classify::Classifier::new(&[], classifier(None));
+    let result = classifier.classify(
+        &currawong_classify::TenantContext::domain("example.test"),
+        b"From: a@example.test\r\nSubject: hi\r\n\r\nhello\r\n",
+        "",
+        &[],
+    );
+    assert_eq!(result.spam.bayes, 0.5);
+    assert!(
+        result
+            .notes
+            .iter()
+            .any(|note| note.contains("bayes store unavailable")),
+        "{:?}",
+        result.notes
+    );
 }
