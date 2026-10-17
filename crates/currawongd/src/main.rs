@@ -21,6 +21,15 @@ struct Args {
     /// Load and validate the configuration, then exit.
     #[arg(long)]
     check_config: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Manage DKIM and ARC signing keys.
+    #[command(subcommand)]
+    Dkim(currawongd::dkim::DkimCommand),
 }
 
 #[tokio::main]
@@ -35,6 +44,16 @@ async fn main() {
     };
     if args.check_config {
         println!("configuration ok");
+        return;
+    }
+    if let Some(Command::Dkim(command)) = args.command {
+        match currawongd::dkim::run(&cfg, command) {
+            Ok(out) => print!("{out}"),
+            Err(err) => {
+                eprintln!("currawongd: {err}");
+                std::process::exit(1);
+            }
+        }
         return;
     }
     currawongd::install_tracing(&cfg);
@@ -96,7 +115,14 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    // Keys exist once `currawongd dkim generate` has run; until then nothing is signed.
+    if (cfg.dkim.sign_outbound || cfg.dkim.seal_arc) && cfg.dkim.database.exists() {
+        let keys = currawong_auth::KeyStore::open(&cfg.dkim.database, &cfg.dkim.kek_path)?;
+        pipeline = pipeline.with_keys(keys);
+    } else if cfg.dkim.sign_outbound || cfg.dkim.seal_arc {
+        tracing::warn!(database = %cfg.dkim.database.display(), "no DKIM key store; outbound mail is not signed");
+    }
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(

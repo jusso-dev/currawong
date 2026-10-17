@@ -1,4 +1,5 @@
 //! Gateway daemon library. The binary is `currawongd`.
+pub mod dkim;
 mod health;
 mod pipeline;
 mod scheduler;

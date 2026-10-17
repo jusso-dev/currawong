@@ -712,6 +712,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "currawong-auth",
  "currawong-core",
  "currawong-spool",
  "dashmap",

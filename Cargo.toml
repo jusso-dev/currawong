@@ -63,3 +63,10 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
 zeroize = "1"
+
+# RSA-2048 key generation is very slow unoptimised, and tests generate keys.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

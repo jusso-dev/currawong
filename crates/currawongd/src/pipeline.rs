@@ -1,6 +1,8 @@
 //! Auth, parse, scan and the M1 policy decision.
-use currawong_auth::AuthChecker;
-use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
+use currawong_auth::{AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
+use currawong_core::{
+    config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
 use currawong_scan::{
@@ -14,6 +16,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// DKIM and ARC keys. `None` means nothing is signed or sealed.
+    pub keys: Option<KeyStore>,
 }
 
 impl Pipeline {
@@ -26,7 +30,56 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        Self {
+            cfg,
+            auth,
+            pool,
+            keys: None,
+        }
+    }
+
+    pub fn with_keys(mut self, keys: KeyStore) -> Self {
+        self.keys = Some(keys);
+        self
+    }
+
+    /// Headers the deliverer prepends: our Authentication-Results (plus the
+    /// ARC set when sealing), then DKIM signatures for outbound tenant mail.
+    /// Replaces any earlier set so re-evaluating deferred mail never stacks.
+    pub fn delivery_headers(&self, env: &Envelope, raw: &[u8], report: &ScanReport) -> Vec<String> {
+        let mut headers: Vec<String> = report.auth.iter().map(auth_header).collect();
+        if let (Some(keys), Some(tenant), Direction::Outbound, true) = (
+            &self.keys,
+            &env.tenant_id,
+            env.direction,
+            self.cfg.dkim.sign_outbound,
+        ) {
+            match currawong_auth::sign_outbound(keys, raw, tenant) {
+                Ok(signed) if !signed.is_empty() => headers.push(signed),
+                Ok(_) => tracing::warn!(id = %env.id, %tenant, "no DKIM key for sender domain"),
+                Err(err) => tracing::error!(id = %env.id, %err, "DKIM signing failed"),
+            }
+        }
+        headers
+    }
+
+    /// Active gateway key for the authserv-id domain, RSA first because
+    /// RFC 8617 verifiers are only required to support rsa-sha256.
+    fn arc_sealer(&self) -> Option<StoredKey> {
+        if !self.cfg.dkim.seal_arc {
+            return None;
+        }
+        let keys = self.keys.as_ref()?;
+        match keys.signing_keys(GATEWAY_TENANT, self.auth.authserv_id(), now()) {
+            Ok(mut found) => {
+                found.sort_by_key(|key| key.algorithm != "rsa-sha256");
+                found.into_iter().next()
+            }
+            Err(err) => {
+                tracing::error!(%err, "ARC key lookup failed");
+                None
+            }
+        }
     }
 
     pub async fn evaluate(
@@ -36,7 +89,8 @@ impl Pipeline {
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
         let mut report = ScanReport::new(env.id.clone());
-        let auth = self.auth.check(raw, env).await;
+        let sealer = self.arc_sealer();
+        let auth = self.auth.check_and_seal(raw, env, sealer.as_ref()).await;
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             let verdict = decide(&report);
@@ -177,4 +231,11 @@ pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
 
 pub fn auth_header(auth: &AuthResults) -> String {
     auth.header.clone()
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }

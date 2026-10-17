@@ -5,15 +5,16 @@ mod sign;
 mod strip;
 
 pub use cache::TxtCache;
-pub use keys::{publishable, KeyStore, StoredKey};
-pub use sign::{ed25519_key, rsa_key, seal_arc, sign_message};
+pub use keys::{generate, publishable, KeyStore, StoredKey, GATEWAY_TENANT};
+pub use sign::{sign, sign_message, sign_outbound};
 pub use strip::strip_forged;
 
 use currawong_core::{AuthMethodResult, AuthResults};
 use currawong_spool::Envelope;
 use mail_auth::{
     common::{headers::HeaderWriter, parse::TxtRecordParser, verify::DomainKey},
-    dmarc::{verify::DmarcParameters, Dmarc},
+    dmarc::{verify::DmarcParameters, Dmarc, Policy},
+    hickory_resolver::config::{ResolverConfig, ResolverOpts},
     spf::{verify::SpfParameters, Spf},
     AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, MessageAuthenticator,
     Parameters, SpfResult, Txt,
@@ -27,22 +28,38 @@ pub struct AuthChecker {
 }
 
 impl AuthChecker {
+    /// Production checker. DNS goes to the host's configured resolvers, the
+    /// same ones the rest of the daemon uses.
     pub fn new(authserv_id: impl Into<String>) -> Result<Self, String> {
-        Self::with_cache(authserv_id, TxtCache::new())
+        let resolver = MessageAuthenticator::new_system_conf().map_err(|err| err.to_string())?;
+        Ok(Self::with_parts(authserv_id, resolver, TxtCache::new()))
     }
 
-    /// Resolver cache misses stay inside the process. Use this in unit tests.
+    /// No name servers and a cache whose misses are errors, so nothing
+    /// leaves the process. Use this in unit tests.
     pub fn offline(authserv_id: impl Into<String>) -> Result<Self, String> {
-        Self::with_cache(authserv_id, TxtCache::offline())
+        let resolver = MessageAuthenticator::new(
+            ResolverConfig::from_name_servers(Vec::new()),
+            ResolverOpts::default(),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(Self::with_parts(authserv_id, resolver, TxtCache::offline()))
     }
 
-    fn with_cache(authserv_id: impl Into<String>, cache: TxtCache) -> Result<Self, String> {
-        let resolver = MessageAuthenticator::new_cloudflare().map_err(|err| err.to_string())?;
-        Ok(Self {
+    fn with_parts(
+        authserv_id: impl Into<String>,
+        resolver: MessageAuthenticator,
+        cache: TxtCache,
+    ) -> Self {
+        Self {
             authserv_id: authserv_id.into(),
             resolver,
             cache,
-        })
+        }
+    }
+
+    pub fn authserv_id(&self) -> &str {
+        &self.authserv_id
     }
 
     pub fn cache(&self) -> &TxtCache {
@@ -50,21 +67,35 @@ impl AuthChecker {
     }
 
     pub async fn check(&self, raw: &[u8], env: &Envelope) -> AuthResults {
+        self.check_and_seal(raw, env, None).await
+    }
+
+    /// Verify, and when `sealer` is given append an ARC set carrying these
+    /// results to `header`. The seal covers the stripped message, which is
+    /// what the spool holds (forged headers are removed at DATA).
+    pub async fn check_and_seal(
+        &self,
+        raw: &[u8],
+        env: &Envelope,
+        sealer: Option<&StoredKey>,
+    ) -> AuthResults {
         let stripped = strip_forged(raw, &self.authserv_id);
         let Some(message) = AuthenticatedMessage::parse(&stripped) else {
             return empty(&self.authserv_id);
         };
         let dkim_params = Parameters::new(&message).with_txt_cache(&self.cache);
         let dkim = self.resolver.verify_dkim(dkim_params).await;
-        let sender = if env.mail_from.is_empty() {
-            "postmaster@invalid.test"
-        } else {
-            env.mail_from.as_str()
-        };
         let helo = if env.helo.is_empty() {
             "localhost"
         } else {
             env.helo.as_str()
+        };
+        // RFC 7208 section 2.4: a null reverse-path is checked as postmaster@HELO.
+        let null_sender = format!("postmaster@{helo}");
+        let sender = if env.mail_from.is_empty() {
+            null_sender.as_str()
+        } else {
+            env.mail_from.as_str()
         };
         let spf_input =
             SpfParameters::verify_mail_from(env.remote_ip, helo, &self.authserv_id, sender);
@@ -85,6 +116,13 @@ impl AuthChecker {
             .with_spf_mailfrom_result(&spf, env.remote_ip, sender, helo)
             .with_dmarc_result(&dmarc)
             .with_arc_result(&arc, env.remote_ip);
+        let mut header = built.to_header();
+        if let Some(key) = sealer {
+            match sign::seal_arc_set(&message, &built, &arc, key) {
+                Ok(set) => header.push_str(&set),
+                Err(err) => tracing::warn!(%err, "ARC seal skipped"),
+            }
+        }
         AuthResults {
             spf: spf_method(spf.result()),
             dkim: dkim
@@ -99,8 +137,10 @@ impl AuthChecker {
                 result: dkim_label(arc.result()).into(),
                 detail: String::new(),
             },
-            dmarc_policy: policy_label(&built),
-            header: built.to_header(),
+            // From the evaluated DMARC record, never from header text: our
+            // header echoes the attacker-controlled MAIL FROM.
+            dmarc_policy: policy_label(dmarc.policy()).into(),
+            header,
         }
     }
 }
@@ -157,16 +197,13 @@ fn dmarc_method(result: DmarcResult) -> AuthMethodResult {
     }
 }
 
-fn policy_label(header: &AuthenticationResults<'_>) -> String {
-    let text = header.to_header().to_ascii_lowercase();
-    let Some(start) = text.find("policy.dmarc=") else {
-        return String::new();
-    };
-    text[start + "policy.dmarc=".len()..]
-        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
-        .next()
-        .unwrap_or("")
-        .to_string()
+fn policy_label(policy: Policy) -> &'static str {
+    match policy {
+        Policy::None => "none",
+        Policy::Quarantine => "quarantine",
+        Policy::Reject => "reject",
+        Policy::Unspecified => "",
+    }
 }
 
 pub fn seed_txt(cache: &TxtCache, name: &str, record: &str) -> Result<(), String> {

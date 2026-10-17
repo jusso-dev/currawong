@@ -4,7 +4,7 @@ use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
 use time::OffsetDateTime;
 
-use crate::pipeline::{auth_header, Pipeline};
+use crate::pipeline::Pipeline;
 
 pub async fn classify_pending(
     spool: &Spool,
@@ -53,9 +53,7 @@ async fn classify_one(
         .map_err(|err| err.to_string())?;
     let body_path = spool_body(spool, &env);
     let (report, verdict) = pipeline.evaluate(&env, &raw, body_path.as_deref()).await;
-    if let Some(auth) = &report.auth {
-        env.prepend_headers.push(auth_header(auth));
-    }
+    env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report);
     match &verdict {
         Verdict::Deliver => {
             env.pipeline = "deliver".into();
