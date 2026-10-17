@@ -376,7 +376,7 @@ mod tests {
             self.gate.acquire().await.unwrap().forget();
             if self
                 .fail_first
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
                 .is_ok()
             {
                 return Err(ExportError::Transport("SIEM unavailable".into()));

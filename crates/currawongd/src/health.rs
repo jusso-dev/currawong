@@ -47,6 +47,7 @@ impl ReadinessCheck for SpoolWritable {
 
 pub struct ClamdReady {
     pub address: String,
+    pub required: bool,
 }
 
 #[async_trait]
@@ -57,10 +58,40 @@ impl ReadinessCheck for ClamdReady {
 
     async fn check(&self) -> Result<(), String> {
         if self.address.is_empty() {
-            return Ok(());
+            return if self.required {
+                Err("clamd is required and no address is configured".into())
+            } else {
+                Ok(())
+            };
         }
         let address = currawong_scan::ClamdAddress::parse(&self.address)?;
-        currawong_scan::ClamdClient::new(address, true).ping().await
+        currawong_scan::ClamdClient::new(address, true)
+            .with_timeout(std::time::Duration::from_secs(2))
+            .ping()
+            .await
+    }
+}
+
+/// A real parse job through a fresh worker: the binary starts, its sandbox
+/// installs and it answers.
+pub struct WorkerReady {
+    pub cfg: Config,
+}
+
+#[async_trait]
+impl ReadinessCheck for WorkerReady {
+    fn name(&self) -> &'static str {
+        "parser_worker"
+    }
+
+    async fn check(&self) -> Result<(), String> {
+        if !self.cfg.scanner.enabled {
+            return Ok(());
+        }
+        let pool = crate::pipeline::worker_pool(&self.cfg)
+            .ok_or("parser worker binary not found")?
+            .with_size(1);
+        pool.self_test().await
     }
 }
 
@@ -87,7 +118,9 @@ pub fn checks_for(cfg: &Config) -> Vec<Arc<dyn ReadinessCheck>> {
         }),
         Arc::new(ClamdReady {
             address: cfg.scanner.clamd.address.clone(),
+            required: cfg.scanner.enabled && cfg.scanner.clamd.required,
         }),
+        Arc::new(WorkerReady { cfg: cfg.clone() }),
         Arc::new(SignaturesReady {
             dirs: cfg.scanner.extra_signature_dirs.clone(),
             files: cfg.scanner.extra_database_paths.clone(),

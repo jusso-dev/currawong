@@ -417,7 +417,7 @@ async fn yara_matches_every_part_and_archive_member_in_the_worker() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("msg.eml");
     std::fs::write(&path, &raw).unwrap();
-    let mut pool = WorkerPool::new(worker_binary(), 10, 500).with_rules_load_timeout(60);
+    let pool = WorkerPool::new(worker_binary(), 10, 500).with_rules_load_timeout(60);
     let outcome = pool
         .scan_file_with_rules("worker", &path, &limits(), Some(&compiled))
         .await;

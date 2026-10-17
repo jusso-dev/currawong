@@ -145,10 +145,13 @@ enum Office {
 
 fn office_kind(bytes: &[u8]) -> Option<Office> {
     let archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
-    let names: Vec<&str> = archive.file_names().collect();
-    if names.contains(&"word/document.xml") {
+    let names: Vec<String> = archive
+        .file_names()
+        .filter_map(|name| name.ok().map(|name| name.to_string()))
+        .collect();
+    if names.iter().any(|name| name == "word/document.xml") {
         Some(Office::Word)
-    } else if names.contains(&"xl/workbook.xml") {
+    } else if names.iter().any(|name| name == "xl/workbook.xml") {
         Some(Office::Excel)
     } else {
         None
@@ -172,6 +175,7 @@ fn docx_text(bytes: &[u8]) -> Option<DlpText> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).ok()?;
     let names: Vec<String> = archive
         .file_names()
+        .filter_map(|name| name.ok().map(|name| name.to_string()))
         .filter(|name| {
             let Some(rest) = name.strip_prefix("word/") else {
                 return false;
@@ -188,7 +192,6 @@ fn docx_text(bytes: &[u8]) -> Option<DlpText> {
                 .iter()
                 .any(|part| rest.starts_with(part))
         })
-        .map(str::to_string)
         .collect();
     let mut out = DlpText::default();
     let mut budget = MAX_XML_BYTES;

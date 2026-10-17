@@ -138,7 +138,7 @@ pub fn analyse(
             .unwrap_or_default()
             .into_iter()
             .filter(|person| {
-                address_domain(&person.email).is_some_and(&in_tenant)
+                address_domain(&person.email).is_some_and(in_tenant)
                     && !person.email.eq_ignore_ascii_case(address)
             })
             .collect();
