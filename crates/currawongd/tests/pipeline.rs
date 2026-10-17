@@ -164,9 +164,10 @@ async fn verdicts_feed_reputation_and_dmarc_pass_skips_greylisting() {
     let (_, verdict) = pipeline.evaluate(&spoof, &text_message(), None).await;
     assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
     let reputation = checks.reputation.as_ref().unwrap();
-    assert!(
-        reputation.score(spoof.remote_ip) > 0.0,
-        "a blocked verdict must raise the score"
+    assert_eq!(
+        reputation.score(spoof.remote_ip),
+        0.0,
+        "a DMARC quarantine says nothing about the connecting host"
     );
 
     let mut clean = envelope("user@example.test");

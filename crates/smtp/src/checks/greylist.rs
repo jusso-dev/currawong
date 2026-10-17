@@ -14,7 +14,7 @@ use std::{
 };
 
 /// New triplets from one network that may wait at once. Past this the
-/// network is delayed without growing the table.
+/// oldest waiting triplet from that network is dropped for each new one.
 const MAX_PENDING_PER_NET: i64 = 1_000;
 /// A triplet that never retried is forgotten after a day.
 const PENDING_TTL_SECS: i64 = 86_400;
@@ -44,6 +44,11 @@ impl GreylistCheck {
         let conn = Connection::open(path).map_err(|err| err.to_string())?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|err| err.to_string())?;
+        // Losing the last few greylist rows in a crash costs one more delay,
+        // so an fsync per RCPT is not worth paying.
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .map_err(|err| err.to_string())?;
+        migrate(&conn).map_err(|err| err.to_string())?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS greylist (
                 triplet_hash TEXT PRIMARY KEY,
@@ -116,14 +121,23 @@ impl GreylistCheck {
                         |row| row.get(0),
                     )
                     .map_err(sql)?;
-                if pending < MAX_PENDING_PER_NET {
+                // A busy network keeps its newest waiting triplets: the oldest
+                // are dropped, so a flood cannot lock out a real retry for good.
+                if pending >= MAX_PENDING_PER_NET {
                     conn.execute(
-                        "INSERT INTO greylist (triplet_hash, net, first_seen, last_seen, passed)
-                         VALUES (?1, ?2, ?3, ?3, 0)",
-                        rusqlite::params![key, net, now],
+                        "DELETE FROM greylist WHERE triplet_hash IN (
+                            SELECT triplet_hash FROM greylist WHERE net = ?1 AND passed = 0
+                            ORDER BY first_seen, rowid LIMIT ?2)",
+                        rusqlite::params![net, pending - MAX_PENDING_PER_NET + 1],
                     )
                     .map_err(sql)?;
                 }
+                conn.execute(
+                    "INSERT INTO greylist (triplet_hash, net, first_seen, last_seen, passed)
+                     VALUES (?1, ?2, ?3, ?3, 0)",
+                    rusqlite::params![key, net, now],
+                )
+                .map_err(sql)?;
                 Ok(GreylistDecision::Delay)
             }
             Some((first_seen, passed))
@@ -173,6 +187,22 @@ impl GreylistCheck {
             .map_err(|err| err.to_string())?;
         Ok(removed)
     }
+}
+
+/// Tables from before the network columns hold triplets hashed differently,
+/// so they cannot be converted. Drop them: the cost is one more delay.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let current: bool = conn
+        .prepare("SELECT 1 FROM pragma_table_info('greylist') WHERE name = 'last_seen'")?
+        .exists([])?;
+    let exists: bool = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'greylist'")?
+        .exists([])?;
+    if exists && !current {
+        tracing::warn!("replacing greylist table from an older schema");
+        conn.execute_batch("DROP INDEX IF EXISTS greylist_net; DROP TABLE greylist;")?;
+    }
+    Ok(())
 }
 
 fn triplet(net: &str, sender: &str, recipient: &str) -> String {
@@ -259,20 +289,65 @@ mod tests {
     }
 
     #[test]
-    fn pending_rows_are_capped_per_network() {
+    fn pending_rows_are_capped_by_evicting_the_oldest() {
         let dir = tempfile::tempdir().unwrap();
-        let (check, _) = clocked(dir.path());
+        let (check, clock) = clocked(dir.path());
         let ip: IpAddr = "203.0.113.5".parse().unwrap();
         for n in 0..MAX_PENDING_PER_NET + 50 {
+            clock.fetch_add(1, Ordering::SeqCst);
             check
                 .decide(ip, &format!("s{n}@spam.test"), "a@example.test")
                 .unwrap();
         }
-        let conn = check.conn.lock().unwrap();
-        let rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM greylist", [], |row| row.get(0))
+        // The legitimate sender arrives during the flood and retries later.
+        check
+            .decide(ip, "real@sender.test", "a@example.test")
             .unwrap();
-        assert_eq!(rows, MAX_PENDING_PER_NET);
+        {
+            let conn = check.conn.lock().unwrap();
+            let rows: i64 = conn
+                .query_row("SELECT COUNT(*) FROM greylist", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, MAX_PENDING_PER_NET);
+        }
+        clock.fetch_add(301, Ordering::SeqCst);
+        assert_eq!(
+            check
+                .decide(ip, "real@sender.test", "a@example.test")
+                .unwrap(),
+            GreylistDecision::Pass,
+            "a new triplet must still be recorded when the network is full"
+        );
+    }
+
+    #[test]
+    fn an_old_schema_is_replaced_instead_of_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grey.sqlite");
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE greylist (triplet_hash TEXT PRIMARY KEY, first_seen INTEGER NOT NULL, passed INTEGER NOT NULL);
+                 INSERT INTO greylist VALUES ('abc', 1, 1);
+                 CREATE TABLE dmarc_allow (sender_domain TEXT PRIMARY KEY, allowed_at INTEGER NOT NULL);",
+            )
+            .unwrap();
+        let check = GreylistCheck::open(&path, 300).unwrap();
+        assert_eq!(
+            check
+                .decide("203.0.113.5".parse().unwrap(), "a@b.test", "c@example.test")
+                .unwrap(),
+            GreylistDecision::Delay
+        );
+        // Reopening the new schema keeps its rows.
+        drop(check);
+        let check = GreylistCheck::open(&path, 0).unwrap();
+        assert_eq!(
+            check
+                .decide("203.0.113.5".parse().unwrap(), "a@b.test", "c@example.test")
+                .unwrap(),
+            GreylistDecision::Pass
+        );
     }
 
     #[tokio::test]

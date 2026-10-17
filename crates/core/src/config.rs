@@ -65,6 +65,10 @@ pub struct LimitsConfig {
     pub max_connections_per_ip: usize,
     /// Implicit TLS and STARTTLS handshakes that take longer are dropped.
     pub tls_handshake_timeout_secs: u64,
+    /// Longest a whole DATA transfer may take, however steadily lines arrive.
+    pub data_timeout_secs: u64,
+    /// DATA is answered 452 4.3.1 when the spool file system has less free.
+    pub spool_min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -299,6 +303,8 @@ impl Default for LimitsConfig {
             max_line_bytes: 1000,
             max_connections_per_ip: 20,
             tls_handshake_timeout_secs: 30,
+            data_timeout_secs: 600,
+            spool_min_free_bytes: 1024 * 1024 * 1024,
         }
     }
 }

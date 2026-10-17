@@ -7,7 +7,7 @@ use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool,
 };
-use currawong_smtp::checks::CheckStack;
+use currawong_smtp::checks::{CheckStack, VerdictSignal};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 
@@ -50,17 +50,17 @@ impl Pipeline {
         if env.tenant_id.is_some() {
             return;
         }
-        let dmarc_pass = report
-            .auth
-            .as_ref()
-            .is_some_and(|auth| auth.dmarc.result == "pass");
-        checks.record_verdict(
-            env.remote_ip,
-            &env.mail_from,
-            dmarc_pass,
-            report.malware,
-            verdict,
-        );
+        let signal = match verdict {
+            Verdict::Deliver => VerdictSignal::Delivered {
+                dmarc_pass: report
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.dmarc.result == "pass"),
+            },
+            _ if report.malware => VerdictSignal::Malware,
+            _ => VerdictSignal::Neutral,
+        };
+        checks.record_verdict(env.remote_ip, &env.mail_from, signal);
     }
 
     pub async fn evaluate(

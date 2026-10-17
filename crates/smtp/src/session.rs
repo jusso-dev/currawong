@@ -5,7 +5,7 @@ use crate::{
     command::{self, Command},
     data::{unstuff, LineDecision},
     line::{read_line, Line},
-    relay::{AuthContext, Relay},
+    relay::{AuthContext, Login, Relay},
     tls::{tls_labels, TlsManager},
 };
 use currawong_core::{
@@ -172,9 +172,12 @@ pub async fn run_session(
 }
 
 impl Session<'_> {
-    /// Connection checks, then the banner.
+    /// Connection checks, then the banner. Submission clients are users on
+    /// dynamic and often listed addresses who must still reach AUTH, so the
+    /// connect checks (DNSBL, reputation, per-IP rate) only run on inbound
+    /// listeners. Submission is guarded by AUTH and its failure limits.
     async fn open(&mut self, conn: &mut Conn) -> io::Result<Flow> {
-        if self.trusted.is_none() {
+        if self.trusted.is_none() && self.ctx.role != ListenerRole::Submission {
             let early = self
                 .ctx
                 .checks
@@ -369,24 +372,26 @@ impl Session<'_> {
                 Ok(Flow::Continue)
             }
             SaslOutcome::Done { username, password } => {
-                let relay = Arc::clone(&self.ctx.relay);
-                let checked =
-                    tokio::task::spawn_blocking(move || relay.authenticate(&username, &password))
-                        .await
-                        .map_err(|err| err.to_string())
-                        .and_then(|result| result);
-                match checked {
-                    Ok(Some(context)) => {
+                match self.ctx.relay.login(self.ip, username, password).await {
+                    Login::Accepted(context) => {
                         self.auth = Some(context);
                         self.sasl_done = true;
                         conn.reply("235 2.7.0 authentication succeeded").await?;
                         Ok(Flow::Continue)
                     }
-                    Ok(None) => {
+                    Login::Rejected => {
                         conn.reply("535 5.7.8 authentication failed").await?;
-                        self.auth_failed(conn).await
+                        // `login` has already counted the source and username.
+                        self.connection_failure(conn).await
                     }
-                    Err(err) => {
+                    Login::Locked => {
+                        conn.reply(
+                            "454 4.7.0 too many failed authentication attempts, try again later",
+                        )
+                        .await?;
+                        self.connection_failure(conn).await
+                    }
+                    Login::Unavailable(err) => {
                         tracing::warn!(%err, "credential store unavailable");
                         conn.reply("454 4.7.0 authentication temporarily unavailable")
                             .await?;
@@ -399,6 +404,10 @@ impl Session<'_> {
 
     async fn auth_failed(&mut self, conn: &mut Conn) -> io::Result<Flow> {
         self.ctx.relay.record_auth_failure(self.ip);
+        self.connection_failure(conn).await
+    }
+
+    async fn connection_failure(&mut self, conn: &mut Conn) -> io::Result<Flow> {
         self.auth_failures += 1;
         if self.auth_failures >= MAX_AUTH_FAILURES {
             let _ = conn
@@ -556,6 +565,15 @@ impl Session<'_> {
             conn.reply("503 5.5.1 need RCPT first").await?;
             return Ok(Flow::Continue);
         }
+        let needed = self
+            .limits
+            .spool_min_free_bytes
+            .max(self.limits.max_message_bytes);
+        if free_bytes(self.ctx.spool.root()).is_some_and(|free| free < needed) {
+            tracing::warn!("spool is low on space; deferring DATA");
+            conn.reply("452 4.3.1 insufficient system storage").await?;
+            return Ok(Flow::Continue);
+        }
         let id = Envelope::new_id();
         let mut body = match self.ctx.spool.begin(&id).await {
             Ok(body) => body,
@@ -568,11 +586,24 @@ impl Session<'_> {
         conn.reply("354 start mail input; end with <CRLF>.<CRLF>")
             .await?;
         let max_bytes = self.limits.max_message_bytes as usize;
+        // After the limit is hit the rest is read and thrown away, but only
+        // up to another message's worth; then the connection is dropped.
+        let drain_limit = max_bytes.max(1024 * 1024);
+        let deadline =
+            tokio::time::Instant::now() + Duration::from_secs(self.limits.data_timeout_secs);
         let mut size = 0usize;
+        let mut drained = 0usize;
         let mut too_large = false;
         let mut spool_failed = false;
         loop {
-            let line = match conn.line().await {
+            let Ok(next) = tokio::time::timeout_at(deadline, conn.line()).await else {
+                metrics::counter!(MESSAGES_REJECTED_TOTAL).increment(1);
+                let _ = conn
+                    .reply("421 4.4.2 DATA took too long, closing connection")
+                    .await;
+                return Ok(Flow::Close);
+            };
+            let line = match next {
                 Ok(Line::Crlf(line)) => line,
                 Ok(Line::BareLf(_)) => return refuse_bare_newline(conn).await,
                 Ok(Line::TooLong) => {
@@ -585,7 +616,15 @@ impl Session<'_> {
             };
             match unstuff(&line, size, self.limits.max_line_bytes, max_bytes) {
                 Ok(None) => break,
-                Ok(Some(_)) if too_large || spool_failed => {}
+                Ok(Some(_)) | Err(LineDecision::TooLarge) if too_large => {
+                    drained += line.len() + 2;
+                    if drained > drain_limit {
+                        metrics::counter!(MESSAGES_REJECTED_TOTAL).increment(1);
+                        let _ = conn.reply("552 5.3.4 message size exceeds limit").await;
+                        return Ok(Flow::Close);
+                    }
+                }
+                Ok(Some(_)) if spool_failed => {}
                 Ok(Some(chunk)) => {
                     size += chunk.len() + 2;
                     let written = match body.write(chunk).await {
@@ -659,6 +698,25 @@ impl Session<'_> {
         }
         Ok(Flow::Continue)
     }
+}
+
+/// Bytes free to unprivileged users on the file system holding `path`.
+#[cfg(unix)]
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `path` is a valid C string and `stat` is a writable statvfs.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return None;
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Some((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
 }
 
 /// A bare CR or LF in DATA ends the session: reading on would let the rest

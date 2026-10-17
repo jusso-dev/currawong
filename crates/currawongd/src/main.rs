@@ -96,6 +96,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
+    checks.spawn_housekeeping();
     let pipeline = Pipeline::new(Arc::clone(&cfg), auth).with_checks(Arc::clone(&checks));
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;

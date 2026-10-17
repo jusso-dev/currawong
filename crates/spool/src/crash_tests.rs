@@ -467,7 +467,10 @@ async fn crash_at_every_step_of_begin_and_commit() {
         assert_clean(dir.path());
     }
     assert!(crash_points >= 6, "only {crash_points} crash points");
-    assert!(kept >= 1, "a crash after the final rename must keep the message");
+    assert!(
+        kept >= 1,
+        "a crash after the final rename must keep the message"
+    );
 }
 
 #[tokio::test]
@@ -494,5 +497,8 @@ async fn dropped_or_failed_commit_leaves_nothing() {
 
     let before = spool.commit_syncs();
     streamed(spool.clone()).await.unwrap();
-    assert!(spool.commit_syncs() >= before + 3, "body, JSON and directory are synced");
+    assert!(
+        spool.commit_syncs() >= before + 3,
+        "body, JSON and directory are synced"
+    );
 }

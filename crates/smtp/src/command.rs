@@ -52,17 +52,21 @@ pub fn parse_command(line: &[u8]) -> Result<Command, ReplyCode> {
         "MAIL" => {
             let rest = rest.ok_or(ReplyCode)?;
             let (address, params) = parse_path(rest, "FROM:")?;
-            if !address.is_empty() {
-                validate_mailbox(&address)?;
-            }
+            let address = if address.is_empty() || address.eq_ignore_ascii_case("postmaster") {
+                address
+            } else {
+                mailbox(&address)?
+            };
             Ok(Command::Mail { address, params })
         }
         "RCPT" => {
             let rest = rest.ok_or(ReplyCode)?;
             let (address, params) = parse_path(rest, "TO:")?;
-            if !address.eq_ignore_ascii_case("postmaster") {
-                validate_mailbox(&address)?;
-            }
+            let address = if address.eq_ignore_ascii_case("postmaster") {
+                address
+            } else {
+                mailbox(&address)?
+            };
             Ok(Command::Rcpt { address, params })
         }
         "DATA" if rest.is_none() => Ok(Command::Data),
@@ -97,6 +101,7 @@ fn split_verb(line: &str) -> (&str, Option<&str>) {
 
 /// `FROM:<path> params` or `TO:<path> params`. Nothing but optional spaces may
 /// sit between the colon and `<`, and parameters follow `>` after a space.
+/// Spaces and `>` are only allowed inside a quoted local part.
 fn parse_path(rest: &str, keyword: &str) -> Result<(String, Vec<(String, String)>), ReplyCode> {
     let head = rest.get(..keyword.len()).ok_or(ReplyCode)?;
     if !head.eq_ignore_ascii_case(keyword) {
@@ -104,13 +109,40 @@ fn parse_path(rest: &str, keyword: &str) -> Result<(String, Vec<(String, String)
     }
     let after = rest[keyword.len()..].trim_start_matches(' ');
     let inner = after.strip_prefix('<').ok_or(ReplyCode)?;
-    let end = inner.find('>').ok_or(ReplyCode)?;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (at, c) in inner.char_indices() {
+        if c == '\t' {
+            return Err(ReplyCode);
+        }
+        if escaped {
+            escaped = false;
+        } else if quoted {
+            match c {
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else {
+            match c {
+                '"' => quoted = true,
+                '>' => {
+                    end = Some(at);
+                    break;
+                }
+                '<' | ' ' => return Err(ReplyCode),
+                _ => {}
+            }
+        }
+    }
+    let end = end.ok_or(ReplyCode)?;
     let path = &inner[..end];
     let param_src = &inner[end + 1..];
     if !param_src.is_empty() && !param_src.starts_with(' ') {
         return Err(ReplyCode);
     }
-    if path.len() > MAX_PATH || path.contains(['<', ' ', '\t']) {
+    if path.len() > MAX_PATH {
         return Err(ReplyCode);
     }
     Ok((path.to_string(), parse_params(param_src)?))
@@ -128,43 +160,74 @@ fn parse_params(src: &str) -> Result<Vec<(String, String)>, ReplyCode> {
     Ok(out)
 }
 
-/// `local-part@domain` with RFC 5321 lengths. Source routes are refused.
-fn validate_mailbox(address: &str) -> Result<(), ReplyCode> {
+/// `local-part@domain` with RFC 5321 lengths, returned with any trailing
+/// dot on the domain removed. Source routes are refused.
+fn mailbox(address: &str) -> Result<String, ReplyCode> {
     let (local, domain) = address.rsplit_once('@').ok_or(ReplyCode)?;
-    if local.is_empty() || local.len() > MAX_LOCAL_PART || local.starts_with('@') {
+    if local.is_empty() || local.len() > MAX_LOCAL_PART {
         return Err(ReplyCode);
     }
-    let quoted = local.len() >= 2 && local.starts_with('"') && local.ends_with('"');
-    if !quoted
-        && local
-            .chars()
-            .any(|c| "()<>[]\\,;:@\" ".contains(c) || c.is_control())
+    if let Some(body) = local.strip_prefix('"') {
+        quoted_local(body)?;
+    } else if local
+        .chars()
+        .any(|c| "()<>[]\\,;:@\" ".contains(c) || c.is_control())
     {
         return Err(ReplyCode);
     }
+    let domain = domain.strip_suffix('.').unwrap_or(domain);
     if domain.is_empty() || domain.len() > MAX_DOMAIN {
         return Err(ReplyCode);
     }
     if let Some(literal) = domain.strip_prefix('[') {
         let literal = literal.strip_suffix(']').ok_or(ReplyCode)?;
-        if literal.is_empty() || literal.contains(['[', ']', '\\']) {
+        let valid = match literal.get(..5) {
+            Some(tag) if tag.eq_ignore_ascii_case("IPv6:") => {
+                literal[5..].parse::<std::net::Ipv6Addr>().is_ok()
+            }
+            _ => literal.parse::<std::net::Ipv4Addr>().is_ok(),
+        };
+        if !valid {
             return Err(ReplyCode);
         }
-        return Ok(());
-    }
-    for label in domain.split('.') {
-        if label.is_empty()
-            || label.len() > 63
-            || label.starts_with('-')
-            || label.ends_with('-')
-            || !label
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || !c.is_ascii())
-        {
-            return Err(ReplyCode);
+    } else {
+        for label in domain.split('.') {
+            if label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || !c.is_ascii())
+            {
+                return Err(ReplyCode);
+            }
         }
     }
-    Ok(())
+    Ok(format!("{local}@{domain}"))
+}
+
+/// The rest of a quoted local part after its opening quote: printable text
+/// and backslash pairs, then exactly one closing quote.
+fn quoted_local(body: &str) -> Result<(), ReplyCode> {
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next().ok_or(ReplyCode)?;
+            }
+            '"' => {
+                return if chars.next().is_none() {
+                    Ok(())
+                } else {
+                    Err(ReplyCode)
+                };
+            }
+            c if c.is_control() => return Err(ReplyCode),
+            _ => {}
+        }
+    }
+    Err(ReplyCode)
 }
 
 pub fn domain_of(address: &str) -> Option<&str> {
@@ -201,6 +264,58 @@ mod tests {
         assert!(parse_command("MAIL FROM:<j\u{f6}rg@b\u{fc}cher.test>".as_bytes()).is_ok());
         assert!(parse_command(b"MAIL FROM:<\"odd,local\"@example.test>").is_ok());
         assert!(parse_command(b"RCPT TO:<a@[192.0.2.1]>").is_ok());
+    }
+
+    fn path(line: &str) -> Option<String> {
+        match parse_command(line.as_bytes()) {
+            Ok(Command::Rcpt { address, .. }) | Ok(Command::Mail { address, .. }) => Some(address),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn accepts_the_valid_forms_rfc_5321_allows() {
+        let cases = [
+            (
+                "RCPT TO:<a@mail_relay.example.test>",
+                "a@mail_relay.example.test",
+            ),
+            (
+                r#"RCPT TO:<"john smith"@example.test>"#,
+                r#""john smith"@example.test"#,
+            ),
+            (
+                r#"RCPT TO:<"a\"b\\c"@example.test>"#,
+                r#""a\"b\\c"@example.test"#,
+            ),
+            (
+                r#"RCPT TO:<"odd>local"@example.test>"#,
+                r#""odd>local"@example.test"#,
+            ),
+            ("MAIL FROM:<postmaster>", "postmaster"),
+            ("MAIL FROM:<a@example.test.>", "a@example.test"),
+            ("RCPT TO:<a@[IPv6:2001:db8::1]>", "a@[IPv6:2001:db8::1]"),
+        ];
+        for (line, want) in cases {
+            assert_eq!(path(line).as_deref(), Some(want), "{line}");
+        }
+    }
+
+    #[test]
+    fn rejects_junk_literals_and_broken_quotes() {
+        for line in [
+            "RCPT TO:<a@[foo]>",
+            "RCPT TO:<a@[300.1.1.1]>",
+            "RCPT TO:<a@[IPv6:zz::1]>",
+            "RCPT TO:<a@[]>",
+            r#"RCPT TO:<"unterminated@example.test>"#,
+            r#"RCPT TO:<"a"b"@example.test>"#,
+            "RCPT TO:<a b@example.test>",
+            "RCPT TO:<a@example.test..>",
+            "MAIL FROM:<postmaster@>",
+        ] {
+            assert!(path(line).is_none(), "accepted {line}");
+        }
     }
 
     #[test]

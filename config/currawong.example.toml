@@ -20,6 +20,8 @@ listen = "127.0.0.1:9090"
 # limits.max_line_bytes: RFC 5321 line limit, including the CRLF (1000 allows 998 octets).
 # limits.max_connections_per_ip: per-address connection cap, shared by all listeners.
 # limits.tls_handshake_timeout_secs: implicit TLS and STARTTLS handshake deadline.
+# limits.data_timeout_secs: deadline for a whole DATA transfer (slow-drip clients).
+# limits.spool_min_free_bytes: below this free space DATA gets 452 4.3.1.
 [limits]
 max_message_bytes = 52428800
 max_recipients = 100
@@ -28,6 +30,8 @@ max_connections = 1000
 max_line_bytes = 1000
 max_connections_per_ip = 20
 tls_handshake_timeout_secs = 30
+data_timeout_secs = 600
+spool_min_free_bytes = 1073741824
 
 # spool.dir: absolute path. The 250 reply is sent only after an fsync.
 [spool]

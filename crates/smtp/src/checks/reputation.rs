@@ -43,18 +43,20 @@ impl Reputation {
             .unwrap_or(0.0)
     }
 
-    /// Add `delta` to the decayed score. Scores never go below zero, and a
-    /// good result for an unknown address does not create an entry.
+    /// Add `delta` to the decayed score. Scores stay between zero and twice
+    /// the reject threshold, and a good result for an unknown address does
+    /// not create an entry.
     pub fn record(&self, ip: IpAddr, delta: f32) {
         let ip = ip.to_canonical();
         let now = self.now();
+        let cap = self.threshold * 2.0;
         if let Some(mut entry) = self.scores.get_mut(&ip) {
-            entry.0 = (decay(entry.0, entry.1, now, self.half_life_secs) + delta).max(0.0);
+            entry.0 = (decay(entry.0, entry.1, now, self.half_life_secs) + delta).clamp(0.0, cap);
             entry.1 = now;
             return;
         }
         if delta > 0.0 {
-            self.scores.insert(ip, (delta, now));
+            self.scores.insert(ip, (delta.min(cap), now));
         }
     }
 

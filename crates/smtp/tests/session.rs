@@ -4,10 +4,10 @@ use currawong_core::{
     config::{
         ChecksConfig, Config, DnsblListing, DnsblZone, ListenerMode, ListenerRole, TenantConfig,
     },
-    Direction, Verdict,
+    Direction,
 };
 use currawong_smtp::{
-    checks::{CheckStack, ConnCtx, GreylistCheck, MailCtx},
+    checks::{CheckStack, ConnCtx, GreylistCheck, MailCtx, VerdictSignal},
     dns::MapDns,
     limits::ConnectionLimits,
     relay::Relay,
@@ -851,6 +851,12 @@ fn listed(ip: IpAddr) -> (DnsblZone, Arc<MapDns>) {
     (zone, Arc::new(map))
 }
 
+fn with_checks_arc(h: &Harness, checks: Arc<CheckStack>) -> SessionContext {
+    let mut ctx = h.ctx(ListenerRole::Inbound);
+    ctx.checks = checks;
+    ctx
+}
+
 fn with_checks(h: &Harness, checks: CheckStack, role: ListenerRole) -> SessionContext {
     let mut ctx = h.ctx(role);
     ctx.checks = Arc::new(checks);
@@ -1077,38 +1083,99 @@ async fn checks_trusted_and_authenticated_senders_skip_connection_checks() {
 }
 
 #[tokio::test]
-async fn checks_reputation_learns_from_verdicts_and_rejects_at_connect() {
+async fn checks_reputation_learns_from_malware_not_from_dmarc_quarantines() {
     let h = harness().await;
     let cfg = ChecksConfig {
         reputation_enabled: true,
-        reputation_reject_score: 50.0,
+        reputation_reject_score: 20.0,
+        reputation_half_life_secs: 3600,
         ..checks_cfg(h.dir.path())
     };
     let stack = Arc::new(CheckStack::from_checks(&cfg, Arc::new(MapDns::new())).unwrap());
-    let ip: IpAddr = "203.0.113.50".parse().unwrap();
-    let quarantine = Verdict::Quarantine {
-        reason: "spam".into(),
+    let clock = Arc::new(AtomicI64::new(1_000_000));
+    let reader = Arc::clone(&clock);
+    stack
+        .reputation
+        .as_ref()
+        .unwrap()
+        .set_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    let ctx = Arc::new(with_checks_arc(&h, Arc::clone(&stack)));
+    let connect = |ip: IpAddr| {
+        let ctx = Arc::clone(&ctx);
+        async move {
+            let (mut c, _, _) = start_with(ctx, SocketAddr::new(ip, 2525), 1 << 20, None);
+            c.reply().await
+        }
     };
-    stack.record_verdict(ip, "a@spam.test", false, false, &quarantine);
-    let mut ctx = h.ctx(ListenerRole::Inbound);
-    ctx.checks = Arc::clone(&stack);
-    let ctx = Arc::new(ctx);
-    let (mut c, _, _) = start_with(Arc::clone(&ctx), SocketAddr::new(ip, 2525), 1 << 20, None);
+    // A list server whose mail fails DMARC is quarantined, not blacklisted.
+    let forwarder: IpAddr = "198.51.100.60".parse().unwrap();
+    for _ in 0..20 {
+        stack.record_verdict(forwarder, "list@lists.test", VerdictSignal::Neutral);
+    }
+    assert!(connect(forwarder).await.starts_with("220"));
+
+    let ip: IpAddr = "203.0.113.50".parse().unwrap();
+    stack.record_verdict(ip, "a@spam.test", VerdictSignal::Malware);
     assert!(
-        c.reply().await.starts_with("220"),
+        connect(ip).await.starts_with("220"),
         "one bad message is not enough"
     );
-    stack.record_verdict(ip, "a@spam.test", false, false, &quarantine);
-    let (mut c, _, _) = start_with(Arc::clone(&ctx), SocketAddr::new(ip, 2525), 1 << 20, None);
-    let reply = c.reply().await;
+    stack.record_verdict(ip, "a@spam.test", VerdictSignal::Malware);
+    let reply = connect(ip).await;
     assert!(reply.starts_with("554 5.7.1 reputation"), "{reply}");
-    assert!(c.closed().await);
-    stack.record_verdict(ip, "a@spam.test", true, false, &Verdict::Deliver);
-    let (mut c, _, _) = start_with(ctx, SocketAddr::new(ip, 2525), 1 << 20, None);
+
+    // The score is capped, so a burst decays back in a bounded time.
+    for _ in 0..100 {
+        stack.record_verdict(ip, "a@spam.test", VerdictSignal::Malware);
+    }
+    let score = stack.reputation.as_ref().unwrap().score(ip);
+    assert!(score <= 40.0, "score {score} not capped");
+    clock.fetch_add(2 * 3600 + 60, Ordering::SeqCst);
     assert!(
-        c.reply().await.starts_with("220"),
-        "delivered mail lowers the score"
+        connect(ip).await.starts_with("220"),
+        "capped score did not decay"
     );
+    stack.record_verdict(ip, "a@spam.test", VerdictSignal::Spam);
+    stack.record_verdict(
+        ip,
+        "a@spam.test",
+        VerdictSignal::Delivered { dmarc_pass: false },
+    );
+    assert!(stack.reputation.as_ref().unwrap().score(ip) < 20.0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn checks_housekeeping_runs_on_its_own_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = ChecksConfig {
+        reputation_enabled: true,
+        reputation_half_life_secs: 1,
+        ..checks_cfg(dir.path())
+    };
+    let stack = Arc::new(CheckStack::from_checks(&cfg, Arc::new(MapDns::new())).unwrap());
+    let clock = Arc::new(AtomicI64::new(1_000_000));
+    let reader = Arc::clone(&clock);
+    let rep = stack.reputation.as_ref().unwrap();
+    rep.set_clock(Arc::new(move || reader.load(Ordering::SeqCst)));
+    stack.record_verdict(
+        "203.0.113.1".parse().unwrap(),
+        "a@x.test",
+        VerdictSignal::Malware,
+    );
+    assert_eq!(rep.tracked(), 1);
+    let task = stack.spawn_housekeeping();
+    clock.fetch_add(3600, Ordering::SeqCst);
+    // Nothing on the connect path prunes any more; only the timer does.
+    stack
+        .on_connect(&ConnCtx {
+            ip: "203.0.113.2".parse().unwrap(),
+            helo: String::new(),
+        })
+        .await;
+    assert_eq!(rep.tracked(), 1);
+    tokio::time::sleep(Duration::from_secs(61)).await;
+    assert_eq!(rep.tracked(), 0);
+    task.abort();
 }
 
 #[tokio::test]
@@ -1120,7 +1187,11 @@ async fn checks_dmarc_pass_skips_greylisting_only_from_that_network() {
     };
     let stack = CheckStack::from_checks(&cfg, Arc::new(MapDns::new())).unwrap();
     let home: IpAddr = "198.51.100.20".parse().unwrap();
-    stack.record_verdict(home, "news@bigcorp.test", true, false, &Verdict::Deliver);
+    stack.record_verdict(
+        home,
+        "news@bigcorp.test",
+        VerdictSignal::Delivered { dmarc_pass: true },
+    );
     let grey = stack.greylist.as_ref().unwrap();
     assert_eq!(
         grey.decide(
@@ -1233,9 +1304,9 @@ async fn checks_each_check_can_be_disabled() {
         greylist_enabled: false,
         ..all_on
     };
-    let blocked = Verdict::Quarantine { reason: "x".into() };
+    let blocked = VerdictSignal::Malware;
     let on = CheckStack::from_checks(&rep_only, dns.clone()).unwrap();
-    on.record_verdict(ip, "a@x.test", false, false, &blocked);
+    on.record_verdict(ip, "a@x.test", blocked);
     assert!(matches!(on.on_connect(&connect).await, Reject(line) if line.contains("reputation")));
     let off = CheckStack::from_checks(
         &ChecksConfig {
@@ -1245,7 +1316,7 @@ async fn checks_each_check_can_be_disabled() {
         dns,
     )
     .unwrap();
-    off.record_verdict(ip, "a@x.test", false, false, &blocked);
+    off.record_verdict(ip, "a@x.test", blocked);
     assert!(off.reputation.is_none());
     assert_eq!(off.on_connect(&connect).await, Pass);
 }
@@ -1278,7 +1349,7 @@ async fn checks_housekeeping_forgets_stale_keys() {
                 helo: String::new(),
             })
             .await;
-        stack.record_verdict(ip, "a@x.test", false, false, &Verdict::Discard);
+        stack.record_verdict(ip, "a@x.test", VerdictSignal::Malware);
     }
     let rate = stack.rate.as_ref().unwrap();
     let rep = stack.reputation.as_ref().unwrap();
@@ -1592,4 +1663,169 @@ async fn submission_login_may_only_send_as_its_own_address_or_alias() {
     assert!(stored
         .iter()
         .any(|env| env.mail_from == "ceo@acme.test" && env.authenticated_as.is_none()));
+}
+
+// ------------------------------------------------------------ round two
+
+#[tokio::test]
+async fn submission_from_a_dnsbl_listed_address_can_still_authenticate() {
+    let t = tenants().await;
+    let ip: IpAddr = "203.0.113.90".parse().unwrap();
+    let (zone, dns) = listed(ip);
+    let cfg = ChecksConfig {
+        dnsbl_enabled: true,
+        dnsbl: vec![zone],
+        ratelimit_enabled: true,
+        rate_per_minute_ip: 1,
+        ..checks_cfg(t.h.dir.path())
+    };
+    let checks = Arc::new(CheckStack::from_checks(&cfg, dns).unwrap());
+    let mut inbound = t.h.ctx(ListenerRole::Inbound);
+    inbound.checks = Arc::clone(&checks);
+    let (mut c, _, _) = start_with(Arc::new(inbound), SocketAddr::new(ip, 2525), 1 << 20, None);
+    assert!(c.reply().await.starts_with("554"), "port 25 still checks");
+
+    let mut submission = t.h.ctx(ListenerRole::Submission);
+    submission.relay = Arc::clone(&t.relay);
+    submission.tls = Some(Arc::clone(&t.manager));
+    submission.checks = checks;
+    let ctx = Arc::new(submission);
+    for _ in 0..2 {
+        let (mut c, _, _) = start_with(Arc::clone(&ctx), SocketAddr::new(ip, 2525), 1 << 20, None);
+        assert!(
+            c.reply().await.starts_with("220"),
+            "listed user locked out of submission"
+        );
+        let mut tls = starttls(c, &t.der, &[&rustls::version::TLS13]).await;
+        assert_eq!(code(&tls.cmd("EHLO laptop").await), "250");
+        let auth = tls
+            .cmd(&format!(
+                "AUTH PLAIN {}",
+                base64_plain("ada@acme.test", "correct horse")
+            ))
+            .await;
+        assert_eq!(code(&auth), "235");
+    }
+}
+
+#[tokio::test]
+async fn data_low_spool_space_is_452_before_354() {
+    let mut h = harness().await;
+    h.cfg.limits.spool_min_free_bytes = u64::MAX;
+    let (mut c, _, _) = start(h.ctx(ListenerRole::Inbound), peer([203, 0, 113, 91])).await;
+    assert_eq!(code(&c.cmd("EHLO c.test").await), "250");
+    assert_eq!(code(&c.cmd("MAIL FROM:<a@x.test>").await), "250");
+    assert_eq!(code(&c.cmd("RCPT TO:<b@example.test>").await), "250");
+    assert_eq!(
+        c.cmd("DATA").await,
+        "452 4.3.1 insufficient system storage\r\n"
+    );
+    assert!(h.incoming_files().is_empty());
+}
+
+#[tokio::test]
+async fn data_slow_drip_hits_the_overall_deadline() {
+    let mut h = harness().await;
+    h.cfg.limits.data_timeout_secs = 1;
+    let (mut c, task, _) = start(h.ctx(ListenerRole::Inbound), peer([203, 0, 113, 92])).await;
+    begin_transaction(&mut c).await;
+    let started = std::time::Instant::now();
+    let reply = loop {
+        c.send(b"drip\r\n").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut buf = [0u8; 128];
+        if let Ok(Ok(n)) = timeout(Duration::from_millis(10), c.read.read(&mut buf)).await {
+            break String::from_utf8_lossy(&buf[..n]).to_string();
+        }
+        assert!(started.elapsed() < WAIT, "per-line activity kept DATA open");
+    };
+    assert!(reply.starts_with("421 4.4.2"), "{reply}");
+    timeout(WAIT, task).await.unwrap().unwrap();
+    assert!(h.incoming_files().is_empty());
+}
+
+#[tokio::test]
+async fn data_oversize_drain_is_bounded() {
+    let mut h = harness().await;
+    h.cfg.limits.max_message_bytes = 64;
+    let (mut c, task, _) = start(h.ctx(ListenerRole::Inbound), peer([203, 0, 113, 93])).await;
+    begin_transaction(&mut c).await;
+    let line = format!("{}\r\n", "D".repeat(900));
+    let mut sent = 0usize;
+    let mut reply = String::new();
+    while sent < 4 * 1024 * 1024 {
+        if c.write.write_all(line.as_bytes()).await.is_err() {
+            break;
+        }
+        sent += line.len();
+        let mut buf = [0u8; 128];
+        if let Ok(Ok(n)) = timeout(Duration::from_millis(0), c.read.read(&mut buf)).await {
+            reply = String::from_utf8_lossy(&buf[..n]).to_string();
+            break;
+        }
+    }
+    if reply.is_empty() {
+        reply = c.reply().await;
+    }
+    assert!(reply.starts_with("552 5.3.4"), "{reply}");
+    assert!(
+        sent < 3 * 1024 * 1024,
+        "drained {sent} bytes before giving up"
+    );
+    timeout(WAIT, task).await.unwrap().unwrap();
+    assert!(h.incoming_files().is_empty());
+}
+
+#[tokio::test]
+async fn data_250_is_sent_only_after_the_spool_fsyncs() {
+    let h = harness().await;
+    let (mut c, _, _) = start(h.ctx(ListenerRole::Inbound), peer([203, 0, 113, 94])).await;
+    begin_transaction(&mut c).await;
+    let before = h.spool.commit_syncs();
+    c.send(b"Subject: sync\r\n\r\nx\r\n.\r\n").await;
+    let reply = c.reply().await;
+    let synced = h.spool.commit_syncs() - before;
+    assert!(reply.starts_with("250"), "{reply}");
+    assert!(
+        synced >= 3,
+        "250 before body, JSON and directory fsyncs ({synced})"
+    );
+    let id = reply.split_whitespace().nth(3).unwrap();
+    let files = h.incoming_files();
+    assert!(files.contains(&format!("{id}.eml")) && files.contains(&format!("{id}.json")));
+}
+
+#[tokio::test]
+async fn tls_starttls_discards_plaintext_sent_after_the_command() {
+    let h = harness().await;
+    let (manager, der) = tls_harness(&h);
+    let mut ctx = h.ctx(ListenerRole::Inbound);
+    ctx.tls = Some(manager);
+    let (mut c, _, _) = start_with(Arc::new(ctx), peer([203, 0, 113, 95]), 1 << 20, None);
+    assert!(c.reply().await.starts_with("220"));
+    assert_eq!(code(&c.cmd("EHLO client.test").await), "250");
+    // An attacker on the wire appends commands to STARTTLS in clear text.
+    c.send(b"STARTTLS\r\nEHLO injected.test\r\nMAIL FROM:<evil@x.test>\r\n")
+        .await;
+    assert_eq!(c.reply().await, "220 2.0.0 Ready to start TLS\r\n");
+    let connector =
+        tokio_rustls::TlsConnector::from(client_config(&der, &[&rustls::version::TLS13]));
+    let tls = connector
+        .connect(
+            rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+            c.into_inner(),
+        )
+        .await
+        .expect("injected bytes must not reach the TLS layer");
+    let mut tls = Client::new(tls);
+    assert_eq!(
+        tls.cmd("RCPT TO:<b@example.test>").await,
+        "503 5.5.1 need MAIL first\r\n",
+        "plaintext commands from before the handshake were run"
+    );
+    assert_eq!(
+        code(&tls.cmd("MAIL FROM:<a@x.test>").await),
+        "503",
+        "needs a fresh EHLO"
+    );
 }
