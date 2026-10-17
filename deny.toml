@@ -8,6 +8,23 @@ ignore = [
     # Key generation only, on the appliance. The rsa crate is not used to
     # decrypt network traffic. Signing uses mail-auth's aws-lc backend.
     "RUSTSEC-2023-0071",
+    # wasmtime 45.0.3, pinned (^45) by yara-x 1.21, the latest yara-x. Fixes
+    # exist in other wasmtime lines (46.0.x and 47.x for 0222 and 0269; all
+    # seven by 48.0.6 or 49.0.3), none of them semver-compatible with 45.
+    # yara-x builds wasmtime with only `cranelift`, `runtime` and `std`: no
+    # component model, async, WASI, GC or threads, and one global engine.
+    # Drop these when yara-x moves to a fixed wasmtime.
+    "RUSTSEC-2026-0222", # type indices mixed between engines: one engine
+    "RUSTSEC-2026-0269", # WASI filesystem: WASI not built
+    "RUSTSEC-2026-0316", # component model: not built
+    "RUSTSEC-2026-0327", # component model async: not built
+    # Needs a hostile wasm module. The only wasm wasmtime runs is the rules
+    # blob: compiled by currawongd from operator rule files and handed to
+    # the worker as bytes on its stdin pipe, never read from a path or from
+    # mail. Its integrity rests on the rules directory and the supervisor.
+    "RUSTSEC-2026-0359",
+    "RUSTSEC-2026-0362", # async entrypoints: async not built
+    "RUSTSEC-2026-0363", # component model handle tables: not built
 ]
 
 [licenses]
@@ -23,6 +40,10 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # wasmtime and cranelift, through yara-x.
+    "Apache-2.0 WITH LLVM-exception",
+    # notify, for YARA rule hot reload.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 
