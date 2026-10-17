@@ -99,7 +99,9 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         return Err("parser worker binary not found: set scanner.worker_binary".into());
     }
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    pipeline.reload_policies().await?;
+    tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -115,6 +117,13 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         loop {
             if shutdown_loop.is_cancelled() {
                 break;
+            }
+            match pipeline.reload_policies().await {
+                Ok(true) => tracing::info!("policies reloaded"),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(%err, "policy reload failed, keeping the previous policies")
+                }
             }
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");
