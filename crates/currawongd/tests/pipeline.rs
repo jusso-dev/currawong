@@ -264,25 +264,6 @@ async fn leftover_scan_directories_are_swept() {
     assert!(!stale.exists());
 }
 
-#[test]
-fn clamd_by_host_name_must_pass_residency() {
-    let dir = tempfile::tempdir().unwrap();
-    let write = |address: &str| {
-        let path = dir.path().join("c.toml");
-        std::fs::write(
-            &path,
-            format!(
-                "[spool]\ndir = \"/var/spool/currawong\"\n[scanner.clamd]\naddress = \"{address}\"\n[residency]\nallowed_names = [\"clamd.internal\"]\n"
-            ),
-        )
-        .unwrap();
-        path
-    };
-    check_config(&write("tcp:clamd.internal:3310")).unwrap();
-    let err = check_config(&write("tcp:clamd.example.com:3310")).unwrap_err();
-    assert!(err.contains("scanner.clamd.address"), "{err}");
-}
-
 /// The default build requires clamd. With no address it defers and fails
 /// readiness instead of delivering unscanned mail.
 #[tokio::test]
@@ -1031,4 +1012,24 @@ async fn outbound_user_policy_matches_only_the_logged_in_user() {
         vec![true, false, false],
         "only ada's login matches; bob sending as ada and trusted relay do not"
     );
+}
+
+/// A config without a clamd address while clamd is required (the default)
+/// fails --check-config with a message that says how to fix it.
+#[test]
+fn check_config_requires_a_clamd_address_when_clamd_is_required() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.toml");
+    std::fs::write(&path, "[spool]\ndir = \"/var/spool/currawong\"\n").unwrap();
+    let err = check_config(&path).unwrap_err();
+    assert!(
+        err.contains("scanner.clamd.address") && err.contains("required = false"),
+        "{err}"
+    );
+    std::fs::write(
+        &path,
+        "[spool]\ndir = \"/var/spool/currawong\"\n[scanner.clamd]\nrequired = false\n",
+    )
+    .unwrap();
+    check_config(&path).unwrap();
 }

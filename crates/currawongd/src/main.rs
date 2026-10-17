@@ -1,15 +1,16 @@
 //! currawongd: SMTP listeners, the scan pipeline and outbound delivery.
 use clap::Parser;
 use currawong_auth::{AuthChecker, DmarcEventStore};
-use currawong_core::residency::{load_or_create_signing_key, sign_report, ResidencyGuard};
+use currawong_core::residency::ResidencyGuard;
 use currawong_smtp::{
     checks::CheckStack, delivery::Deliverer, dns::HickoryDns, limits::ConnectionLimits,
     relay::Relay, server::SmtpServer, session::SessionContext, tls::TlsManager,
 };
 use currawong_spool::Spool;
 use currawongd::{
-    check_config, checks_for, classify_pending, send_dmarc_reports, supervise, BimiWorker,
-    Pipeline, BIMI_QUEUE,
+    check_config, checks_for, classify_pending, report_signing_key, residency_reports,
+    send_dmarc_reports, spool_depth, supervise, BimiWorker, Pipeline, ReportHealth, BIMI_QUEUE,
+    REPORT_CHECK,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -84,30 +85,35 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
         return Err("PR_SET_DUMPABLE failed".into());
     }
-    let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
-    guard
-        .enforce_startup(&cfg.residency.content_endpoints)
-        .map_err(|err| err.to_string())?;
-    if let Some(key_path) = &cfg.residency.signing_key_path {
-        let key = load_or_create_signing_key(key_path).map_err(|err| err.to_string())?;
-        let report = guard.report("startup", &cfg.residency.content_endpoints);
-        let signed = sign_report(report, &key);
-        tokio::fs::create_dir_all(&cfg.residency.report_dir)
-            .await
-            .map_err(|err| err.to_string())?;
-        let path = cfg.residency.report_dir.join("residency-report.json");
-        let body = serde_json::to_vec_pretty(&signed).map_err(|err| err.to_string())?;
-        tokio::fs::write(path, body)
-            .await
-            .map_err(|err| err.to_string())?;
-    }
+    let guard =
+        Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?);
+    guard.enforce_config(&cfg).map_err(|err| err.to_string())?;
+    let report_key = report_signing_key(&cfg)?;
     let cfg = Arc::new(cfg);
+    let shutdown = CancellationToken::new();
+    let report_health = ReportHealth::default();
+    if let Some(key) = report_key {
+        tokio::spawn(residency_reports(
+            Arc::clone(&cfg),
+            Arc::clone(&guard),
+            key,
+            report_health.clone(),
+            shutdown.clone(),
+            time::OffsetDateTime::now_utc,
+            REPORT_CHECK,
+        ));
+    }
     let spool = Arc::new(
         Spool::open(&cfg.spool.dir)
             .await
             .map_err(|err| err.to_string())?,
     );
     spool.recover().await.map_err(|err| err.to_string())?;
+    tokio::spawn(spool_depth(
+        Arc::clone(&spool),
+        Duration::from_secs(cfg.delivery.poll_secs.max(1)),
+        shutdown.clone(),
+    ));
     let tls = match (&cfg.tls.cert, &cfg.tls.key) {
         (Some(cert), Some(key)) => Some(Arc::new(
             TlsManager::load(cert, key).map_err(|err| err.to_string())?,
@@ -121,7 +127,6 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     let relay = Arc::new(
         Relay::open(&cfg.relay.database, &cfg.relay.tenants).map_err(|err| err.to_string())?,
     );
-    let shutdown = CancellationToken::new();
     let mut listeners = Vec::new();
     for listener in &cfg.listeners {
         let bound = TcpListener::bind(&listener.bind)
@@ -130,10 +135,13 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         tracing::info!(name = %listener.name, bind = %listener.bind, "smtp listening");
         listeners.push((bound, listener.mode.clone(), listener.role.clone()));
     }
+    let mut readiness = checks_for(&cfg);
+    readiness.push(Arc::new(report_health));
     currawong_core::telemetry::serve(
         cfg.metrics_addr().map_err(|err| err.to_string())?,
-        checks_for(&cfg),
-    );
+        readiness,
+    )
+    .map_err(|err| format!("metrics.listen {}: {err}", cfg.metrics.listen))?;
     if cfg.scanner.enabled && currawongd::worker_binary(&cfg).is_none() {
         return Err("parser worker binary not found: set scanner.worker_binary".into());
     }

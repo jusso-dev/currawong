@@ -6,6 +6,7 @@ use currawong_classify::{
     message::{too_nested, MAX_RAW_BYTES},
     Classifier, TenantContext,
 };
+use currawong_core::telemetry::SCAN_DURATION_SECONDS;
 use currawong_core::{
     config::{Config, TenantConfig},
     AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
@@ -22,6 +23,7 @@ use currawong_scan::{
 use currawong_smtp::checks::{CheckStack, VerdictSignal};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
+use tracing::Instrument;
 
 pub struct Pipeline {
     pub cfg: Arc<Config>,
@@ -295,7 +297,27 @@ impl Pipeline {
         (report, decision.verdict())
     }
 
+    /// Every log line from one assessment carries a `message` span with the
+    /// `message_id` field. Scan time goes to `currawong_scan_duration_seconds`.
     pub async fn assess(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, MessageDecision) {
+        let span = tracing::info_span!("message", message_id = %env.id);
+        async {
+            let started = std::time::Instant::now();
+            let (report, decision) = self.assess_inner(env, raw, body_path).await;
+            metrics::histogram!(SCAN_DURATION_SECONDS).record(started.elapsed().as_secs_f64());
+            tracing::info!(verdict = ?decision.verdict(), "message evaluated");
+            (report, decision)
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn assess_inner(
         &self,
         env: &Envelope,
         raw: &[u8],

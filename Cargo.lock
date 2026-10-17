@@ -1133,10 +1133,16 @@ dependencies = [
 name = "currawong-fuzzstand"
 version = "0.0.1"
 dependencies = [
+ "bytes",
+ "currawong-auth",
+ "currawong-core",
  "currawong-dlp",
  "currawong-parser-worker",
  "currawong-scan",
  "currawong-smtp",
+ "currawong-spool",
+ "serde_json",
+ "tokio-util",
 ]
 
 [[package]]
@@ -1279,14 +1285,18 @@ dependencies = [
 name = "currawong-testkit"
 version = "0.0.1"
 dependencies = [
+ "currawong-auth",
  "currawong-core",
+ "currawong-quarantine",
  "currawong-smtp",
  "currawong-spool",
+ "currawongd",
  "mail-send",
  "rustls",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
@@ -1310,6 +1320,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "metrics",
  "serde",
  "serde_json",
  "sevenz-rust2",

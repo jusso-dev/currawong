@@ -77,6 +77,7 @@ key = "/etc/currawong/key.pem"
 #   currawong-parser-worker; by default it sits next to currawongd, and the
 #   daemon refuses to start without it.
 # scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310 (deploy/docker-compose.yml).
+#   clamd gets whole messages, so in au mode TCP must be loopback or an allowed CIDR.
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
 #   Required with an empty address defers all mail and fails /readyz. Set
 #   required = false to run without ClamAV.
@@ -129,15 +130,21 @@ max_uncompressed_bytes = 209715200
 max_files = 1000
 max_ratio = 100
 
-# residency.mode: "au" (default) or "off".
+# residency.mode: "au" (default) or "off". "off" is refused unless
+#   residency.off_approval = { reason = "...", approved_by = "..." } is set.
 # residency.allowed_host_suffixes: Sydney and Melbourne object-storage names.
 # residency.allowed_names: exact hostnames, never a GeoIP lookup.
-# residency.allowed_cidrs: on-premises ranges.
+# residency.allowed_cidrs: on-premises ranges. The defaults trust loopback and
+#   every RFC 1918 range as on-premises. Narrow them to your own networks.
 # residency.content_endpoints: sandbox, LLM, object store and webhook URLs
-# checked at startup. A us-east-1 bucket fails in au mode.
+#   (http or https) checked at startup. A us-east-1 bucket fails in au mode.
+#   scanner.clamd.address is checked too: unix:, loopback or an allowed CIDR.
 # residency.overrides: audited exceptions (url, reason, approved_by).
-# residency.signing_key_path: Ed25519 key for the residency report.
-# residency.report_dir: where signed monthly reports are written.
+# residency.signing_key_path: Ed25519 key for the residency report. Unset
+#   means no signed report (currawongd logs a warning).
+# residency.report_dir: signed reports (monthly, and at startup when the
+#   residency config changed), 0600.
+# residency.report_retention_days: reports older than this are deleted.
 [residency]
 mode = "au"
 allowed_host_suffixes = [
@@ -155,6 +162,7 @@ allowed_cidrs = [
 content_endpoints = []
 overrides = []
 report_dir = "/var/lib/currawong/residency"
+report_retention_days = 400
 
 # gateway.hostname: EHLO name and Received header.
 [gateway]

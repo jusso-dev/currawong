@@ -1,4 +1,4 @@
 #![no_main]
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
-    currawong_dlp::fuzz_scan(data);
+    currawong_fuzzstand::dlp_scan(data);
 });
