@@ -184,3 +184,9 @@ seal_arc = true
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
 [auth]
 authserv_id = "currawong.example.test"
+
+# policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
+# policy.database: SQLite policy store, seeded from the pack when it has no policies.
+[policy]
+# pack = "/etc/currawong/policies.toml"
+# database = "/var/lib/currawong/policy.db"

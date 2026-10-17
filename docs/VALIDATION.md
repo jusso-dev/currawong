@@ -21,6 +21,17 @@ Unit tests use fakes for DNS, clamd and the downstream SMTP sink. They bind port
 - seccomp. The parser worker installs a seccompiler filter only on Linux. This machine is macOS, so workers run unsandboxed. The Linux filter is untested here.
 - 7z extraction. 7z is recognised by magic and flagged, and it is not unpacked (no `sevenz` crate in the workspace). zip, tar, gz and a minimal ISO walk are implemented. RAR is detected and not extracted.
 
+## Policy engine (#37)
+
+`cargo test -p currawong-policy` and `cargo test -p currawongd --test policy` cover the engine. The corpus test runs every sample in `testdata/corpus/expected.toml` through the real pipeline and default pack, with an in-process fake clamd for EICAR.
+
+- Storage is SQLite through `rusqlite`, not `sqlx`. The workspace already links `rusqlite` with bundled SQLite, and `sqlx-sqlite` would link a second `libsqlite3-sys`, which Cargo refuses. Migrations are plain SQL in `crates/policy/migrations/`, tracked with `PRAGMA user_version`. PostgreSQL is not supported yet.
+- "Editable via API" is the `PolicyStore` Rust API (upsert, delete, groups, TOML import and export). There is no HTTP endpoint yet; that belongs to the admin issue.
+- Header, redirect and bcc actions are applied before delivery. Banner, encrypt and require TLS are decided and logged but not yet carried out by delivery.
+- The default pack tags spam with an `X-Currawong-Spam: [SPAM]` header, not a subject rewrite, because the spool does not rewrite bodies.
+- Nothing produces a `spam` score yet, so the spam policies do not fire on real mail. The tests inject scores.
+- When recipients get different outcomes the message is split. The extra copies are new spool entries that are scanned again on the next pass.
+
 ## ADR 0002 and the worker transport
 
 ADR 0002 says the supervisor talks to parser workers over a Unix socket. Issue #23 specifies length-prefixed JSON on stdin and stdout. M1 follows the issue: `LengthDelimitedCodec` on the worker's standard streams. The ADR decision is unchanged. The transport should be reconciled in a later ADR update rather than silently rewritten.

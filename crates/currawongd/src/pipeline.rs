@@ -1,8 +1,8 @@
-//! Auth, parse, scan and the M1 policy decision.
+//! Auth, parse, scan and the policy decision.
 use currawong_auth::AuthChecker;
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
-use currawong_policy::decide;
+use currawong_policy::{default_pack, evaluate_message, Message, MessageDecision, PolicySet};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool,
@@ -14,6 +14,7 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    pub policies: PolicySet,
 }
 
 impl Pipeline {
@@ -26,21 +27,42 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        Self {
+            cfg,
+            auth,
+            pool,
+            policies: default_pack().clone(),
+        }
     }
 
+    pub fn with_policies(mut self, policies: PolicySet) -> Self {
+        self.policies = policies;
+        self
+    }
+
+    /// One verdict for the whole message. See `assess` for per-recipient decisions.
     pub async fn evaluate(
         &mut self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
+        let (report, decision) = self.assess(env, raw, body_path).await;
+        (report, decision.verdict())
+    }
+
+    pub async fn assess(
+        &mut self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, MessageDecision) {
         let mut report = ScanReport::new(env.id.clone());
         let auth = self.auth.check(raw, env).await;
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
-            let verdict = decide(&report);
-            return (report, verdict);
+            let decision = self.decide(env, &report);
+            return (report, decision);
         }
         let parsed = self.parse(env, raw, body_path).await;
         report.parts = parsed.parts.clone();
@@ -102,8 +124,18 @@ impl Pipeline {
                 detail: String::new(),
             });
         }
-        let verdict = decide(&report);
-        (report, verdict)
+        let decision = self.decide(env, &report);
+        (report, decision)
+    }
+
+    fn decide(&self, env: &Envelope, report: &ScanReport) -> MessageDecision {
+        let msg = Message {
+            tenant_id: env.tenant_id.as_deref(),
+            direction: env.direction,
+            sender: &env.mail_from,
+            recipients: &env.rcpt_to,
+        };
+        evaluate_message(report, &msg, &self.policies)
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {

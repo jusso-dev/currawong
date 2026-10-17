@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +271,16 @@ pub struct AuthConfig {
     pub authserv_id: String,
 }
 
+/// Policy engine. With neither set, the built-in default pack applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyConfig {
+    /// TOML policy pack. Seeds the database when the database has no policies.
+    pub pack: Option<PathBuf>,
+    /// SQLite policy store. When set, policies are read from it.
+    pub database: Option<PathBuf>,
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -483,6 +494,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }

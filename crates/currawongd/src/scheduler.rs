@@ -1,7 +1,9 @@
 //! Run the pipeline before delivery. Unscanned mail is never handed to the deliverer.
 use currawong_core::Verdict;
+use currawong_policy::Action;
 use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
+use std::io::Cursor;
 use time::OffsetDateTime;
 
 use crate::pipeline::{auth_header, Pipeline};
@@ -52,12 +54,38 @@ async fn classify_one(
         .await
         .map_err(|err| err.to_string())?;
     let body_path = spool_body(spool, &env);
-    let (report, verdict) = pipeline.evaluate(&env, &raw, body_path.as_deref()).await;
+    let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+    let groups = decision.split();
+    // Recipients with a different outcome move to their own spool copy, decided on the next pass.
+    // Copies are written before the original is narrowed, so a crash can duplicate, not lose, mail.
+    if groups.len() > 1 {
+        for group in &groups[1..] {
+            let mut copy = env.clone();
+            copy.id = Envelope::new_id();
+            copy.rcpt_to = group.iter().map(|d| d.recipient.clone()).collect();
+            copy.rcpt_status
+                .retain(|status| copy.rcpt_to.contains(&status.address));
+            copy.pipeline = "pending".into();
+            copy.next_attempt_at = None;
+            tracing::info!(id = %env.id, split = %copy.id, "recipients differ, message split");
+            spool
+                .accept(copy, Cursor::new(raw.clone()))
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+        env.rcpt_to = groups[0].iter().map(|d| d.recipient.clone()).collect();
+        env.rcpt_status
+            .retain(|status| env.rcpt_to.contains(&status.address));
+    }
+    let decided = groups[0][0];
+    let verdict = decided.verdict.clone();
+    tracing::info!(id = %env.id, explanation = %decided.explanation.join("; "), "policy decision");
     if let Some(auth) = &report.auth {
         env.prepend_headers.push(auth_header(auth));
     }
     match &verdict {
         Verdict::Deliver => {
+            apply_actions(&mut env, &decided.actions);
             env.pipeline = "deliver".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
         }
@@ -90,6 +118,23 @@ async fn classify_one(
         }
     }
     Ok(())
+}
+
+/// Delivery-time actions. Banner, encryption and TLS enforcement are not wired into delivery yet.
+fn apply_actions(env: &mut Envelope, actions: &[Action]) {
+    for action in actions {
+        match action {
+            Action::AddHeader { name, value } => {
+                env.prepend_headers.push(format!("{name}: {value}\r\n"))
+            }
+            Action::Redirect(to) => env.rcpt_to = vec![to.clone()],
+            Action::Bcc(to) if !env.rcpt_to.contains(to) => env.rcpt_to.push(to.clone()),
+            Action::Banner(_) | Action::Encrypt | Action::RequireTls => {
+                tracing::warn!(id = %env.id, ?action, "policy action not applied yet")
+            }
+            _ => {}
+        }
+    }
 }
 
 fn spool_body(spool: &Spool, env: &Envelope) -> Option<std::path::PathBuf> {
