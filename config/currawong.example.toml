@@ -187,7 +187,17 @@ domains = ["example.test"]
 trusted_cidrs = ["10.0.0.0/8"]
 
 # dkim.kek_path: 32-byte AES-GCM key file. Private keys are encrypted at rest.
-# dkim.sign_outbound / seal_arc: outbound signing and ARC when we modify mail.
+# It is created on first use; if it goes missing while keys exist, startup fails.
+# dkim.sign_outbound: sign outbound tenant mail with every active key for the From domain.
+#   A signing failure defers the message rather than sending it unsigned.
+# dkim.seal_arc: ARC seal inbound mail a stage modified, with the "_gateway" tenant's key
+#   for auth.authserv_id. Outbound mail never carries our Authentication-Results or ARC.
+# Keys: currawongd --config ... dkim generate --tenant <id> --domain <d> --selector <s> [--algorithm rsa|ed25519]
+#         (pending: publish the printed TXT record; it does not sign yet)
+#       currawongd --config ... dkim activate --tenant <id> --domain <d> --selector <s>
+#         (checks DNS serves the record, then signs; retires the previous key, keep it in DNS 7 days)
+#       currawongd --config ... dkim records --tenant <id> --domain <d>  (pending/active/retired)
+# Nothing is signed until the key database exists.
 [dkim]
 database = "/var/lib/currawong/dkim.sqlite"
 kek_path = "/etc/currawong/dkim.kek"
