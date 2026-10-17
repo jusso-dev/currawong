@@ -1,0 +1,148 @@
+# Packaging and release: container image, Debian package, appliance image, Helm chart.
+# Move to .github/workflows/release.yml once a token with workflow scope is available.
+# Each job checks one #46 acceptance criterion; see docs/VALIDATION.md.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t currawong:ci .
+      - name: Image is under 80 MB
+        run: |
+          size=$(docker image inspect currawong:ci --format '{{.Size}}')
+          echo "image size: $size bytes"
+          test "$size" -lt 83886080
+      - name: Container passes /healthz
+        run: |
+          mkdir -p ci-tls
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+            -days 1 -subj /CN=ci.example.test -keyout ci-tls/key.pem -out ci-tls/cert.pem
+          chmod 0644 ci-tls/key.pem ci-tls/cert.pem
+          docker run -d --name cw -p 127.0.0.1:9090:9090 \
+            -v "$PWD/ci-tls/cert.pem:/etc/currawong/cert.pem:ro" \
+            -v "$PWD/ci-tls/key.pem:/etc/currawong/key.pem:ro" currawong:ci
+          for _ in $(seq 1 45); do
+            [ "$(docker inspect -f '{{.State.Health.Status}}' cw)" = healthy ] && break
+            sleep 2
+          done
+          docker logs cw
+          test "$(docker inspect -f '{{.State.Health.Status}}' cw)" = healthy
+          curl -fsS http://127.0.0.1:9090/healthz
+          test "$(docker inspect -f '{{.Config.User}}' currawong:ci)" = 65532:65532
+
+  deb:
+    runs-on: ubuntu-latest
+    # Build on bookworm so the binaries link against Debian 12's glibc.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-deb --locked
+      - run: cargo build --release --locked -p currawongd -p currawong-parser-worker
+      - run: cargo deb -p currawongd --no-build
+      - run: dpkg-deb --info target/debian/currawong_*.deb && dpkg-deb --contents target/debian/currawong_*.deb
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/debian/currawong_*.deb
+
+  deb-install:
+    needs: deb
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: debs }
+      - name: Install and start on Debian 12 under systemd
+        run: |
+          printf '%s\n' 'FROM debian:12' \
+            'RUN apt-get update && apt-get install -y --no-install-recommends systemd systemd-sysv curl && rm -rf /var/lib/apt/lists/*' \
+            'CMD ["/lib/systemd/systemd"]' | docker build -t deb12-systemd -
+          docker run -d --name deb12 --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw -v "$PWD/debs:/debs:ro" deb12-systemd
+          sleep 5
+          docker exec deb12 sh -c 'apt-get update && apt-get install -y /debs/currawong_*.deb'
+          sleep 5
+          docker exec deb12 systemctl status currawongd --no-pager || true
+          docker exec deb12 systemctl is-active currawongd
+          docker exec deb12 curl -fsS http://127.0.0.1:9090/healthz
+          docker exec deb12 systemd-analyze security currawongd.service --no-pager || true
+
+  appliance:
+    needs: deb
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: target/debian }
+      - name: Install mkosi and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pipx qemu-system-x86 qemu-utils ovmf
+          sudo pipx install --global git+https://github.com/systemd/mkosi@v25.3
+      - run: sudo mkosi -C packaging/appliance build
+      - name: Convert to qcow2 and VMDK
+        run: |
+          raw=packaging/appliance/mkosi.output/currawong-appliance.raw
+          qemu-img convert -O qcow2 "$raw" currawong-appliance.qcow2
+          qemu-img convert -O vmdk -o subformat=streamOptimized "$raw" currawong-appliance.vmdk
+      - name: Boots to the wizard in QEMU
+        run: |
+          sudo chmod 0666 /dev/kvm || true
+          qemu-system-x86_64 -machine q35 -accel kvm -accel tcg -m 2048 -smp 2 \
+            -bios /usr/share/ovmf/OVMF.fd \
+            -drive if=virtio,format=qcow2,file=currawong-appliance.qcow2,snapshot=on \
+            -display none -monitor none -serial file:serial.log &
+          qemu=$!
+          for _ in $(seq 1 120); do
+            grep -q "Currawong first-boot setup" serial.log && break
+            sleep 5
+          done
+          kill "$qemu" || true
+          tail -n 50 serial.log
+          grep -q "Currawong first-boot setup" serial.log
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appliance
+          path: |
+            currawong-appliance.qcow2
+            currawong-appliance.vmdk
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/currawong
+      - run: helm template ci deploy/helm/currawong > /dev/null
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [container, deb-install, appliance, helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Push image to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image=ghcr.io/${{ github.repository_owner }}/currawong:${GITHUB_REF_NAME#v}
+          docker build -t "$image" .
+          docker push "$image"
+      - name: Attach artefacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" dist/* --clobber
