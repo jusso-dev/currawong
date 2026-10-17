@@ -3,7 +3,15 @@ use async_trait::async_trait;
 use currawong_core::{config::Config, telemetry::ReadinessCheck};
 use currawong_scan::clamav::supplemental_paths_ready;
 use currawong_smtp::tls::TlsManager;
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
+
+static PROBE: AtomicU64 = AtomicU64::new(0);
 
 pub struct SpoolWritable {
     pub dir: std::path::PathBuf,
@@ -19,7 +27,12 @@ impl ReadinessCheck for SpoolWritable {
         if !self.dir.is_dir() {
             return Err(format!("spool {} is not a directory", self.dir.display()));
         }
-        let probe = self.dir.join(".ready");
+        // A unique name per probe, so concurrent /readyz calls do not race.
+        let probe = self.dir.join(format!(
+            ".ready-{}-{}",
+            std::process::id(),
+            PROBE.fetch_add(1, Ordering::Relaxed)
+        ));
         tokio::fs::write(&probe, b"ok")
             .await
             .map_err(|err| err.to_string())?;

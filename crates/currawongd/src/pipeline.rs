@@ -1,5 +1,6 @@
 //! Auth, parse, scan and the M1 policy decision.
 use currawong_auth::AuthChecker;
+use currawong_core::telemetry::SCAN_DURATION_SECONDS;
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
@@ -9,6 +10,7 @@ use currawong_scan::{
 };
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
+use tracing::Instrument;
 
 pub struct Pipeline {
     pub cfg: Arc<Config>,
@@ -29,7 +31,27 @@ impl Pipeline {
         Self { cfg, auth, pool }
     }
 
+    /// Every log line from one evaluation carries a `message` span with the
+    /// `message_id` field. Scan time goes to `currawong_scan_duration_seconds`.
     pub async fn evaluate(
+        &mut self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, Verdict) {
+        let span = tracing::info_span!("message", message_id = %env.id);
+        async {
+            let started = std::time::Instant::now();
+            let (report, verdict) = self.evaluate_inner(env, raw, body_path).await;
+            metrics::histogram!(SCAN_DURATION_SECONDS).record(started.elapsed().as_secs_f64());
+            tracing::info!(verdict = ?verdict, "message evaluated");
+            (report, verdict)
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn evaluate_inner(
         &mut self,
         env: &Envelope,
         raw: &[u8],
