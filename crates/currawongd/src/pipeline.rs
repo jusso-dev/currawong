@@ -7,6 +7,7 @@ use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool,
 };
+use currawong_smtp::checks::CheckStack;
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 
@@ -14,6 +15,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// Connection checks that learn from verdicts (reputation, greylist DMARC pass).
+    pub checks: Option<Arc<CheckStack>>,
 }
 
 impl Pipeline {
@@ -26,7 +29,38 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        Self {
+            cfg,
+            auth,
+            pool,
+            checks: None,
+        }
+    }
+
+    pub fn with_checks(mut self, checks: Arc<CheckStack>) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// Feed an inbound verdict back to the SMTP connection checks.
+    fn feedback(&self, env: &Envelope, report: &ScanReport, verdict: &Verdict) {
+        let Some(checks) = &self.checks else {
+            return;
+        };
+        if env.tenant_id.is_some() {
+            return;
+        }
+        let dmarc_pass = report
+            .auth
+            .as_ref()
+            .is_some_and(|auth| auth.dmarc.result == "pass");
+        checks.record_verdict(
+            env.remote_ip,
+            &env.mail_from,
+            dmarc_pass,
+            report.malware,
+            verdict,
+        );
     }
 
     pub async fn evaluate(
@@ -40,6 +74,7 @@ impl Pipeline {
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             let verdict = decide(&report);
+            self.feedback(env, &report, &verdict);
             return (report, verdict);
         }
         let parsed = self.parse(env, raw, body_path).await;
@@ -103,6 +138,7 @@ impl Pipeline {
             });
         }
         let verdict = decide(&report);
+        self.feedback(env, &report, &verdict);
         (report, verdict)
     }
 

@@ -62,6 +62,10 @@ pub struct RcptStatus {
 pub struct Envelope {
     pub id: MessageId,
     pub tenant_id: Option<String>,
+    /// SMTP AUTH login that submitted the message. `None` for inbound mail
+    /// and trusted-network relay. Policy can scope user and group rules by it.
+    #[serde(default)]
+    pub authenticated_as: Option<String>,
     pub mail_from: String,
     pub rcpt_to: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -100,6 +104,35 @@ impl Envelope {
     }
 }
 
+/// A body being streamed into the spool. Dropping it without `Spool::commit`
+/// removes the temporary file, so an aborted transaction leaves nothing behind.
+pub struct PendingBody {
+    id: MessageId,
+    tmp: PathBuf,
+    file: Option<tokio::io::BufWriter<tokio::fs::File>>,
+}
+
+impl PendingBody {
+    pub fn id(&self) -> &MessageId {
+        &self.id
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(bytes).await?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PendingBody {
+    fn drop(&mut self) {
+        if self.file.is_some() {
+            let _ = std::fs::remove_file(&self.tmp);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Spool {
     root: PathBuf,
@@ -125,22 +158,44 @@ impl Spool {
 
     pub async fn accept(
         &self,
-        mut env: Envelope,
+        env: Envelope,
         mut body: impl AsyncRead + Unpin,
     ) -> Result<MessageId> {
-        if !is_safe_id(env.id.as_str()) {
-            return Err(SpoolError::UnsafeId(env.id.as_str().to_string()));
+        let mut pending = self.begin(&env.id).await?;
+        if let Some(file) = pending.file.as_mut() {
+            tokio::io::copy(&mut body, file).await?;
         }
+        self.commit(pending, env).await
+    }
+
+    /// Start streaming a body to `incoming/<id>.eml.tmp`. Nothing is visible
+    /// to the pipeline until `commit`.
+    pub async fn begin(&self, id: &MessageId) -> Result<PendingBody> {
+        if !is_safe_id(id.as_str()) {
+            return Err(SpoolError::UnsafeId(id.as_str().to_string()));
+        }
+        let tmp = self
+            .state_dir(SpoolState::Incoming)
+            .join(format!("{id}.eml.tmp"));
+        let file = tokio::fs::File::create(&tmp).await?;
+        Ok(PendingBody {
+            id: id.clone(),
+            tmp,
+            file: Some(tokio::io::BufWriter::new(file)),
+        })
+    }
+
+    /// fsync the body, rename it into place, then write the envelope.
+    pub async fn commit(&self, mut pending: PendingBody, mut env: Envelope) -> Result<MessageId> {
+        env.id = pending.id.clone();
         env.state = SpoolState::Incoming;
         let dir = self.state_dir(SpoolState::Incoming);
-        let eml_tmp = dir.join(format!("{}.eml.tmp", env.id));
-        let eml = dir.join(format!("{}.eml", env.id));
-        {
-            let mut file = tokio::fs::File::create(&eml_tmp).await?;
-            tokio::io::copy(&mut body, &mut file).await?;
-            file.sync_all().await?;
+        if let Some(mut file) = pending.file.take() {
+            file.flush().await?;
+            file.into_inner().sync_all().await?;
         }
-        tokio::fs::rename(&eml_tmp, &eml).await?;
+        let eml = dir.join(format!("{}.eml", env.id));
+        tokio::fs::rename(&pending.tmp, &eml).await?;
         self.write_json(&dir, &env).await?;
         sync_dir(&dir).await?;
         Ok(env.id)

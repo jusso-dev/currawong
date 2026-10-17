@@ -10,6 +10,7 @@ fn envelope(from: &str) -> Envelope {
     Envelope {
         id: currawong_core::MessageId("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: from.into(),
         rcpt_to: vec!["dest@example.test".into()],
         received_at: OffsetDateTime::now_utc(),
@@ -133,5 +134,66 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
     assert!(
         err.contains("Australia") || err.contains("us-east-1") || err.contains("not an allowed"),
         "{err}"
+    );
+}
+
+#[tokio::test]
+async fn verdicts_feed_reputation_and_dmarc_pass_skips_greylisting() {
+    use currawong_smtp::{
+        checks::{CheckStack, GreylistDecision},
+        dns::MapDns,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.checks.dnsbl_enabled = false;
+    cfg.checks.ratelimit_enabled = false;
+    cfg.checks.greylist_enabled = true;
+    cfg.checks.reputation_enabled = true;
+    cfg.checks.greylist_database = dir.path().join("grey.sqlite");
+    let checks = Arc::new(CheckStack::from_checks(&cfg.checks, Arc::new(MapDns::new())).unwrap());
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "attacker.test", "v=spf1 -all").unwrap();
+    seed_txt(auth.cache(), "_dmarc.example.test", "v=DMARC1; p=reject").unwrap();
+    seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth).with_checks(Arc::clone(&checks));
+
+    let spoof = envelope("spoof@attacker.test");
+    let (_, verdict) = pipeline.evaluate(&spoof, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    let reputation = checks.reputation.as_ref().unwrap();
+    assert!(
+        reputation.score(spoof.remote_ip) > 0.0,
+        "a blocked verdict must raise the score"
+    );
+
+    let mut clean = envelope("user@example.test");
+    clean.remote_ip = "198.51.100.30".parse().unwrap();
+    let (report, verdict) = pipeline.evaluate(&clean, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    assert_eq!(report.auth.unwrap().dmarc.result, "pass");
+    let greylist = checks.greylist.as_ref().unwrap();
+    assert_eq!(
+        greylist
+            .decide(
+                "198.51.100.31".parse().unwrap(),
+                "other@example.test",
+                "x@example.test"
+            )
+            .unwrap(),
+        GreylistDecision::Pass,
+        "aligned DMARC pass lets the domain skip greylisting from that network"
+    );
+    assert_eq!(
+        greylist
+            .decide(
+                "203.0.113.200".parse().unwrap(),
+                "other@example.test",
+                "x@example.test"
+            )
+            .unwrap(),
+        GreylistDecision::Delay
     );
 }

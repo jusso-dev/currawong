@@ -7,7 +7,7 @@ Commands run on this tree, and the checks that were not run.
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `cargo test --workspace`
-- `cargo deny check` (advisories, bans, licences and sources). Hickory is 0.26 so the 0.25 proto advisories are not in the tree. `RUSTSEC-2023-0071` (the `rsa` crate timing issue) is ignored in `deny.toml`: that crate only generates DKIM keys on the appliance. Signing uses `mail-auth`'s aws-lc backend.
+- `cargo deny check` (advisories, bans, licences and sources). Hickory is 0.26 so the 0.25 proto advisories are not in the tree. `RUSTSEC-2023-0071` (the `rsa` crate timing issue) is ignored in `deny.toml`: that crate only generates DKIM keys on the appliance. Signing uses `mail-auth`'s aws-lc backend. On 2026-10-17 `cargo deny check advisories` fails on `zip` 2.x (RUSTSEC-2026-0367, -0368, -0369, all about extracting to disk). The fix is `zip` 9, a major upgrade in `crates/parser-worker` that has not been done yet. `rustls` was bumped to 0.23.46 for RUSTSEC-2026-0346.
 - `cargo run -p currawongd -- --config config/currawong.example.toml --check-config`
 
 Unit tests use fakes for DNS, clamd and the downstream SMTP sink. They bind port 0, not port 25. The EICAR test string is produced at build time from XOR bytes and is not stored as a contiguous string in the repository.
@@ -16,6 +16,8 @@ Unit tests use fakes for DNS, clamd and the downstream SMTP sink. They bind port
 
 - Live clamd. No clamd was listening. `CLAMD_ADDR=... cargo test -p currawong-scan clamav -- --ignored` is the check. `deploy/docker-compose.yml` starts `clamav/clamav:stable`.
 - A second, email-focused signature set. Config accepts `scanner.extra_signature_dirs` and `scanner.extra_database_paths`. Currawong checks that those paths exist and expects the operator to point clamd at them (`OfficialDatabaseOnly no`). It does not ship or download a supplemental set, and it does not upload mail.
+- `swaks` and `openssl s_client -starttls smtp`. Neither was run against a live listener. `crates/smtp/tests/session.rs` drives the same flows in process: a rustls client asserts TLS 1.3 after STARTTLS, a TLS 1.2-only client is accepted, and a hand-built TLS 1.1 ClientHello gets a fatal alert.
+- ACME (`tls.acme`). Not implemented. `--check-config` refuses a config that sets it.
 - Live MX delivery. Delivery tests use an in-process SMTP sink. A real MX lookup and a remote 250 were not exercised.
 - `cargo +nightly fuzz build`. `cargo-fuzz` is not installed here. `cargo test -p currawong-fuzzstand` is the stand-in and does not need libFuzzer. See `docs/fuzzing.md`.
 - seccomp. The parser worker installs a seccompiler filter only on Linux. This machine is macOS, so workers run unsandboxed. The Linux filter is untested here.

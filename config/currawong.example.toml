@@ -14,10 +14,12 @@ listen = "127.0.0.1:9090"
 
 # limits.max_message_bytes: at least 1 MiB. Default is 50 MiB.
 # limits.max_recipients: recipients accepted in one transaction.
-# limits.smtp_command_timeout_secs: idle timeout between SMTP commands.
+# limits.smtp_command_timeout_secs: idle timeout between SMTP commands, and
+# the longest a reply write may block on a client that is not reading.
 # limits.max_connections: process-wide connection cap.
-# limits.max_line_bytes: RFC 5321 line limit, excluding the line ending.
-# limits.max_connections_per_ip: per-address connection cap.
+# limits.max_line_bytes: RFC 5321 line limit, including the CRLF (1000 allows 998 octets).
+# limits.max_connections_per_ip: per-address connection cap, shared by all listeners.
+# limits.tls_handshake_timeout_secs: implicit TLS and STARTTLS handshake deadline.
 [limits]
 max_message_bytes = 52428800
 max_recipients = 100
@@ -25,6 +27,7 @@ smtp_command_timeout_secs = 300
 max_connections = 1000
 max_line_bytes = 1000
 max_connections_per_ip = 20
+tls_handshake_timeout_secs = 30
 
 # spool.dir: absolute path. The 250 reply is sent only after an fsync.
 [spool]
@@ -52,8 +55,7 @@ mode = "implicit"
 role = "submission"
 
 # tls.cert and tls.key: PEM paths. Reloaded on SIGHUP.
-# tls.acme is optional and is not required for M1. Leave it unset unless
-# the binary was built with the acme feature. ACME does not carry message content.
+# tls.acme is not implemented yet. --check-config refuses a config that sets it.
 [tls]
 cert = "/etc/currawong/cert.pem"
 key = "/etc/currawong/key.pem"
@@ -144,7 +146,8 @@ max_age_days = 5
 require_tls = false
 
 # checks.*_enabled: each pre-DATA check can be turned off.
-# checks.allow_cidrs: skip DNSBL, greylisting and reputation.
+# checks.allow_cidrs: skip rate limits, DNSBL, greylisting and reputation.
+# Trusted tenant networks and SMTP AUTH sessions skip them as well.
 # Put published Microsoft and Google outbound ranges here; do not hard-code a
 # stale copy into the binary.
 # checks.dnsbl: zone, optional dqs_key (never logged) and 127.0.0.x codes.
@@ -163,7 +166,8 @@ reputation_reject_score = 100.0
 reputation_half_life_secs = 86400
 dnsbl = []
 
-# relay.database: argon2 SMTP AUTH credentials.
+# relay.database: argon2 SMTP AUTH credentials. A login may send only as
+# its own address (when the username is an address) or a listed alias.
 # relay.tenants: trusted CIDRs and the domains that tenant may send as.
 [relay]
 database = "/var/lib/currawong/relay.sqlite"

@@ -3,8 +3,8 @@ use clap::Parser;
 use currawong_auth::AuthChecker;
 use currawong_core::residency::{load_or_create_signing_key, sign_report, ResidencyGuard};
 use currawong_smtp::{
-    checks::CheckStack, delivery::Deliverer, dns::HickoryDns, relay::Relay, server::SmtpServer,
-    session::SessionContext, tls::TlsManager,
+    checks::CheckStack, delivery::Deliverer, dns::HickoryDns, limits::ConnectionLimits,
+    relay::Relay, server::SmtpServer, session::SessionContext, tls::TlsManager,
 };
 use currawong_spool::Spool;
 use currawongd::{check_config, checks_for, classify_pending, Pipeline};
@@ -96,7 +96,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let pipeline = Pipeline::new(Arc::clone(&cfg), auth).with_checks(Arc::clone(&checks));
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -133,6 +133,10 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         wait_for_signals(shutdown_signal, tls_reload, cert, key).await;
     });
     let mut set = tokio::task::JoinSet::new();
+    let limits = ConnectionLimits::new(
+        cfg.limits.max_connections,
+        cfg.limits.max_connections_per_ip as u32,
+    );
     for (listener, mode, role) in listeners {
         let ctx = Arc::new(SessionContext {
             cfg: Arc::clone(&cfg),
@@ -143,8 +147,11 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             role,
         });
         let shutdown = shutdown.clone();
+        let limits = Arc::clone(&limits);
         set.spawn(async move {
-            SmtpServer::new(ctx).run(listener, shutdown, mode).await;
+            SmtpServer::with_limits(ctx, limits)
+                .run(listener, shutdown, mode)
+                .await;
         });
     }
     while set.join_next().await.is_some() {}

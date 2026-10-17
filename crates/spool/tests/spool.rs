@@ -8,6 +8,7 @@ fn envelope(id: &str) -> Envelope {
     Envelope {
         id: MessageId(id.to_string()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: "sender@example.test".into(),
         rcpt_to: vec!["rcpt@example.test".into()],
         received_at: OffsetDateTime::UNIX_EPOCH,

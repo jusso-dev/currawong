@@ -63,3 +63,10 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
 zeroize = "1"
+
+# Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
