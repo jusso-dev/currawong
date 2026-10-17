@@ -16,9 +16,9 @@ pub use periodic::{
 pub use pipeline::Pipeline;
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};
 
-use currawong_core::{config::Config, Config as CoreConfig};
+use currawong_core::{config::Config, residency::ResidencyGuard, Config as CoreConfig};
 use currawong_scan::engines::yara::{compile_dir, RuleSummary};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 /// Load and validate. Validation includes the residency check on clamd and
 /// every content endpoint.
@@ -29,6 +29,21 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
         currawong_classify::check_config(&cfg.classify).map_err(|err| err.to_string())?;
     }
     currawong_policy::load_pack(&cfg.policy).map_err(|err| err.to_string())?;
+    let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
+    // The guard checks HTTP URLs; a syslog collector is checked as
+    // https://host:port, as the exporter does.
+    let sinks: Vec<String> = cfg
+        .events
+        .destinations()
+        .into_iter()
+        .map(|sink| match sink.split_once("://") {
+            Some(("syslog" | "syslog-tls", rest)) => format!("https://{rest}"),
+            _ => sink,
+        })
+        .collect();
+    guard
+        .enforce_startup(&sinks)
+        .map_err(|err| format!("events: {err}"))?;
     yara_summary(&cfg)?;
     Ok(cfg)
 }
@@ -40,6 +55,31 @@ pub fn yara_summary(cfg: &CoreConfig) -> Result<Option<RuleSummary>, String> {
         return Ok(None);
     }
     compile_dir(&cfg.scanner.yara.rules_dir).map(|(_, summary)| Some(summary))
+}
+
+/// Build the `[events]` sinks and install the process-wide event bus. Does
+/// nothing when no sink is configured. Must run inside the Tokio runtime.
+pub fn start_events(cfg: &CoreConfig, guard: Arc<ResidencyGuard>) -> Result<(), String> {
+    let events = &cfg.events;
+    if events.destinations().is_empty() {
+        return Ok(());
+    }
+    let overflow = events
+        .overflow_dir
+        .clone()
+        .unwrap_or_else(|| cfg.spool.dir.join("events"));
+    let bus = currawong_integrations::export::EventBus::from_config(
+        events,
+        guard,
+        &cfg.gateway.hostname,
+        &overflow,
+    )
+    .map_err(|err| format!("events: {err}"))?;
+    if currawong_integrations::export::install(bus).is_err() {
+        return Err("events: an event bus is already installed".into());
+    }
+    tracing::info!(sinks = ?events.destinations(), "event export started");
+    Ok(())
 }
 
 pub fn install_tracing(cfg: &CoreConfig) {

@@ -17,6 +17,7 @@ use currawong_core::{
     config::{QuarantineConfig, ADMIN_RELEASE_QUEUES},
     Direction, MessageId,
 };
+use currawong_integrations::export;
 use currawong_spool::{Envelope, Spool, SpoolState};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -605,6 +606,14 @@ impl QuarantineStore {
             now,
         )?;
         tracing::info!(item = %item.id, released = %env.id, actor = %principal.actor, "quarantine item released");
+        export::emit(export::Event::new(
+            item.tenant_id.as_deref(),
+            export::EventKind::QuarantineRelease {
+                message_id: item.message_id.clone(),
+                released_by: principal.actor.clone(),
+                rcpt_to: vec![item.recipient.clone()],
+            },
+        ));
         Ok(Some(env.id))
     }
 

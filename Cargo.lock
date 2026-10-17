@@ -1191,6 +1191,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "currawong-integrations"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "currawong-core",
+ "hex",
+ "hmac",
+ "metrics",
+ "rcgen",
+ "reqwest",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "toml",
+ "tracing",
+ "ulid",
+ "url",
+ "webpki-roots",
+]
+
+[[package]]
 name = "currawong-parser-worker"
 version = "0.0.1"
 dependencies = [
@@ -1244,6 +1272,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "currawong-core",
+ "currawong-integrations",
  "currawong-spool",
  "hex",
  "hmac",
@@ -1376,6 +1405,7 @@ dependencies = [
  "currawong-classify",
  "currawong-core",
  "currawong-dlp",
+ "currawong-integrations",
  "currawong-parser-worker",
  "currawong-policy",
  "currawong-quarantine",

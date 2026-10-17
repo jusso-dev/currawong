@@ -75,6 +75,9 @@ strsim = "0.11"
 psl = "2"
 idna = "1"
 regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+hmac = "0.12"
+webpki-roots = "1"
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
@@ -82,11 +85,7 @@ proptest = "1"
 # S3-compatible quarantine blobs. TLS through rustls; certificates are verified.
 object_store = { version = "0.14", default-features = false, features = ["aws"] }
 askama = "0.16"
-# 0.13 needs the digest 0.11 line; sha2 here is 0.10.
-hmac = "0.12"
 tower = { version = "0.5", features = ["util"] }
-# Only under object_store, through the residency-guarded connector.
-reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 
 # Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
 [profile.dev.package.argon2]
