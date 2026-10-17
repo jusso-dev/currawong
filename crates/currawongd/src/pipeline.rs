@@ -16,6 +16,8 @@ pub struct Pipeline {
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
     pub yara: Option<Arc<YaraEngine>>,
+    /// YARA is configured but its rules could not be loaded: fail closed.
+    pub yara_error: Option<String>,
     _yara_watch: Option<PollWatcher>,
 }
 
@@ -28,8 +30,15 @@ impl Pipeline {
                 cfg.scanner.max_jobs_per_worker as u64,
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
+            .with_rules_load_timeout(cfg.scanner.yara.load_timeout_secs)
         });
-        let yara = yara_engine(&cfg);
+        let (yara, yara_error) = match yara_engine(&cfg) {
+            Ok(yara) => (yara, None),
+            Err(err) => {
+                tracing::error!(%err, "yara rules unavailable, mail fails closed");
+                (None, Some(err))
+            }
+        };
         let _yara_watch = yara.as_ref().and_then(|engine| match engine.watch() {
             Ok(watcher) => Some(watcher),
             Err(err) => {
@@ -42,6 +51,7 @@ impl Pipeline {
             auth,
             pool,
             yara,
+            yara_error,
             _yara_watch,
         }
     }
@@ -85,6 +95,15 @@ impl Pipeline {
         outputs.push(finding("filetype", &result));
         if self.yara.is_some() {
             outputs.push(finding("yara", &yara::result_for(&report.yara)));
+        }
+        if let Some(reason) = &self.yara_error {
+            outputs.push(finding(
+                "yara",
+                &currawong_scan::EngineResult::Failed {
+                    reason: format!("rules unavailable: {reason}"),
+                    unreachable: false,
+                },
+            ));
         }
         if !self.cfg.scanner.clamd.address.is_empty() {
             match ClamdAddress::parse(&self.cfg.scanner.clamd.address) {
@@ -165,12 +184,7 @@ impl Pipeline {
     ) -> ParseResponse {
         if let (Some(pool), Some(path)) = (self.pool.as_mut(), body_path) {
             return match pool
-                .scan_file_with_rules(
-                    env.id.as_str(),
-                    path,
-                    &self.cfg.scanner.extract,
-                    rules.map(CompiledRules::path),
-                )
+                .scan_file_with_rules(env.id.as_str(), path, &self.cfg.scanner.extract, rules)
                 .await
             {
                 ScanOutcome::Parsed(response) => response,
@@ -194,18 +208,12 @@ fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {
     }
 }
 
-fn yara_engine(cfg: &Config) -> Option<Arc<YaraEngine>> {
+fn yara_engine(cfg: &Config) -> Result<Option<Arc<YaraEngine>>, String> {
     let dir = &cfg.scanner.yara.rules_dir;
     if !cfg.scanner.enabled || dir.as_os_str().is_empty() {
-        return None;
+        return Ok(None);
     }
-    match YaraEngine::new(dir) {
-        Ok(engine) => Some(Arc::new(engine)),
-        Err(err) => {
-            tracing::error!(%err, "yara engine disabled");
-            None
-        }
-    }
+    YaraEngine::new(dir).map(|engine| Some(Arc::new(engine)))
 }
 
 pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {

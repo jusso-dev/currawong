@@ -8,5 +8,5 @@ pub mod office;
 pub mod parse;
 pub mod yara;
 
-pub use ipc::{ParseRequest, ParseResponse};
+pub use ipc::{LoadRules, ParseRequest, ParseResponse};
 pub use parse::parse_request;

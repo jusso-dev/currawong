@@ -962,6 +962,7 @@ dependencies = [
 name = "currawong-parser-worker"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "bytes",
  "cfb 0.10.0",
  "currawong-core",
@@ -1007,6 +1008,7 @@ version = "0.0.1"
 dependencies = [
  "arc-swap",
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "currawong-core",
  "currawong-parser-worker",

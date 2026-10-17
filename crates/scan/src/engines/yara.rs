@@ -1,64 +1,83 @@
 //! YARA rules from `scanner.yara.rules_dir`, compiled with yara-x.
 //!
-//! Every `*.yar` and `*.yara` file is compiled into its own namespace. A
-//! change to the directory recompiles. A broken file is logged and the
-//! previous rules stay active. The pipeline matches message parts inside the
-//! parser worker (ADR 0002), so each compiled set is also serialised to a
-//! private temporary file the worker loads.
+//! Every `*.yar` and `*.yara` file under the directory (any case, dot entries
+//! skipped) is compiled into its own namespace. A change recompiles. A set
+//! that does not compile, or an empty set replacing a non-empty one, is
+//! logged and rejected; the previous rules stay active.
+//!
+//! Matching runs only in the parser worker (ADR 0002). Each compiled set is
+//! serialised once here and sent to workers over their stdin protocol.
 //!
 //! Rules tagged `malware` make the message malware, rules tagged `suspicious`
-//! make it active content. Other matches only appear on the report.
-use crate::engines::{EngineResult, ScanItem, Scanner};
+//! make it active content. Other matches only appear on the report. A tag that
+//! looks like a misspelt action tag (`Malware`, `malwre`) rejects the set.
+use crate::engines::EngineResult;
 use arc_swap::ArcSwap;
-use async_trait::async_trait;
+use base64::Engine as _;
 use currawong_core::YaraMatch;
-use currawong_parser::yara::YaraScan;
 pub use notify::PollWatcher;
 use notify::{EventKind, RecursiveMode, Watcher};
-use std::io::Write;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::NamedTempFile;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 use yara_x::{Compiler, Rules, SourceCode};
 
-/// One compiled rule set. The serialised file lives as long as this value.
+const ACTION_TAGS: [&str; 2] = ["malware", "suspicious"];
+const MAX_DEPTH: usize = 8;
+
+/// One compiled rule set.
 pub struct CompiledRules {
     pub rules: Rules,
     pub generation: u64,
-    file: NamedTempFile,
+    /// Base64 of the serialised rules, for the worker's `LoadRules` frame.
+    pub encoded: String,
+    pub summary: RuleSummary,
 }
 
-impl CompiledRules {
-    /// Serialised rules for [`currawong_parser::ParseRequest::yara_rules`].
-    pub fn path(&self) -> &Path {
-        self.file.path()
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuleSummary {
+    pub files: usize,
+    pub rules: usize,
+    pub tags: BTreeMap<String, usize>,
+    pub warnings: Vec<String>,
+}
+
+impl std::fmt::Display for RuleSummary {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} rules from {} files", self.rules, self.files)?;
+        let tags: Vec<String> = self
+            .tags
+            .iter()
+            .map(|(tag, count)| format!("{tag}={count}"))
+            .collect();
+        if !tags.is_empty() {
+            write!(f, "; tags {}", tags.join(", "))?;
+        }
+        if !self.warnings.is_empty() {
+            write!(f, "; {} warnings", self.warnings.len())?;
+        }
+        Ok(())
     }
 }
 
 pub struct YaraEngine {
     dir: PathBuf,
     current: ArcSwap<CompiledRules>,
-    generation: AtomicU64,
+    reload: Mutex<()>,
 }
 
 impl YaraEngine {
-    /// Compile `dir`. If it does not compile, log it and start with no rules;
-    /// the watcher picks up the fix.
+    /// Fails when the directory cannot be read or its rules do not compile,
+    /// so the caller can fail closed instead of running without rules.
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, String> {
         let dir = dir.into();
-        let rules = match compile_dir(&dir) {
-            Ok(rules) => rules,
-            Err(err) => {
-                tracing::error!(dir = %dir.display(), %err, "yara rules rejected, starting with none");
-                Compiler::new().build()
-            }
-        };
+        let compiled = build(&dir, 0)?;
+        log_loaded(&dir, &compiled);
         Ok(Self {
-            current: ArcSwap::from_pointee(persist(rules, 0)?),
+            current: ArcSwap::from_pointee(compiled),
             dir,
-            generation: AtomicU64::new(0),
+            reload: Mutex::new(()),
         })
     }
 
@@ -71,17 +90,27 @@ impl YaraEngine {
         self.current.load_full()
     }
 
-    /// Recompile. On error the previous rules stay active.
+    /// Recompile. On error the previous rules stay active. Reloads are
+    /// serialised so generations are stored in order.
     pub fn reload(&self) -> Result<u64, String> {
-        let result = compile_dir(&self.dir).and_then(|rules| {
-            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-            persist(rules, generation)
+        let _guard = self.reload.lock().unwrap_or_else(|err| err.into_inner());
+        let current = self.current.load_full();
+        let result = build(&self.dir, current.generation + 1).and_then(|next| {
+            if next.summary.rules == 0 && current.summary.rules > 0 {
+                Err(format!(
+                    "{} has no rules; keeping {} active rules",
+                    self.dir.display(),
+                    current.summary.rules
+                ))
+            } else {
+                Ok(next)
+            }
         });
         match result {
-            Ok(compiled) => {
-                let generation = compiled.generation;
-                self.current.store(Arc::new(compiled));
-                tracing::info!(dir = %self.dir.display(), generation, "yara rules reloaded");
+            Ok(next) => {
+                let generation = next.generation;
+                log_loaded(&self.dir, &next);
+                self.current.store(Arc::new(next));
                 Ok(generation)
             }
             Err(err) => {
@@ -91,16 +120,18 @@ impl YaraEngine {
         }
     }
 
-    /// Reload whenever a rule file in the directory changes. Keep the
+    /// Reload whenever a rule file under the directory changes. Keep the
     /// returned watcher alive for as long as reloads are wanted.
     ///
     /// Polls every two seconds rather than using inotify or FSEvents: those
     /// miss changes on bind mounts and network volumes, and FSEvents drops
-    /// events under load. One directory listing per interval is cheap.
+    /// events under load. Before reloading it waits for the files to stop
+    /// changing, so a copy in progress is not compiled half written.
     pub fn watch(self: &Arc<Self>) -> Result<PollWatcher, String> {
         let engine = Arc::clone(self);
         let handler = move |event: notify::Result<notify::Event>| match event {
             Ok(event) if touches_rules(&event) => {
+                wait_until_settled(&engine.dir, Duration::from_millis(500));
                 let _ = engine.reload();
             }
             Ok(_) => {}
@@ -110,10 +141,22 @@ impl YaraEngine {
         let mut watcher =
             PollWatcher::new(handler, config).map_err(|err| format!("watch yara rules: {err}"))?;
         watcher
-            .watch(&self.dir, RecursiveMode::NonRecursive)
+            .watch(&self.dir, RecursiveMode::Recursive)
             .map_err(|err| format!("watch {}: {err}", self.dir.display()))?;
         Ok(watcher)
     }
+}
+
+fn log_loaded(dir: &Path, compiled: &CompiledRules) {
+    for warning in &compiled.summary.warnings {
+        tracing::warn!(dir = %dir.display(), %warning, "yara rule warning");
+    }
+    tracing::info!(
+        dir = %dir.display(),
+        generation = compiled.generation,
+        summary = %compiled.summary,
+        "yara rules loaded"
+    );
 }
 
 fn touches_rules(event: &notify::Event) -> bool {
@@ -122,57 +165,140 @@ fn touches_rules(event: &notify::Event) -> bool {
 }
 
 fn is_rule_file(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|ext| ext.to_str()),
-        Some("yar" | "yara")
-    )
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("yar") || ext.eq_ignore_ascii_case("yara"))
+        .unwrap_or(false)
 }
 
-/// Compile every rule file in `dir`. Any error rejects the whole set.
-pub fn compile_dir(dir: &Path) -> Result<Rules, String> {
+/// Rule files under `dir`, sorted. A file or directory that cannot be read
+/// is an error, not silently skipped.
+pub fn rule_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    collect(dir, 0, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn collect(dir: &Path, depth: usize, files: &mut Vec<PathBuf>) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|err| format!("yara rules_dir {}: {err}", dir.display()))?;
-    let mut files: Vec<PathBuf> = entries
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.is_file() && is_rule_file(path))
-        .collect();
-    files.sort();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("yara rules_dir {}: {err}", dir.display()))?;
+        let path = entry.path();
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let meta = std::fs::metadata(&path).map_err(|err| format!("{}: {err}", path.display()))?;
+        if meta.is_dir() && depth < MAX_DEPTH {
+            collect(&path, depth + 1, files)?;
+        } else if meta.is_file() && is_rule_file(&path) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn fingerprint(dir: &Path) -> Vec<(PathBuf, u64, Option<SystemTime>)> {
+    rule_files(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| {
+            let meta = std::fs::metadata(&path).ok();
+            let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let modified = meta.and_then(|m| m.modified().ok());
+            (path, len, modified)
+        })
+        .collect()
+}
+
+fn wait_until_settled(dir: &Path, quiet: Duration) {
+    let mut before = fingerprint(dir);
+    for _ in 0..20 {
+        std::thread::sleep(quiet);
+        let after = fingerprint(dir);
+        if after == before {
+            return;
+        }
+        before = after;
+    }
+}
+
+/// Compile and serialise `dir`. Any error rejects the whole set.
+pub fn build(dir: &Path, generation: u64) -> Result<CompiledRules, String> {
+    let (rules, summary) = compile_dir(dir)?;
+    let bytes = rules
+        .serialize()
+        .map_err(|err| format!("serialise yara rules: {err}"))?;
+    Ok(CompiledRules {
+        rules,
+        generation,
+        encoded: base64::engine::general_purpose::STANDARD.encode(bytes),
+        summary,
+    })
+}
+
+/// Compile every rule file under `dir` and check the tags.
+pub fn compile_dir(dir: &Path) -> Result<(Rules, RuleSummary), String> {
+    let files = rule_files(dir)?;
     let mut compiler = Compiler::new();
     for path in &files {
         let source = std::fs::read_to_string(path)
             .map_err(|err| format!("read {}: {err}", path.display()))?;
-        let namespace = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("default");
-        compiler.new_namespace(namespace);
+        let relative = path.strip_prefix(dir).unwrap_or(path).with_extension("");
+        compiler.new_namespace(&relative.to_string_lossy());
         compiler
             .add_source(SourceCode::from(source.as_str()).with_origin(path.display().to_string()))
             .map_err(|err| format!("{}: {err}", path.display()))?;
     }
-    Ok(compiler.build())
+    let rules = compiler.build();
+    let mut summary = RuleSummary {
+        files: files.len(),
+        rules: rules.iter().len(),
+        tags: BTreeMap::new(),
+        warnings: rules.warnings().iter().map(|w| w.to_string()).collect(),
+    };
+    for rule in rules.iter() {
+        for tag in rule.tags() {
+            let tag = tag.identifier();
+            if let Some(action) = near_action_tag(tag) {
+                return Err(format!(
+                    "rule {}: tag `{tag}` looks like `{action}`; only the exact lower-case tag acts",
+                    rule.identifier()
+                ));
+            }
+            *summary.tags.entry(tag.to_string()).or_default() += 1;
+        }
+    }
+    Ok((rules, summary))
 }
 
-fn persist(rules: Rules, generation: u64) -> Result<CompiledRules, String> {
-    let bytes = rules
-        .serialize()
-        .map_err(|err| format!("serialise yara rules: {err}"))?;
-    let mut file = tempfile::Builder::new()
-        .prefix("currawong-yara-")
-        .suffix(".yarc")
-        .tempfile()
-        .map_err(|err| format!("yara rules file: {err}"))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.flush())
-        .map_err(|err| format!("yara rules file: {err}"))?;
-    Ok(CompiledRules {
-        rules,
-        generation,
-        file,
-    })
+/// The action tag `tag` was probably meant to be, if it is not exactly one.
+fn near_action_tag(tag: &str) -> Option<&'static str> {
+    let lower = tag.to_ascii_lowercase();
+    ACTION_TAGS
+        .into_iter()
+        .find(|action| tag != *action && (lower == *action || distance(&lower, action) <= 2))
 }
 
-/// Malware beats suspicious. Untagged matches leave the engine clean.
+fn distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut prev = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = (prev + usize::from(ca != *cb))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            prev = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    row[b.len()]
+}
+
+/// Malware beats suspicious. Matches with other tags leave the engine clean.
 pub fn result_for(matches: &[YaraMatch]) -> EngineResult {
     let tagged = |tag: &str| -> Vec<String> {
         matches
@@ -194,24 +320,4 @@ pub fn result_for(matches: &[YaraMatch]) -> EngineResult {
         };
     }
     EngineResult::Clean
-}
-
-#[async_trait]
-impl Scanner for YaraEngine {
-    fn name(&self) -> &str {
-        "yara"
-    }
-
-    async fn scan(&self, item: &ScanItem<'_>) -> EngineResult {
-        let compiled = self.current();
-        let mut scan = YaraScan::new(&compiled.rules);
-        scan.scan(item.name, item.bytes);
-        if let Some(reason) = scan.error {
-            return EngineResult::Failed {
-                reason,
-                unreachable: false,
-            };
-        }
-        result_for(&scan.matches)
-    }
 }

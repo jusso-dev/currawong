@@ -1,6 +1,7 @@
 //! Parser worker processes. A crash, timeout or limit is a fail-closed result.
+use crate::engines::yara::CompiledRules;
 use currawong_core::config::ExtractLimits;
-use currawong_parser::{ParseRequest, ParseResponse};
+use currawong_parser::{LoadRules, ParseRequest, ParseResponse};
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -24,12 +25,14 @@ pub struct WorkerPool {
     max_jobs: u64,
     memory_mib: u64,
     cpu_secs: u64,
+    load_timeout: Duration,
     child: Option<ChildHandle>,
 }
 
 struct ChildHandle {
     child: Child,
     jobs: u64,
+    yara_generation: Option<u64>,
 }
 
 impl WorkerPool {
@@ -40,6 +43,7 @@ impl WorkerPool {
             max_jobs: max_jobs.max(1),
             memory_mib: 512,
             cpu_secs: 30,
+            load_timeout: Duration::from_secs(120),
             child: None,
         }
     }
@@ -59,19 +63,43 @@ impl WorkerPool {
         self.scan_file_with_rules(id, path, limits, None).await
     }
 
-    /// `yara_rules` is a serialised rule set from [`crate::YaraEngine`].
+    /// Loading rules recompiles their wasm in the worker, so it gets its own
+    /// timeout and happens once per worker and rules generation.
+    pub fn with_rules_load_timeout(mut self, secs: u64) -> Self {
+        self.load_timeout = Duration::from_secs(secs.max(1));
+        self
+    }
+
+    /// Scan with YARA rules from [`crate::YaraEngine`]. They are sent to the
+    /// worker first if it does not have this generation yet.
     pub async fn scan_file_with_rules(
         &mut self,
         id: &str,
         path: &Path,
         limits: &ExtractLimits,
-        yara_rules: Option<&Path>,
+        rules: Option<&CompiledRules>,
     ) -> ScanOutcome {
+        let yara_generation = match rules {
+            Some(rules) => match timeout(self.load_timeout, self.load_rules(rules)).await {
+                Ok(Ok(())) => Some(rules.generation),
+                Ok(Err(reason)) => {
+                    self.kill().await;
+                    return ScanOutcome::Failed { reason };
+                }
+                Err(_) => {
+                    self.kill().await;
+                    return ScanOutcome::Failed {
+                        reason: "yara rules load timed out".into(),
+                    };
+                }
+            },
+            None => None,
+        };
         let request = ParseRequest {
             id: id.to_string(),
             raw_path: path.to_path_buf(),
             limits: limits.clone(),
-            yara_rules: yara_rules.map(Path::to_path_buf),
+            yara_generation,
         };
         let bytes = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes,
@@ -155,7 +183,61 @@ impl WorkerPool {
             .spawn()
             .map_err(|err| format!("spawn parser worker: {err}"))?;
         let _ = child.stdin.as_mut();
-        self.child = Some(ChildHandle { child, jobs: 0 });
+        self.child = Some(ChildHandle {
+            child,
+            jobs: 0,
+            yara_generation: None,
+        });
+        Ok(())
+    }
+
+    /// Recycle or spawn as [`Self::round_trip`] would, then send the rules
+    /// unless this worker already has the generation. Not counted as a job.
+    async fn load_rules(&mut self, rules: &CompiledRules) -> Result<(), String> {
+        if self
+            .child
+            .as_ref()
+            .map(|child| child.jobs >= self.max_jobs)
+            .unwrap_or(false)
+        {
+            self.kill().await;
+        }
+        if self.child.is_none() {
+            self.spawn().await?;
+        }
+        let handle = self.child.as_mut().ok_or("worker missing")?;
+        if handle.yara_generation == Some(rules.generation) {
+            return Ok(());
+        }
+        let frame = serde_json::to_vec(&LoadRules {
+            generation: rules.generation,
+            yara_rules: rules.encoded.clone(),
+        })
+        .map_err(|err| err.to_string())?;
+        let codec = || {
+            LengthDelimitedCodec::builder()
+                .max_frame_length(LoadRules::MAX_FRAME_BYTES)
+                .new_codec()
+        };
+        let mut framed = bytes::BytesMut::new();
+        tokio_util::codec::Encoder::encode(&mut codec(), bytes::Bytes::from(frame), &mut framed)
+            .map_err(|err| format!("yara rules frame: {err}"))?;
+        let stdin = handle.child.stdin.as_mut().ok_or("worker stdin")?;
+        stdin
+            .write_all(&framed)
+            .await
+            .map_err(|err| err.to_string())?;
+        stdin.flush().await.map_err(|err| err.to_string())?;
+        let stdout = handle.child.stdout.as_mut().ok_or("worker stdout")?;
+        let reply = futures::StreamExt::next(&mut FramedRead::new(stdout, codec()))
+            .await
+            .ok_or("worker closed during yara rules load")?
+            .map_err(|err| err.to_string())?;
+        let reply: ParseResponse = serde_json::from_slice(&reply).map_err(|err| err.to_string())?;
+        if let Some(err) = reply.error {
+            return Err(format!("yara rules load: {err}"));
+        }
+        handle.yara_generation = Some(rules.generation);
         Ok(())
     }
 

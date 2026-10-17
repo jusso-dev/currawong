@@ -15,8 +15,8 @@ pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseRespons
         Ok(raw) => raw,
         Err(err) => return ParseResponse::failed(&req.id, format!("read input: {err}")),
     };
-    let rules = match &req.yara_rules {
-        Some(path) => match cache.get(path) {
+    let rules = match req.yara_generation {
+        Some(generation) => match cache.get(generation) {
             Ok(rules) => Some(rules),
             Err(err) => return ParseResponse::failed(&req.id, err),
         },

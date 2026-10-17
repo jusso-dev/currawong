@@ -144,12 +144,24 @@ pub struct ClamdConfig {
     pub required: bool,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct YaraConfig {
     /// Directory of `*.yar` and `*.yara` files, recompiled when it changes.
     /// Empty disables the engine.
     pub rules_dir: PathBuf,
+    /// Time a parser worker may take to load a rules generation. Loading
+    /// recompiles the rules, so large sets need far longer than one job.
+    pub load_timeout_secs: u64,
+}
+
+impl Default for YaraConfig {
+    fn default() -> Self {
+        Self {
+            rules_dir: PathBuf::new(),
+            load_timeout_secs: 120,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
