@@ -45,6 +45,13 @@ async fn main() {
 }
 
 async fn run(cfg: currawong_core::Config) -> Result<(), String> {
+    // Parser workers run as this user; they must not be able to ptrace the
+    // daemon or read /proc/<pid>/mem.
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain prctl with constant arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err("PR_SET_DUMPABLE failed".into());
+    }
     let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
     guard
         .enforce_startup(&cfg.residency.content_endpoints)
@@ -100,6 +107,11 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     }
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    if let Some(pool) = &pipeline.pool {
+        pool.self_test()
+            .await
+            .map_err(|err| format!("parser worker self-test failed: {err}"))?;
+    }
     pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))

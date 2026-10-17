@@ -32,7 +32,15 @@ pub struct ParseResponse {
     pub parts: Vec<PartInfo>,
     pub urls: Vec<String>,
     pub error: Option<String>,
+    /// Sandbox warnings, sent once in the `ready` frame.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
+
+/// Id of the frame a worker sends once its sandbox is in place, and of the
+/// failure it sends instead when it could not install it.
+pub const READY_ID: &str = "ready";
+pub const STARTUP_ID: &str = "startup";
 
 impl ParseResponse {
     pub fn failed(id: impl Into<String>, reason: impl Into<String>) -> Self {
@@ -41,6 +49,7 @@ impl ParseResponse {
             parts: Vec::new(),
             urls: Vec::new(),
             error: Some(reason.into()),
+            warnings: Vec::new(),
         }
     }
 }

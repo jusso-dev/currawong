@@ -7,6 +7,7 @@ use currawong_parser::ParseResponse;
 use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
 };
+use currawong_scan::pool::{display_name, sweep};
 use currawong_scan::{combine, ClamdAddress, ClamdClient, EngineOutput, ScanOutcome, WorkerPool};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
@@ -21,15 +22,15 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn new(cfg: Arc<Config>, auth: AuthChecker) -> Self {
-        let pool = worker_binary(&cfg).map(|binary| {
-            WorkerPool::new(
-                binary,
-                cfg.scanner.job_timeout_secs,
-                cfg.scanner.max_jobs_per_worker as u64,
-            )
-            .with_size(cfg.scanner.worker_pool_size)
-            .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
-        });
+        // Scratch left by an earlier run: worker directories and parts.
+        sweep(&parts_root(&cfg), &["scan-", "worker-", "selftest-"]);
+        if cfg.scanner.enabled && !cfg.scanner.require_landlock {
+            tracing::warn!(
+                "scanner.require_landlock is false: on kernels without Landlock the parser \
+                 worker can read every file this user can"
+            );
+        }
+        let pool = worker_pool(&cfg);
         Self {
             cfg,
             auth,
@@ -91,7 +92,7 @@ impl Pipeline {
     }
 
     pub async fn assess(
-        &mut self,
+        &self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
@@ -105,10 +106,23 @@ impl Pipeline {
         }
         // Holds the extracted parts on disk until the engines have run.
         let (parsed, _parts_dir) = self.parse(env, raw, body_path).await;
+        let (parsed, parser_failed) = match parsed {
+            Ok(parsed) => {
+                let failed = parsed.error.is_some();
+                (parsed, failed)
+            }
+            // No worker could run: not the message's fault, try again later.
+            Err(reason) => {
+                report.defer = true;
+                report
+                    .notes
+                    .push(format!("parser worker unreachable: {reason}"));
+                (ParseResponse::failed(env.id.as_str(), reason), false)
+            }
+        };
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
-        let parser_failed = parsed.error.is_some();
-        if let Some(err) = parsed.error {
+        if let Some(err) = parsed.error.filter(|_| parser_failed) {
             report.notes.push(err);
         }
         self.fold_part_flags(&mut report);
@@ -147,7 +161,7 @@ impl Pipeline {
         let combined = combine(&outputs, parser_failed);
         report.malware = combined.malware;
         report.active_content = report.active_content || combined.active_content;
-        report.defer = combined.defer;
+        report.defer = report.defer || combined.defer;
         report.fail_closed = report.fail_closed || combined.fail_closed;
         report.notes.extend(combined.notes);
         for output in &outputs {
@@ -232,7 +246,7 @@ impl Pipeline {
         let scanner = &self.cfg.scanner;
         let mut notes = Vec::new();
         for part in &mut report.parts {
-            let name = part.filename.as_deref().unwrap_or("attachment").to_string();
+            let name = display_name(part.filename.as_deref().unwrap_or("attachment"));
             if blocked_extension(part.filename.as_deref(), &scanner.blocked_extensions)
                 && !part.flags.contains(&PartFlag::Executable)
             {
@@ -266,73 +280,83 @@ impl Pipeline {
         report.notes.extend(notes);
     }
 
-    /// Always in a worker process (ADR 0002). No worker, no parse: the
-    /// message fails closed rather than being parsed inside the daemon.
+    /// Always in a worker process (ADR 0002); never inside the daemon.
+    /// `Err` means no worker could run (defer), not a verdict on the mail.
     async fn parse(
-        &mut self,
+        &self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
-    ) -> (ParseResponse, Option<tempfile::TempDir>) {
+    ) -> (Result<ParseResponse, String>, Option<tempfile::TempDir>) {
         let id = env.id.as_str();
         let Some(pool) = self.pool.as_ref() else {
-            return (
-                ParseResponse::failed(id, "parser worker binary not found"),
-                None,
-            );
+            return (Err("parser worker binary not found".into()), None);
         };
         let dir = match parts_dir(&self.cfg) {
             Ok(dir) => dir,
-            Err(err) => {
-                return (
-                    ParseResponse::failed(id, format!("parts directory: {err}")),
-                    None,
-                )
-            }
+            Err(err) => return (Err(format!("parts directory: {err}")), None),
         };
         let path = match body_path {
             Some(path) => path.to_path_buf(),
             None => {
                 let path = dir.path().join("message.eml");
                 if let Err(err) = tokio::fs::write(&path, raw).await {
-                    return (
-                        ParseResponse::failed(id, format!("stage message: {err}")),
-                        Some(dir),
-                    );
+                    return (Err(format!("stage message: {err}")), Some(dir));
                 }
                 path
             }
         };
         let out = dir.path().join("parts");
         if let Err(err) = tokio::fs::create_dir(&out).await {
-            return (
-                ParseResponse::failed(id, format!("parts directory: {err}")),
-                Some(dir),
-            );
+            return (Err(format!("parts directory: {err}")), Some(dir));
         }
         let response = match pool
             .scan_file_into(id, &path, &self.cfg.scanner.extract, Some(&out))
             .await
         {
-            ScanOutcome::Parsed(response) => response,
-            ScanOutcome::Failed { reason } => ParseResponse::failed(id, reason),
+            ScanOutcome::Parsed(response) => Ok(response),
+            ScanOutcome::Failed { reason } => Ok(ParseResponse::failed(id, reason)),
+            ScanOutcome::Unavailable { reason } => Err(reason),
         };
         (response, Some(dir))
     }
 }
 
+fn parts_root(cfg: &Config) -> std::path::PathBuf {
+    cfg.spool.dir.join("parts")
+}
+
 /// Per-message scratch space for extracted parts, next to the spool.
 fn parts_dir(cfg: &Config) -> std::io::Result<tempfile::TempDir> {
-    let base = cfg.spool.dir.join("parts");
+    let base = parts_root(cfg);
     std::fs::create_dir_all(&base)?;
     tempfile::Builder::new().prefix("scan-").tempdir_in(base)
 }
 
+/// The worker pool the config describes, if the worker binary exists.
+pub fn worker_pool(cfg: &Config) -> Option<WorkerPool> {
+    let scanner = &cfg.scanner;
+    let user = scanner.worker_uid.zip(scanner.worker_gid);
+    worker_binary(cfg).map(|binary| {
+        WorkerPool::new(
+            binary,
+            scanner.job_timeout_secs,
+            scanner.max_jobs_per_worker as u64,
+        )
+        .with_size(scanner.worker_pool_size)
+        .with_limits(scanner.worker_memory_mib, scanner.worker_cpu_secs)
+        .with_work_dir(parts_root(cfg))
+        .with_landlock_required(scanner.require_landlock)
+        .with_user(user)
+    })
+}
+
+/// Same rule as the parser worker: the extension Windows would act on.
 fn blocked_extension(filename: Option<&str>, blocked: &[String]) -> bool {
-    let Some((_, ext)) = filename.and_then(|name| name.rsplit_once('.')) else {
+    let Some(ext) = filename.and_then(currawong_parser::filetype::file_extension) else {
         return false;
     };
-    blocked.iter().any(|b| b.eq_ignore_ascii_case(ext))
+    blocked.iter().any(|b| b.eq_ignore_ascii_case(&ext))
 }
 
 fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {

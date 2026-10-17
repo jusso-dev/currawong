@@ -133,6 +133,15 @@ pub struct ScannerConfig {
     pub treat_macros_as_active: bool,
     pub treat_executables_as_active: bool,
     pub extract: ExtractLimits,
+    /// Linux: refuse to run a worker without Landlock. Turning this off is
+    /// logged as a warning on every worker start.
+    pub require_landlock: bool,
+    /// When the daemon runs as root, workers run as this uid and gid
+    /// (required in that case).
+    pub worker_uid: Option<u32>,
+    pub worker_gid: Option<u32>,
+    /// A message deferred by the scanner this many times is quarantined.
+    pub max_scan_deferrals: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +340,10 @@ impl Default for ScannerConfig {
             treat_macros_as_active: true,
             treat_executables_as_active: true,
             extract: ExtractLimits::default(),
+            require_landlock: true,
+            worker_uid: None,
+            worker_gid: None,
+            max_scan_deferrals: 288,
         }
     }
 }
@@ -606,6 +619,18 @@ impl Config {
         }
         if !self.scanner.clamd.address.is_empty() {
             parse_clamd_address(&self.scanner.clamd.address)?;
+        } else if self.scanner.enabled && self.scanner.clamd.required {
+            return Err(ConfigError::Invalid(
+                "scanner.clamd.address is empty and scanner.clamd.required is true: \
+                 set the clamd address (unix:/path or tcp:host:port), or set \
+                 scanner.clamd.required = false to run without ClamAV"
+                    .into(),
+            ));
+        }
+        if self.scanner.worker_uid.is_some() != self.scanner.worker_gid.is_some() {
+            return Err(ConfigError::Invalid(
+                "scanner.worker_uid and scanner.worker_gid must be set together".into(),
+            ));
         }
         if self.log.format != "json" && self.log.format != "pretty" {
             return Err(ConfigError::Invalid(
@@ -651,7 +676,10 @@ pub fn parse_clamd_address(address: &str) -> Result<(), ConfigError> {
         return Ok(());
     }
     let tcp = address.strip_prefix("tcp:").unwrap_or(address);
-    if tcp.parse::<SocketAddr>().is_err() {
+    let host_port = tcp
+        .rsplit_once(':')
+        .filter(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+    if tcp.parse::<SocketAddr>().is_err() && host_port.is_none() {
         return Err(ConfigError::Invalid(format!(
             "clamd address '{address}' must be unix:/path or tcp:host:port"
         )));
@@ -665,6 +693,18 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn required_clamd_without_an_address_is_a_config_error() {
+        let cfg = Config::default();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("scanner.clamd.address"), "{err}");
+        let mut cfg = Config::default();
+        cfg.scanner.clamd.required = false;
+        cfg.validate().unwrap();
+        cfg.scanner.clamd.address = "tcp:clamd.internal:3310".into();
+        cfg.validate().unwrap();
+    }
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/currawong.example.toml")

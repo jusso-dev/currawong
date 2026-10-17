@@ -51,7 +51,7 @@ fn kill_9(pid: u32) {
 #[tokio::test]
 async fn clamav_fake_detects_eicar_and_clean_mail() {
     let addr = fake_clamd().await;
-    let client = ClamdClient::new(ClamdAddress::Tcp(addr), true);
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true);
     client.ping().await.unwrap();
     let hit = client
         .scan(&ScanItem {
@@ -71,7 +71,7 @@ async fn clamav_fake_detects_eicar_and_clean_mail() {
 
 #[tokio::test]
 async fn required_clamd_down_defers() {
-    let client = ClamdClient::new(ClamdAddress::Tcp("127.0.0.1:1".parse().unwrap()), true);
+    let client = ClamdClient::new(ClamdAddress::Tcp("127.0.0.1:1".into()), true);
     let result = client
         .scan(&ScanItem {
             name: "a",
@@ -105,7 +105,7 @@ async fn clamd_size_limit_reply_fails_closed() {
             .await;
         drop(sock);
     });
-    let client = ClamdClient::new(ClamdAddress::Tcp(addr), true);
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true);
     let body = vec![b'x'; 32 * 1024 * 1024];
     let result = client
         .scan(&ScanItem {
@@ -144,8 +144,8 @@ async fn stalled_clamd_times_out() {
         tokio::time::sleep(Duration::from_secs(60)).await;
         drop(sock);
     });
-    let client =
-        ClamdClient::new(ClamdAddress::Tcp(addr), true).with_timeout(Duration::from_millis(500));
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true)
+        .with_timeout(Duration::from_millis(500));
     let body = vec![b'x'; 16 * 1024 * 1024];
     let result = tokio::time::timeout(
         Duration::from_secs(10),
@@ -160,7 +160,7 @@ async fn stalled_clamd_times_out() {
         matches!(
             result,
             EngineResult::Failed {
-                unreachable: true,
+                unreachable: false,
                 ..
             }
         ),
@@ -188,7 +188,7 @@ async fn clamd_reply_is_read_to_the_terminator() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         sock.write_all(b"-Signature FOUND\0").await.unwrap();
     });
-    let client = ClamdClient::new(ClamdAddress::Tcp(addr), true);
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true);
     let result = client
         .scan(&ScanItem {
             name: "a",
@@ -232,7 +232,7 @@ async fn extracted_parts_are_sent_to_clamd() {
     else {
         panic!("worker failed");
     };
-    let client = ClamdClient::new(ClamdAddress::Tcp(fake_clamd().await), true);
+    let client = ClamdClient::new(ClamdAddress::Tcp(fake_clamd().await.to_string()), true);
     let raw_only = client.scan_message(raw.as_bytes(), &[]).await;
     assert_eq!(raw_only, EngineResult::Clean);
     let with_parts = client.scan_message(raw.as_bytes(), &parsed.parts).await;
@@ -247,9 +247,13 @@ async fn extracted_parts_are_sent_to_clamd() {
 async fn pool_crash_fails_closed_and_live_worker_parses() {
     let dir = tempfile::tempdir().unwrap();
     let path = message_file(&dir, "msg.eml", PLAIN);
+    // A worker that exits before it is ready is an infrastructure fault.
     let crashed = WorkerPool::new("/usr/bin/false", 2, 10);
     let failed = crashed.scan_file("1", &path, &limits()).await;
-    assert!(matches!(failed, ScanOutcome::Failed { .. }), "{failed:?}");
+    assert!(
+        matches!(failed, ScanOutcome::Unavailable { .. }),
+        "{failed:?}"
+    );
 
     let pool = WorkerPool::new(worker_bin(), 10, 500);
     let parsed = pool.scan_file("2", &path, &limits()).await;
@@ -340,7 +344,7 @@ async fn worker_does_not_inherit_the_daemon_environment() {
     let path = message_file(&dir, "msg.eml", PLAIN);
     let pool = WorkerPool::new(&script, 5, 10);
     let outcome = pool.scan_file("1", &path, &limits()).await;
-    assert!(matches!(outcome, ScanOutcome::Failed { .. }));
+    assert!(!matches!(outcome, ScanOutcome::Parsed(_)));
     let env = std::fs::read_to_string(&dump).unwrap();
     assert!(env.contains("CURRAWONG_WORKER_AS_MIB"), "{env}");
     assert!(!env.contains("CURRAWONG_TEST_SECRET"), "{env}");
@@ -376,6 +380,7 @@ async fn decompression_bomb_hits_the_memory_limit() {
     let outcome = pool.scan_file("bomb", &path, &unbounded).await;
     match &outcome {
         ScanOutcome::Failed { .. } => {}
+        ScanOutcome::Unavailable { reason } => panic!("{reason}"),
         ScanOutcome::Parsed(parsed) => assert!(
             parsed
                 .parts
@@ -387,6 +392,254 @@ async fn decompression_bomb_hits_the_memory_limit() {
     let small = message_file(&dir, "small.eml", PLAIN);
     let next = pool.scan_file("small", &small, &limits()).await;
     assert!(matches!(next, ScanOutcome::Parsed(_)), "{next:?}");
+}
+
+fn script(dir: &tempfile::TempDir, body: &str) -> PathBuf {
+    let path = dir.path().join("worker.sh");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A worker that becomes ready, then answers the first request with a part
+/// path of its choosing. The environment is cleared, so commands need full
+/// paths.
+const LYING_WORKER: &str = r#"
+emit() { n=$(printf %s "$1" | /usr/bin/wc -c); n=$((n)); printf "\\$(printf %03o $((n>>24&255)))\\$(printf %03o $((n>>16&255)))\\$(printf %03o $((n>>8&255)))\\$(printf %03o $((n&255)))"; printf %s "$1"; }
+emit '{"id":"ready","parts":[],"urls":[],"error":null}'
+/usr/bin/head -c 4 >/dev/null
+SETUP
+P="PART_PATH"
+emit "{\"id\":\"evil\",\"parts\":[{\"content_type\":\"text/plain\",\"filename\":null,\"size\":1,\"sha256\":\"x\",\"flags\":[],\"path\":\"$P\"}],\"urls\":[],\"error\":null}"
+/bin/sleep 5
+"#;
+
+async fn lying_worker_outcome(setup: &str, part_path: &str) -> (ScanOutcome, usize) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = message_file(&dir, "msg.eml", PLAIN);
+    let worker = script(
+        &dir,
+        &LYING_WORKER
+            .replace("SETUP", setup)
+            .replace("PART_PATH", part_path),
+    );
+    let pool = WorkerPool::new(&worker, 5, 10).with_work_dir(dir.path());
+    let dest = dir.path().join("dest");
+    std::fs::create_dir(&dest).unwrap();
+    let outcome = pool
+        .scan_file_into("evil", &path, &limits(), Some(&dest))
+        .await;
+    (outcome, std::fs::read_dir(&dest).unwrap().count())
+}
+
+#[tokio::test]
+async fn part_paths_outside_the_output_directory_are_refused() {
+    let (outcome, copied) = lying_worker_outcome("", "/etc/passwd").await;
+    assert!(
+        matches!(&outcome, ScanOutcome::Failed { reason } if reason.contains("outside")),
+        "{outcome:?}"
+    );
+    assert_eq!(copied, 0);
+}
+
+#[tokio::test]
+async fn symlinked_parts_are_refused() {
+    let (outcome, copied) = lying_worker_outcome(
+        r#"/bin/ln -s /etc/passwd "$CURRAWONG_WORKER_DIR/out/0000.part""#,
+        "$CURRAWONG_WORKER_DIR/out/0000.part",
+    )
+    .await;
+    assert!(
+        matches!(&outcome, ScanOutcome::Failed { reason } if reason.contains("part")),
+        "{outcome:?}"
+    );
+    assert_eq!(copied, 0);
+}
+
+#[tokio::test]
+async fn honest_worker_part_is_copied_and_rehashed() {
+    let (outcome, copied) = lying_worker_outcome(
+        r#"printf hello > "$CURRAWONG_WORKER_DIR/out/0000.part""#,
+        "$CURRAWONG_WORKER_DIR/out/0000.part",
+    )
+    .await;
+    let ScanOutcome::Parsed(parsed) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(copied, 1);
+    // The supervisor's own hash, not the worker's "x".
+    assert_eq!(
+        parsed.parts[0].sha256,
+        "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+    );
+}
+
+/// A worker that never becomes ready is killed at the timeout and the
+/// message is deferred, not judged.
+#[tokio::test]
+async fn hung_worker_at_startup_times_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = message_file(&dir, "msg.eml", PLAIN);
+    let worker = script(&dir, "/bin/sleep 60");
+    let pool = WorkerPool::new(&worker, 1, 10).with_work_dir(dir.path());
+    let started = std::time::Instant::now();
+    let outcome = pool.scan_file("1", &path, &limits()).await;
+    assert!(
+        matches!(outcome, ScanOutcome::Unavailable { .. }),
+        "{outcome:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(pool.worker_pids().is_empty());
+}
+
+/// A worker busy past the job timeout is killed and the message fails closed.
+#[tokio::test]
+async fn hung_worker_mid_job_times_out_and_is_replaced() {
+    let member = {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        enc.write_all(&vec![0u8; 1024 * 1024]).unwrap();
+        enc.finish().unwrap()
+    };
+    let bomb: Vec<u8> = std::iter::repeat_n(member, 1024).flatten().collect();
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bomb);
+    let raw = format!(
+        "From: a@example.test\r\nTo: b@example.test\r\nSubject: slow\r\nMIME-Version: 1.0\r\nContent-Type: application/gzip; name=\"zeros.gz\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{encoded}\r\n"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let slow = message_file(&dir, "slow.eml", raw.as_bytes());
+    let slow_limits = ExtractLimits {
+        max_uncompressed_bytes: 2 * 1024 * 1024 * 1024,
+        max_ratio: u32::MAX,
+        ..limits()
+    };
+    let pool = WorkerPool::new(worker_bin(), 1, 500);
+    let outcome = pool.scan_file("slow", &slow, &slow_limits).await;
+    assert!(
+        matches!(&outcome, ScanOutcome::Failed { reason } if reason.contains("timed out")),
+        "{outcome:?}"
+    );
+    assert!(pool.worker_pids().is_empty());
+    let small = message_file(&dir, "small.eml", PLAIN);
+    let next = pool.scan_file("small", &small, &limits()).await;
+    assert!(matches!(next, ScanOutcome::Parsed(_)), "{next:?}");
+}
+
+/// mail-parser recurses per nested message: 50,000 levels would overflow
+/// the stack. The worker refuses it before parsing and stays up.
+#[tokio::test]
+async fn deeply_nested_message_is_refused_by_the_worker() {
+    let mut raw = String::new();
+    for _ in 0..50_000 {
+        raw.push_str("From: a@example.test\r\nContent-Type: message/rfc822\r\n\r\n");
+    }
+    raw.push_str("From: a@example.test\r\nSubject: bottom\r\n\r\nhello\r\n");
+    let dir = tempfile::tempdir().unwrap();
+    let deep = message_file(&dir, "deep.eml", raw.as_bytes());
+    let pool = WorkerPool::new(worker_bin(), 30, 500);
+    let outcome = pool.scan_file("deep", &deep, &limits()).await;
+    assert!(
+        matches!(&outcome, ScanOutcome::Failed { reason } if reason.contains("nesting limit")),
+        "{outcome:?}"
+    );
+    let pid = pool.worker_pids();
+    assert_eq!(pid.len(), 1, "worker should still be running");
+    let small = message_file(&dir, "small.eml", PLAIN);
+    let next = pool.scan_file("small", &small, &limits()).await;
+    assert!(matches!(next, ScanOutcome::Parsed(_)), "{next:?}");
+    assert_eq!(pool.worker_pids(), pid);
+}
+
+/// One deadline for the whole message, and no more streams after clamd
+/// stops answering.
+#[tokio::test]
+async fn clamd_gets_one_deadline_per_message_and_stops_when_unreachable() {
+    use currawong_core::PartInfo;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let dir = tempfile::tempdir().unwrap();
+    let parts: Vec<PartInfo> = (0..5)
+        .map(|i| {
+            let path = dir.path().join(format!("{i}.part"));
+            std::fs::write(&path, format!("part {i}")).unwrap();
+            PartInfo {
+                content_type: "text/plain".into(),
+                filename: None,
+                size: 6,
+                sha256: format!("{i}"),
+                flags: Vec::new(),
+                path: Some(path.to_string_lossy().to_string()),
+            }
+        })
+        .collect();
+
+    // Slow but honest: 300 ms per stream against a 700 ms deadline.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                while !buf.ends_with(&[0, 0, 0, 0]) {
+                    let Ok(n) = sock.read(&mut tmp).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let _ = sock.write_all(b"stream: OK\0").await;
+            });
+        }
+    });
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true)
+        .with_timeout(Duration::from_millis(700));
+    let started = std::time::Instant::now();
+    let result = client.scan_message(b"raw", &parts).await;
+    assert!(
+        matches!(
+            result,
+            EngineResult::Failed {
+                unreachable: false,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    // Hangs up on every stream: one attempt, then stop.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&seen);
+    tokio::spawn(async move {
+        while let Ok((sock, _)) = listener.accept().await {
+            counter.fetch_add(1, Ordering::SeqCst);
+            drop(sock);
+        }
+    });
+    let client = ClamdClient::new(ClamdAddress::Tcp(addr.to_string()), true);
+    let result = client.scan_message(b"raw", &parts).await;
+    assert!(
+        matches!(
+            result,
+            EngineResult::Failed {
+                unreachable: true,
+                ..
+            }
+        ),
+        "{result:?}"
+    );
+    assert_eq!(seen.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn clamd_host_names_are_accepted() {
+    let address = ClamdAddress::parse("tcp:clamd.internal:3310").unwrap();
+    assert_eq!(address.host(), Some("clamd.internal"));
+    assert!(ClamdAddress::parse("tcp:clamd.internal").is_err());
 }
 
 #[test]

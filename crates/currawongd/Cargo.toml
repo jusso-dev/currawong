@@ -23,8 +23,13 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 tempfile = { workspace = true }
+futures = { workspace = true }
+url = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 flate2 = { workspace = true }

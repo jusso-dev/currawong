@@ -54,6 +54,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
 tar = "0.4"
 cfb = "0.10"
+landlock = "0.4"
 sevenz-rust2 = { version = "0.24", default-features = false, features = ["aes256"] }
 tempfile = "3"
 http = "1"

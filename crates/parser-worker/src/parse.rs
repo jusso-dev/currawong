@@ -4,12 +4,18 @@ use crate::filetype::{self, FileKind};
 use crate::ipc::{ParseRequest, ParseResponse};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
-use mail_parser::{Message, MessageParser, MimeHeaders, PartType};
+use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders, PartType};
+use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
 
 /// URLs reported per message. Keeps the response frame bounded.
 const MAX_URLS: usize = 512;
+/// mail-parser recurses per nested message and multipart; past these the
+/// message is refused before it is parsed (a deep stack would overflow).
+const MAX_NESTED_MESSAGES: usize = 32;
+const MAX_MULTIPARTS: usize = 512;
 
 pub fn parse_request(req: &ParseRequest) -> ParseResponse {
     let raw = match fs::read(&req.raw_path) {
@@ -36,6 +42,9 @@ pub fn parse_with(
     limits: &ExtractLimits,
     out_dir: Option<&Path>,
 ) -> ParseResponse {
+    if let Some(reason) = nesting_limit(raw) {
+        return ParseResponse::failed(id, reason);
+    }
     let Some(message) = MessageParser::default().with_mime_headers().parse(raw) else {
         return ParseResponse::failed(id, "message has no headers");
     };
@@ -67,6 +76,7 @@ pub fn parse_with(
         parts: walk.parts,
         urls,
         error: None,
+        warnings: Vec::new(),
     }
 }
 
@@ -96,7 +106,7 @@ impl Walk {
                 Some(sub) => format!("{}/{}", ct.c_type, sub).to_ascii_lowercase(),
                 None => ct.c_type.to_ascii_lowercase(),
             });
-            let bytes = part.contents();
+            let bytes = &*part_bytes(message, part);
             if let PartType::Message(inner) = &part.body {
                 let entry = self
                     .budget
@@ -144,6 +154,45 @@ impl Walk {
         );
         self.parts.push(part);
     }
+}
+
+/// A cheap count before mail-parser sees the message.
+pub fn nesting_limit(raw: &[u8]) -> Option<String> {
+    let count = |needle: &[u8]| {
+        raw.windows(needle.len())
+            .filter(|window| window.eq_ignore_ascii_case(needle))
+            .count()
+    };
+    let messages = count(b"message/rfc822") + count(b"message/global");
+    if messages > MAX_NESTED_MESSAGES {
+        return Some(format!(
+            "nesting limit: {messages} attached messages (limit {MAX_NESTED_MESSAGES})"
+        ));
+    }
+    let multiparts = count(b"multipart/");
+    if multiparts > MAX_MULTIPARTS {
+        return Some(format!(
+            "nesting limit: {multiparts} multipart sections (limit {MAX_MULTIPARTS})"
+        ));
+    }
+    None
+}
+
+/// The bytes the AV engines should see. Text parts are decoded from their
+/// transfer encoding only, not converted to UTF-8, which could lose bytes.
+fn part_bytes<'a>(message: &'a Message<'a>, part: &'a MessagePart<'a>) -> Cow<'a, [u8]> {
+    if !matches!(part.body, PartType::Text(_) | PartType::Html(_)) {
+        return Cow::Borrowed(part.contents());
+    }
+    let raw = message
+        .raw_message
+        .get(part.offset_body as usize..part.offset_end as usize);
+    let decoded = raw.and_then(|raw| match part.encoding {
+        Encoding::Base64 => base64_decode(raw),
+        Encoding::QuotedPrintable => quoted_printable_decode(raw),
+        Encoding::None => Some(raw.to_vec()),
+    });
+    decoded.map_or(Cow::Borrowed(part.contents()), Cow::Owned)
 }
 
 /// Executable content declared as something else (a PE sent as

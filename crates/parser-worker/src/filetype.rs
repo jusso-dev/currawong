@@ -91,6 +91,20 @@ pub fn detect(bytes: &[u8]) -> FileKind {
             executable: false,
         };
     }
+    if let Some(label) = opaque_container(bytes) {
+        return FileKind {
+            label: label.into(),
+            executable: false,
+        };
+    }
+    // A zip appended to something else (a polyglot, or a self-extractor
+    // that is not a PE) is still opened as a zip.
+    if has_trailing_zip(bytes) {
+        return FileKind {
+            label: "application/zip".into(),
+            executable: false,
+        };
+    }
     if let Some(kind) = infer::get(bytes) {
         let executable = matches!(kind.extension(), "exe" | "dll" | "elf" | "so" | "dylib");
         return FileKind {
@@ -104,10 +118,119 @@ pub fn detect(bytes: &[u8]) -> FileKind {
     }
 }
 
+/// Containers that are recognised and not unpacked. They cannot be
+/// inspected, so they fail closed.
+fn opaque_container(bytes: &[u8]) -> Option<&'static str> {
+    let at = |offset: usize, magic: &[u8]| bytes.get(offset..offset + magic.len()) == Some(magic);
+    let tail = |magic: &[u8]| bytes.len() >= 512 && bytes[bytes.len() - 512..].starts_with(magic);
+    if at(0, b"BZh") && bytes.get(3).is_some_and(u8::is_ascii_digit) {
+        return Some("application/x-bzip2");
+    }
+    if at(0, &[0xfd, b'7', b'z', b'X', b'Z', 0]) {
+        return Some("application/x-xz");
+    }
+    if at(0, &[0x28, 0xb5, 0x2f, 0xfd]) {
+        return Some("application/zstd");
+    }
+    if at(0, b"MSCF\0\0\0\0") {
+        return Some("application/vnd.ms-cab-compressed");
+    }
+    if at(0, &[0x60, 0xea]) {
+        return Some("application/x-arj");
+    }
+    if at(2, b"-lh") && bytes.get(6) == Some(&b'-') {
+        return Some("application/x-lzh-compressed");
+    }
+    if at(7, b"**ACE**") {
+        return Some("application/x-ace-compressed");
+    }
+    if at(0, b"LZIP") || at(0, &[0x1f, 0x9d]) {
+        return Some("application/x-compress");
+    }
+    if at(0, b"MSWIM\0\0\0") {
+        return Some("application/x-ms-wim");
+    }
+    if at(0, b"vhdxfile") || at(0, b"conectix") || tail(b"conectix") {
+        return Some("application/x-vhd");
+    }
+    if tail(b"koly") {
+        return Some("application/x-apple-diskimage");
+    }
+    let udf = (0x8001..0x10001)
+        .step_by(2048)
+        .any(|offset| at(offset, b"BEA01") || at(offset, b"NSR02") || at(offset, b"NSR03"));
+    if udf {
+        return Some("application/x-udf-image");
+    }
+    None
+}
+
+/// A zip end-of-central-directory record near the end of a blob that does
+/// not start like a zip.
+fn has_trailing_zip(bytes: &[u8]) -> bool {
+    let start = bytes.len().saturating_sub(65_557);
+    bytes.len() >= 22
+        && bytes[start..]
+            .windows(4)
+            .any(|window| window == b"PK\x05\x06")
+}
+
+pub fn is_archive(kind: &FileKind) -> bool {
+    matches!(
+        kind.label.as_str(),
+        "application/zip"
+            | "application/gzip"
+            | "application/x-tar"
+            | "application/x-iso9660-image"
+            | "application/x-7z-compressed"
+            | "application/vnd.rar"
+            | "application/x-bzip2"
+            | "application/x-xz"
+            | "application/zstd"
+            | "application/vnd.ms-cab-compressed"
+            | "application/x-arj"
+            | "application/x-lzh-compressed"
+            | "application/x-ace-compressed"
+            | "application/x-compress"
+            | "application/x-ms-wim"
+            | "application/x-vhd"
+            | "application/x-apple-diskimage"
+            | "application/x-udf-image"
+    )
+}
+
+/// Extensions of archives and disk images. A file named like one whose
+/// content is not a container we can open cannot be inspected.
+const CONTAINER_EXTENSIONS: &[&str] = &[
+    "zip", "7z", "rar", "gz", "tgz", "tar", "iso", "bz2", "tbz", "tbz2", "xz", "txz", "zst",
+    "tzst", "cab", "arj", "lzh", "lha", "ace", "img", "vhd", "vhdx", "udf", "dmg", "wim", "z",
+    "lz", "lzma",
+];
+
+/// The extension Windows would act on: last path component, before any
+/// `:stream` suffix, with trailing dots, spaces and control characters
+/// removed (Windows drops them), in lower case.
+pub fn file_extension(name: &str) -> Option<String> {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    let base = base.split(':').next().unwrap_or(base);
+    let base = base.trim_end_matches(|c: char| c == '.' || c.is_whitespace() || c.is_control());
+    let (_, ext) = base.rsplit_once('.')?;
+    let ext = ext.trim();
+    (!ext.is_empty()).then(|| ext.to_ascii_lowercase())
+}
+
 pub fn flags_for(bytes: &[u8], filename: Option<&str>, kind: &FileKind) -> Vec<PartFlag> {
     let mut flags = Vec::new();
     if kind.executable {
         flags.push(PartFlag::Executable);
+    }
+    let ext = filename.and_then(file_extension);
+    if !is_archive(kind)
+        && ext
+            .as_deref()
+            .is_some_and(|e| CONTAINER_EXTENSIONS.contains(&e))
+    {
+        flags.push(PartFlag::Unscannable);
     }
     if extension_mismatch(filename, kind) {
         flags.push(PartFlag::ExtMismatch);
@@ -127,11 +250,9 @@ pub fn flags_for(bytes: &[u8], filename: Option<&str>, kind: &FileKind) -> Vec<P
 }
 
 fn extension_mismatch(filename: Option<&str>, kind: &FileKind) -> bool {
-    let Some(name) = filename else { return false };
-    let ext = name.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
-    if ext.is_empty() || ext == name.to_ascii_lowercase() {
+    let Some(ext) = filename.and_then(file_extension) else {
         return false;
-    }
+    };
     let expected = match kind.label.as_str() {
         "application/vnd.microsoft.portable-executable"
         | "application/x-elf"

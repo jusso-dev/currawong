@@ -11,12 +11,13 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    time::timeout,
+    time::{timeout_at, Instant},
 };
 
 #[derive(Debug, Clone)]
 pub enum ClamdAddress {
-    Tcp(std::net::SocketAddr),
+    /// `host:port`; names are resolved when connecting.
+    Tcp(String),
     Unix(PathBuf),
 }
 
@@ -26,12 +27,26 @@ impl ClamdAddress {
             return Ok(Self::Unix(PathBuf::from(path)));
         }
         if let Some(addr) = text.strip_prefix("tcp:") {
-            let addr = addr
-                .parse()
-                .map_err(|err| format!("clamd tcp address: {err}"))?;
-            return Ok(Self::Tcp(addr));
+            let valid = addr.parse::<std::net::SocketAddr>().is_ok()
+                || addr
+                    .rsplit_once(':')
+                    .is_some_and(|(host, port)| !host.is_empty() && port.parse::<u16>().is_ok());
+            if !valid {
+                return Err(format!("clamd tcp address {addr:?} is not host:port"));
+            }
+            return Ok(Self::Tcp(addr.to_string()));
         }
         Err("clamd address must start with unix: or tcp:".into())
+    }
+
+    /// The host of a TCP address, for the residency check.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            Self::Tcp(addr) => addr
+                .rsplit_once(':')
+                .map(|(host, _)| host.trim_start_matches('[').trim_end_matches(']')),
+            Self::Unix(_) => None,
+        }
     }
 }
 
@@ -39,13 +54,21 @@ pub struct ClamdClient {
     pub address: ClamdAddress,
     pub required: bool,
     pub chunk: usize,
-    /// Whole exchange: connect, send and the terminated reply. A stalled
-    /// clamd is treated as unreachable.
+    /// Deadline for one message: the raw stream and every extracted part.
     pub timeout: Duration,
 }
 
 /// Longest reply read from clamd. Real replies are a line.
 const MAX_REPLY: usize = 4096;
+/// A clamd that does not accept a connection in this time is unreachable.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `unreachable`: clamd could not be reached (defer). Otherwise clamd was
+/// reached and did not finish the scan (fail closed).
+struct ClamdError {
+    reason: String,
+    unreachable: bool,
+}
 
 impl ClamdClient {
     pub fn new(address: ClamdAddress, required: bool) -> Self {
@@ -63,7 +86,11 @@ impl ClamdClient {
     }
 
     pub async fn ping(&self) -> Result<(), String> {
-        let reply = self.round_trip(b"zPING\0", &[]).await?;
+        let deadline = Instant::now() + self.timeout.min(CONNECT_TIMEOUT);
+        let reply = self
+            .round_trip(b"zPING\0", &[], deadline)
+            .await
+            .map_err(|err| err.reason)?;
         if reply == "PONG" {
             Ok(())
         } else {
@@ -72,17 +99,21 @@ impl ClamdClient {
     }
 
     /// The raw message, then every distinct part the parser worker wrote to
-    /// disk (decoded attachments and archive members).
+    /// disk (decoded attachments and archive members), all under one
+    /// deadline. Stops at the first malware or unreachable result.
     pub async fn scan_message(&self, raw: &[u8], parts: &[PartInfo]) -> EngineResult {
-        let mut result = self
-            .scan(&ScanItem {
-                name: "message.eml",
-                bytes: raw,
-            })
-            .await;
+        let deadline = Instant::now() + self.timeout;
+        let mut result = self.scan_until(raw, deadline).await;
         let mut seen = HashSet::new();
         for part in parts {
-            if matches!(result, EngineResult::Malware { .. }) {
+            if matches!(
+                result,
+                EngineResult::Malware { .. }
+                    | EngineResult::Failed {
+                        unreachable: true,
+                        ..
+                    }
+            ) {
                 break;
             }
             let Some(path) = &part.path else { continue };
@@ -90,13 +121,7 @@ impl ClamdClient {
                 continue;
             }
             let next = match tokio::fs::read(path).await {
-                Ok(bytes) => {
-                    self.scan(&ScanItem {
-                        name: part.filename.as_deref().unwrap_or("part"),
-                        bytes: &bytes,
-                    })
-                    .await
-                }
+                Ok(bytes) => self.scan_until(&bytes, deadline).await,
                 Err(err) => EngineResult::Failed {
                     reason: format!("read extracted part: {err}"),
                     unreachable: false,
@@ -109,30 +134,64 @@ impl ClamdClient {
         result
     }
 
-    async fn instream(&self, bytes: &[u8]) -> Result<String, String> {
-        self.round_trip(b"zINSTREAM\0", bytes).await
+    async fn scan_until(&self, bytes: &[u8], deadline: Instant) -> EngineResult {
+        match self.round_trip(b"zINSTREAM\0", bytes, deadline).await {
+            Ok(reply) => classify(&reply),
+            Err(err) => EngineResult::Failed {
+                reason: err.reason,
+                unreachable: err.unreachable,
+            },
+        }
     }
 
-    async fn round_trip(&self, command: &[u8], body: &[u8]) -> Result<String, String> {
-        let exchange = async {
-            match &self.address {
-                ClamdAddress::Tcp(addr) => {
-                    let stream = TcpStream::connect(addr)
-                        .await
-                        .map_err(|err| format!("clamd connect: {err}"))?;
-                    exchange(stream, command, body, self.chunk).await
-                }
-                ClamdAddress::Unix(path) => {
-                    let stream = tokio::net::UnixStream::connect(path)
-                        .await
-                        .map_err(|err| format!("clamd connect: {err}"))?;
-                    exchange(stream, command, body, self.chunk).await
-                }
+    async fn round_trip(
+        &self,
+        command: &[u8],
+        body: &[u8],
+        deadline: Instant,
+    ) -> Result<String, ClamdError> {
+        let unreachable = |reason: String| ClamdError {
+            reason,
+            unreachable: true,
+        };
+        let late = || ClamdError {
+            reason: "clamd did not finish the scan in time".into(),
+            unreachable: false,
+        };
+        if Instant::now() >= deadline {
+            return Err(late());
+        }
+        let connect_by = deadline.min(Instant::now() + CONNECT_TIMEOUT);
+        let connect_timed_out = || {
+            if Instant::now() >= deadline {
+                late()
+            } else {
+                unreachable("clamd connect timed out".into())
             }
         };
-        timeout(self.timeout, exchange)
-            .await
-            .map_err(|_| "clamd timed out".to_string())?
+        let exchange = match &self.address {
+            ClamdAddress::Tcp(addr) => {
+                let stream = timeout_at(connect_by, TcpStream::connect(addr.as_str()))
+                    .await
+                    .map_err(|_| connect_timed_out())?
+                    .map_err(|err| unreachable(format!("clamd connect: {err}")))?;
+                timeout_at(deadline, exchange(stream, command, body, self.chunk)).await
+            }
+            ClamdAddress::Unix(path) => {
+                let stream = timeout_at(connect_by, tokio::net::UnixStream::connect(path))
+                    .await
+                    .map_err(|_| connect_timed_out())?
+                    .map_err(|err| unreachable(format!("clamd connect: {err}")))?;
+                timeout_at(deadline, exchange(stream, command, body, self.chunk)).await
+            }
+        };
+        match exchange {
+            Ok(Ok(reply)) => Ok(reply),
+            // Connected and then lost: clamd went away, try again later.
+            Ok(Err(reason)) => Err(unreachable(reason)),
+            // Connected and stalled: do not keep retrying the same message.
+            Err(_) => Err(late()),
+        }
     }
 }
 
@@ -237,13 +296,8 @@ impl Scanner for ClamdClient {
     }
 
     async fn scan(&self, item: &ScanItem<'_>) -> EngineResult {
-        match self.instream(item.bytes).await {
-            Ok(reply) => classify(&reply),
-            Err(reason) => EngineResult::Failed {
-                reason,
-                unreachable: true,
-            },
-        }
+        self.scan_until(item.bytes, Instant::now() + self.timeout)
+            .await
     }
 }
 

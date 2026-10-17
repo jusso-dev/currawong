@@ -227,7 +227,7 @@ async fn inbound_tenant_comes_from_each_recipient_domain() {
         Scope::Tenant,
         vec![Action::Quarantine("t1".into())],
     );
-    let mut pipeline = pipeline(config(dir.path()), with(vec![hold]));
+    let pipeline = pipeline(config(dir.path()), with(vec![hold]));
     // MX mail: no tenant on the envelope.
     let env = envelope(ID, &["a@example.test", "b@other.test", "c@nobody.test"]);
     let (_, decision) = pipeline.assess(&env, RAW, None).await;
@@ -259,7 +259,7 @@ async fn submitted_mail_to_a_local_mailbox_is_scoped_by_that_mailbox() {
         Scope::User("colleague@example.test".into()),
         vec![Action::Quarantine("review".into())],
     );
-    let mut pipeline = pipeline(config(dir.path()), with(vec![hold]));
+    let pipeline = pipeline(config(dir.path()), with(vec![hold]));
     let mut env = envelope(ID, &["colleague@example.test", "partner@elsewhere.test"]);
     env.direction = Direction::Outbound;
     env.tenant_id = Some("t1".into());

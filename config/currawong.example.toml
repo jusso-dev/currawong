@@ -59,7 +59,14 @@ cert = "/etc/currawong/cert.pem"
 key = "/etc/currawong/key.pem"
 
 # scanner.enabled: isolated parser workers and the malware engines.
-# scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
+# scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp
+#   and Landlock.
+# scanner.require_landlock: Linux workers refuse to start without Landlock.
+#   false runs them unconfined on old kernels, with a warning on every start.
+# scanner.worker_uid / worker_gid: required when currawongd runs as root;
+#   workers then run as this user.
+# scanner.max_scan_deferrals: a message the scanner keeps deferring (no
+#   worker, clamd down) is quarantined after this many tries (5 minutes apart).
 #   worker_cpu_secs is per job. worker_binary (optional) is the path to
 #   currawong-parser-worker; by default it sits next to currawongd, and the
 #   daemon refuses to start without it.
@@ -81,6 +88,8 @@ max_jobs_per_worker = 500
 worker_memory_mib = 512
 worker_cpu_secs = 30
 job_timeout_secs = 30
+require_landlock = true
+max_scan_deferrals = 288
 blocked_extensions = [
   "exe", "scr", "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "lnk", "iso",
   "one", "bat", "cmd", "com", "msi", "dll", "ps1", "jar", "cpl", "msc", "reg",

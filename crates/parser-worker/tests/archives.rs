@@ -119,6 +119,14 @@ fn zip_entry_with_a_lying_size_header_is_flagged() {
         extracted.parts
     );
     assert!(!extracted.parts.iter().any(|p| p.flags.is_empty()));
+    // The root carries the verdict, and no truncated member is reported.
+    assert_eq!(extracted.parts[0].filename.as_deref(), Some("bomb.zip"));
+    assert!(!extracted
+        .parts
+        .iter()
+        .any(|p| p.filename.as_deref() == Some("zeros.bin")
+            && p.size as usize >= 8 * 1024
+            && !p.flags.contains(&PartFlag::LimitExceeded)));
 }
 
 #[test]

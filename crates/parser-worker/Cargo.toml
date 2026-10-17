@@ -37,7 +37,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-seccompiler = "0.4"
+landlock = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

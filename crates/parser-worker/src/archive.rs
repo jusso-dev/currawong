@@ -222,15 +222,7 @@ fn add(flags: &mut Vec<PartFlag>, flag: PartFlag) {
 }
 
 pub fn is_archive(kind: &FileKind) -> bool {
-    matches!(
-        kind.label.as_str(),
-        "application/zip"
-            | "application/gzip"
-            | "application/x-tar"
-            | "application/x-iso9660-image"
-            | "application/x-7z-compressed"
-            | "application/vnd.rar"
-    )
+    filetype::is_archive(kind)
 }
 
 fn unzip(
@@ -398,6 +390,15 @@ fn untar(
     }
 }
 
+/// Body-text passwords tried on one 7z archive. Each try runs the archive's
+/// key derivation (2^NumCyclesPower SHA-256 rounds), so it is capped by
+/// count, by time and by the declared cost.
+const MAX_7Z_GUESSES: usize = 4;
+const MAX_7Z_GUESS_TIME: std::time::Duration = std::time::Duration::from_secs(3);
+/// 7-Zip's own default; anything above it is refused for guessing.
+const MAX_7Z_CYCLES_POWER: u8 = 19;
+const AES_7Z: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
+
 fn un7z(
     bytes: &[u8],
     passwords: &[String],
@@ -407,10 +408,18 @@ fn un7z(
 ) {
     use sevenz_rust2::{Error, Password};
     let start = parts.len();
-    let candidates = std::iter::once(Password::empty())
-        .chain(passwords.iter().take(32).map(|p| Password::new(p)))
-        .collect::<Vec<_>>();
-    for password in candidates {
+    let deadline = std::time::Instant::now() + MAX_7Z_GUESS_TIME;
+    let candidates = std::iter::once(Password::empty()).chain(
+        passwords
+            .iter()
+            .take(MAX_7Z_GUESSES)
+            .map(|p| Password::new(p)),
+    );
+    let costly = aes_cycles_power(bytes).is_some_and(|power| power > MAX_7Z_CYCLES_POWER);
+    for (attempt, password) in candidates.enumerate() {
+        if attempt > 0 && (costly || std::time::Instant::now() > deadline) {
+            break;
+        }
         parts.truncate(start);
         match un7z_with(bytes, password, passwords, budget, parts) {
             Ok(()) => return,
@@ -432,6 +441,24 @@ fn un7z(
         }
     }
     parts.truncate(start);
+}
+
+/// Highest AES NumCyclesPower named in the archive's header, read before
+/// any key derivation. The header itself may be encrypted, so the coder
+/// records (`flags, 06 F1 07 01, prop size, props...`) are found by search.
+fn aes_cycles_power(bytes: &[u8]) -> Option<u8> {
+    let le = |range: std::ops::Range<usize>| -> Option<usize> {
+        let raw: [u8; 8] = bytes.get(range)?.try_into().ok()?;
+        usize::try_from(u64::from_le_bytes(raw)).ok()
+    };
+    let start = 32usize.checked_add(le(12..20)?)?;
+    let end = start.checked_add(le(20..28)?)?.min(bytes.len());
+    let header = bytes.get(start..end)?;
+    header
+        .windows(AES_7Z.len() + 2)
+        .filter(|window| window.starts_with(AES_7Z) && window[AES_7Z.len()] > 0)
+        .map(|window| window[AES_7Z.len() + 1] & 0x3f)
+        .max()
 }
 
 fn un7z_with(

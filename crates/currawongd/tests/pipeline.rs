@@ -150,6 +150,8 @@ name = "in"
 bind = "127.0.0.1:2525"
 mode = "plain"
 role = "inbound"
+[scanner.clamd]
+required = false
 [residency]
 content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
 "#,
@@ -170,15 +172,113 @@ async fn verdict_for(cfg: Config, raw: &[u8]) -> (currawong_core::ScanReport, Ve
         .await
 }
 
-/// No in-daemon fallback: without a worker the message fails closed.
+/// No in-daemon fallback: without a worker the message is not parsed. That
+/// is an infrastructure fault, so it is deferred rather than judged.
 #[tokio::test]
-async fn missing_worker_fails_closed() {
+async fn missing_worker_defers() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = scan_config(&dir);
     cfg.scanner.worker_binary = Some(dir.path().join("no-such-worker"));
     let (report, verdict) = verdict_for(cfg, &text_message()).await;
-    assert!(report.fail_closed, "{report:?}");
+    assert!(report.defer && !report.fail_closed, "{report:?}");
+    assert!(matches!(verdict, Verdict::Defer { .. }), "{verdict:?}");
+}
+
+/// A message the scanner keeps deferring is quarantined after the cap.
+#[tokio::test]
+async fn repeated_scan_deferrals_end_in_quarantine() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = scan_config(&dir);
+    cfg.scanner.worker_binary = Some(dir.path().join("no-such-worker"));
+    cfg.scanner.max_scan_deferrals = 2;
+    let spool = Spool::open(&cfg.spool.dir).await.unwrap();
+    let mut env = envelope("a@example.test");
+    env.attempts = 2;
+    spool
+        .accept(env.clone(), Cursor::new(text_message()))
+        .await
+        .unwrap();
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let held = QuarantineStore::open(dir.path().join("held")).unwrap();
+    classify_pending(&spool, &mut pipeline, &held)
+        .await
+        .unwrap();
+    let env = spool.load(&env.id).await.unwrap();
+    assert_eq!(env.pipeline, "quarantine", "{env:?}");
+}
+
+/// Windows ignores trailing dots and spaces; the block list must too.
+#[tokio::test]
+async fn blocked_extension_with_trailing_dot_is_caught() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = with_attachment("run.js.", "text/plain", b"plain text");
+    let (report, verdict) = verdict_for(scan_config(&dir), &raw).await;
     assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    assert!(report.notes.iter().any(|n| n.contains("executable")));
+}
+
+/// Control characters in attacker-chosen names do not reach notes or logs.
+#[tokio::test]
+async fn attachment_names_are_sanitised_in_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    let raw = with_attachment("a\u{1b}[31mb.exe", "application/octet-stream", b"x");
+    let (report, _) = verdict_for(scan_config(&dir), &raw).await;
+    assert!(
+        report
+            .notes
+            .iter()
+            .all(|n| !n.chars().any(char::is_control)),
+        "{:?}",
+        report.notes
+    );
+}
+
+#[tokio::test]
+async fn worker_readiness_runs_a_real_job() {
+    use currawong_core::telemetry::ReadinessCheck;
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scan_config(&dir);
+    let ready = currawongd::WorkerReady { cfg: cfg.clone() };
+    ready.check().await.unwrap();
+    let mut broken = cfg;
+    broken.scanner.worker_binary = Some(dir.path().join("no-such-worker"));
+    assert!(currawongd::WorkerReady { cfg: broken }
+        .check()
+        .await
+        .is_err());
+}
+
+/// Scratch from an earlier run is removed when the pipeline starts.
+#[tokio::test]
+async fn leftover_scan_directories_are_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = scan_config(&dir);
+    let stale = cfg.spool.dir.join("parts").join("scan-old");
+    std::fs::create_dir_all(stale.join("parts")).unwrap();
+    std::fs::write(stale.join("parts/0000.part"), b"old mail").unwrap();
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let _pipeline = Pipeline::new(Arc::new(cfg), auth);
+    assert!(!stale.exists());
+}
+
+#[test]
+fn clamd_by_host_name_must_pass_residency() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |address: &str| {
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[spool]\ndir = \"/var/spool/currawong\"\n[scanner.clamd]\naddress = \"{address}\"\n[residency]\nallowed_names = [\"clamd.internal\"]\n"
+            ),
+        )
+        .unwrap();
+        path
+    };
+    check_config(&write("tcp:clamd.internal:3310")).unwrap();
+    let err = check_config(&write("tcp:clamd.example.com:3310")).unwrap_err();
+    assert!(err.contains("scanner.clamd.address"), "{err}");
 }
 
 /// The default build requires clamd. With no address it defers and fails
