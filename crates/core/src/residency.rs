@@ -150,7 +150,7 @@ impl ResidencyGuard {
                 name: None,
             });
         }
-        Ok(Self {
+        let guard = Self {
             mode: cfg.mode.clone(),
             allowed,
             allowed_suffixes: cfg.allowed_host_suffixes.clone(),
@@ -159,7 +159,11 @@ impl ResidencyGuard {
             overrides: cfg.overrides.clone(),
             off_approval: cfg.off_approval.clone(),
             audit: Mutex::new(Vec::new()),
-        })
+        };
+        // `off` is audited when the guard is built, not only when content is
+        // sent, so a gateway with no remote destinations still records it.
+        guard.off_allows();
+        Ok(guard)
     }
 
     /// Refuse to send message content to a URL that is outside the configured
@@ -177,11 +181,7 @@ impl ResidencyGuard {
         if self.off_allows() {
             return Ok(());
         }
-        if let Some(over) = self
-            .overrides
-            .iter()
-            .find(|item| normalise_str(&item.url) == url_text)
-        {
+        if let Some(over) = self.override_for(url) {
             self.record(AuditEvent {
                 action: "residency_override".into(),
                 url: url_text,
@@ -238,11 +238,65 @@ impl ResidencyGuard {
         if address.is_empty() || address.starts_with("unix:") {
             return Ok(());
         }
-        let tcp = address.strip_prefix("tcp:").unwrap_or(address);
-        let addr: SocketAddr = tcp
-            .parse()
-            .map_err(|_| ResidencyError::Invalid(format!("clamd address {address}")))?;
+        let addr: SocketAddr = address
+            .strip_prefix("tcp:")
+            .and_then(|tcp| tcp.parse().ok())
+            .ok_or_else(|| ResidencyError::Invalid(format!("clamd address {address}")))?;
         self.check_socket(&addr)
+    }
+
+    /// Choose the address to connect to for `url` from what DNS returned.
+    /// This is the required second step after [`check_request`]: name rules
+    /// trust DNS, so the peer is checked and then pinned.
+    ///
+    /// - An exact name (`allowed_names`, meant for on-premises hosts) must
+    ///   resolve only to addresses inside an allowed CIDR.
+    /// - A host suffix (a cloud region such as `s3.ap-southeast-2.amazonaws.com`)
+    ///   trusts the provider's DNS. The address is still pinned.
+    /// - An IP literal must match a CIDR.
+    ///
+    /// Connect to the returned address and do not resolve the name again, so
+    /// a DNS change between the check and the connection cannot move it.
+    ///
+    /// [`check_request`]: Self::check_request
+    pub fn pin(&self, url: &Url, resolved: &[SocketAddr]) -> Result<SocketAddr, ResidencyError> {
+        self.check(url)?;
+        let first = *resolved
+            .first()
+            .ok_or_else(|| ResidencyError::Invalid(format!("{url} did not resolve")))?;
+        if self.mode == "off" || self.override_for(url).is_some() {
+            return Ok(first);
+        }
+        let exact_name = match url.host() {
+            Some(Host::Domain(name)) => {
+                classify_name(name, &self.allowed).is_some_and(|rule| rule.name.is_some())
+            }
+            _ => true,
+        };
+        if exact_name {
+            for addr in resolved {
+                self.check_socket(addr)?;
+            }
+        }
+        Ok(first)
+    }
+
+    /// Check `url`, resolve it and return the pinned address to connect to.
+    pub async fn resolve(&self, url: &Url) -> Result<SocketAddr, ResidencyError> {
+        self.check(url)?;
+        let port = url
+            .port_or_known_default()
+            .ok_or_else(|| ResidencyError::Invalid(format!("{url} has no port")))?;
+        let resolved: Vec<SocketAddr> = match url.host() {
+            Some(Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            Some(Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            Some(Host::Domain(name)) => tokio::net::lookup_host((name, port))
+                .await
+                .map_err(|err| ResidencyError::Invalid(format!("resolve {name}: {err}")))?
+                .collect(),
+            None => return Err(ResidencyError::Invalid(format!("{url} has no host"))),
+        };
+        self.pin(url, &resolved)
     }
 
     /// Check every configured content destination. Startup fails on the first
@@ -321,6 +375,13 @@ impl ResidencyGuard {
             allowed_names: self.allowed_names.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
         }
+    }
+
+    fn override_for(&self, url: &Url) -> Option<&ResidencyOverride> {
+        let url_text = normalise_url(url);
+        self.overrides
+            .iter()
+            .find(|item| normalise_str(&item.url) == url_text)
     }
 
     fn off_allows(&self) -> bool {
@@ -459,37 +520,105 @@ pub fn verify_report(signed: &SignedReport, trusted: &VerifyingKey) -> Result<()
         .map_err(|_| ResidencyError::BadSignature)
 }
 
+/// Load the report signing key, or create it. A new key is written to a
+/// temporary 0600 file, synced, then linked into place, so a crash never
+/// leaves a partial key and a concurrent start never replaces one. The parent
+/// directory is created 0700. An existing key readable by group or others is
+/// refused.
 pub fn load_or_create_signing_key(path: &Path) -> std::io::Result<SigningKey> {
     if path.exists() {
-        let bytes = fs::read(path)?;
-        let array: [u8; 32] = bytes.try_into().map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "residency signing key must be 32 bytes",
-            )
-        })?;
-        return Ok(SigningKey::from_bytes(&array));
+        return read_signing_key(path);
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    create_private_dir(parent)?;
     let key = SigningKey::generate(&mut rand::rngs::OsRng);
+    let tmp = parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&tmp);
+    {
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&key.to_bytes())?;
+        file.sync_all()?;
+    }
+    let linked = fs::hard_link(&tmp, path);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {
+            fs::File::open(parent)?.sync_all()?;
+            Ok(key)
+        }
+        // Another process created it first; use theirs.
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => read_signing_key(path),
+        Err(err) => Err(err),
+    }
+}
+
+fn read_signing_key(path: &Path) -> std::io::Result<SigningKey> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)?;
-        use std::io::Write;
-        file.write_all(&key.to_bytes())?;
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "residency signing key {} is mode {:o}; it must not be readable by group or others (chmod 600)",
+                    path.display(),
+                    mode & 0o777
+                ),
+            ));
+        }
     }
-    #[cfg(not(unix))]
+    let bytes = fs::read(path)?;
+    let array: [u8; 32] = bytes.try_into().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "residency signing key must be 32 bytes",
+        )
+    })?;
+    Ok(SigningKey::from_bytes(&array))
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(dir)?.permissions().mode();
+            if mode & 0o077 != 0 {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    mode = format!("{:o}", mode & 0o777),
+                    "residency key directory is open to group or others"
+                );
+            }
+        }
+        return Ok(());
+    }
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
     {
-        fs::write(path, key.to_bytes())?;
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
     }
-    Ok(key)
+    builder.create(dir)
 }
 
 #[cfg(test)]
@@ -559,7 +688,7 @@ mod tests {
         guard.check_clamd("unix:/run/clamav/clamd.ctl").unwrap();
         guard.check_clamd("tcp:127.0.0.1:3310").unwrap();
         guard.check_clamd("tcp:10.2.3.4:3310").unwrap();
-        guard.check_clamd("[::1]:3310").unwrap();
+        guard.check_clamd("tcp:[::1]:3310").unwrap();
         let err = guard.check_clamd("tcp:8.8.8.8:3310").unwrap_err();
         assert!(matches!(err, ResidencyError::Denied(_)), "{err:?}");
     }
@@ -622,6 +751,97 @@ mod tests {
         let report = guard.report("2026-10-14T00:00:00Z", &Config::default());
         assert_eq!(report.overrides.len(), 1);
         assert_eq!(report.configured_overrides, vec![legacy_override()]);
+    }
+
+    #[test]
+    fn off_mode_is_audited_when_the_guard_is_built() {
+        let cfg = ResidencyConfig {
+            mode: "off".into(),
+            off_approval: Some(ResidencyApproval {
+                reason: "lab".into(),
+                approved_by: "ciso".into(),
+            }),
+            ..ResidencyConfig::default()
+        };
+        let guard = ResidencyGuard::from_config(&cfg).unwrap();
+        guard.check_clamd("unix:/run/clamav/clamd.ctl").unwrap();
+        assert_eq!(guard.audit_log().len(), 1);
+        assert_eq!(guard.audit_log()[0].action, "residency_off");
+    }
+
+    #[test]
+    fn exact_names_must_resolve_on_premises_and_suffixes_are_pinned() {
+        let cfg = ResidencyConfig {
+            allowed_names: vec!["archive.corp.example".into()],
+            ..ResidencyConfig::default()
+        };
+        let guard = ResidencyGuard::from_config(&cfg).unwrap();
+        let addr = |text: &str| -> SocketAddr { text.parse().unwrap() };
+        let internal = Url::parse("https://archive.corp.example/drop").unwrap();
+        assert_eq!(
+            guard.pin(&internal, &[addr("10.9.8.7:443")]).unwrap(),
+            addr("10.9.8.7:443")
+        );
+        // DNS for an on-premises name pointing overseas is refused.
+        let err = guard
+            .pin(&internal, &[addr("10.9.8.7:443"), addr("8.8.8.8:443")])
+            .unwrap_err();
+        assert!(matches!(err, ResidencyError::Denied(_)), "{err:?}");
+        let sydney = Url::parse("https://box.s3.ap-southeast-2.amazonaws.com/").unwrap();
+        assert_eq!(
+            guard.pin(&sydney, &[addr("52.95.128.1:443")]).unwrap(),
+            addr("52.95.128.1:443")
+        );
+        let foreign = Url::parse("https://box.s3.us-east-1.amazonaws.com/").unwrap();
+        assert!(guard.pin(&foreign, &[addr("10.0.0.1:443")]).is_err());
+        assert!(guard.pin(&internal, &[]).is_err());
+    }
+
+    #[tokio::test]
+    async fn resolve_pins_localhost_and_literals() {
+        let guard = guard(Vec::new());
+        let local = guard
+            .resolve(&Url::parse("http://localhost:8080/hook").unwrap())
+            .await
+            .unwrap();
+        assert!(local.ip().is_loopback() && local.port() == 8080, "{local}");
+        let literal = guard
+            .resolve(&Url::parse("https://10.1.2.3/hook").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(literal, "10.1.2.3:443".parse().unwrap());
+        assert!(guard
+            .resolve(&Url::parse("https://8.8.8.8/").unwrap())
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn clamd_tcp_needs_its_prefix() {
+        let guard = guard(Vec::new());
+        assert!(matches!(
+            guard.check_clamd("127.0.0.1:3310"),
+            Err(ResidencyError::Invalid(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signing_key_is_private_and_a_shared_key_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys/nested/report.key");
+        let key = load_or_create_signing_key(&path).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+        assert_eq!(mode(&dir.path().join("keys")), 0o700);
+        assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
+        let again = load_or_create_signing_key(&path).unwrap();
+        assert_eq!(again.to_bytes(), key.to_bytes());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let err = load_or_create_signing_key(&path).expect_err("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 
     #[test]

@@ -108,7 +108,9 @@ max_ratio = 100
 # residency.overrides: audited exceptions (url, reason, approved_by).
 # residency.signing_key_path: Ed25519 key for the residency report. Unset
 #   means no signed report (currawongd logs a warning).
-# residency.report_dir: signed reports (at startup and monthly), 0600.
+# residency.report_dir: signed reports (monthly, and at startup when the
+#   residency config changed), 0600.
+# residency.report_retention_days: reports older than this are deleted.
 [residency]
 mode = "au"
 allowed_host_suffixes = [
@@ -126,6 +128,7 @@ allowed_cidrs = [
 content_endpoints = []
 overrides = []
 report_dir = "/var/lib/currawong/residency"
+report_retention_days = 400
 
 # gateway.hostname: EHLO name and Received header.
 [gateway]

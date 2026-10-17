@@ -128,3 +128,17 @@ async fn concurrent_spool_probes_do_not_race() {
     }
     assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
 }
+
+#[tokio::test]
+async fn a_timed_out_spool_probe_leaves_no_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let check = SpoolWritable {
+        dir: dir.path().to_path_buf(),
+    };
+    for _ in 0..32 {
+        let _ = tokio::time::timeout(std::time::Duration::ZERO, check.check()).await;
+    }
+    // Let the blocking jobs finish.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}

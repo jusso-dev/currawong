@@ -6,8 +6,8 @@ mod scheduler;
 
 pub use health::{checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable};
 pub use periodic::{
-    record_spool_depth, report_due, report_signing_key, residency_reports, spool_depth,
-    write_report,
+    config_digest, prune_reports, record_spool_depth, report_due, report_signing_key, report_tick,
+    residency_reports, spool_depth, write_report, LastReport, ReportHealth, REPORT_CHECK,
 };
 pub use pipeline::Pipeline;
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};

@@ -35,25 +35,6 @@ pub fn push_data_line(
     LineDecision::Continue
 }
 
-/// Feed a raw DATA payload, including the terminating dot line, for fuzzing.
-pub fn decode_data(
-    input: &[u8],
-    max_line: usize,
-    max_bytes: usize,
-) -> Result<Vec<u8>, &'static str> {
-    let mut out = Vec::new();
-    let text = String::from_utf8_lossy(input);
-    for line in text.split('\n') {
-        match push_data_line(line, &mut out, max_line, max_bytes) {
-            LineDecision::Continue => {}
-            LineDecision::Done => return Ok(out),
-            LineDecision::TooLong => return Err("line"),
-            LineDecision::TooLarge => return Err("size"),
-        }
-    }
-    Err("truncated")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

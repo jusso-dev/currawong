@@ -35,4 +35,3 @@ cargo +nightly fuzz run smtp_command -- -max_total_time=60 -rss_limit_mb=512
 ## Gaps
 
 - clamd reply parsing (`classify` in `crates/scan/src/clamav.rs`) is private, so only address parsing is fuzzed.
-- `currawong_smtp::data::decode_data` splits on `\n` after a lossy UTF-8 conversion and is no longer used by any target. The `smtp_data` target follows the session's real path instead.

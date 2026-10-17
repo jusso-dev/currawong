@@ -157,8 +157,14 @@ mod tests {
             vec![0, 1, 2, 255, 10, 13],
         ];
         for dir in ["testdata/corpus", "testdata/fixtures", "testdata/auth"] {
-            for entry in std::fs::read_dir(root().join(dir)).unwrap() {
-                seeds.push(std::fs::read(entry.unwrap().path()).unwrap());
+            // read_dir order is not stable; sort so the mutation stream repeats.
+            let mut paths: Vec<PathBuf> = std::fs::read_dir(root().join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            paths.sort();
+            for path in paths {
+                seeds.push(std::fs::read(path).unwrap());
             }
         }
         seeds

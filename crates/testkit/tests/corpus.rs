@@ -38,8 +38,31 @@ async fn corpus_verdicts_match_expected_toml() {
         assert_eq!(result.code, 250, "{name}: {result:?}");
         gateway.run_pipeline().await.unwrap();
         assert_eq!(gateway.outcomes().await, [verdict], "{name}");
-        gateway.shutdown().await;
+        let reasons = gateway.quarantine_reasons().await;
+        match entry.get("reason").and_then(|reason| reason.as_str()) {
+            Some(reason) => assert!(
+                reasons.len() == 1 && reasons[0].contains(reason),
+                "{name}: wanted reason {reason}, got {reasons:?}"
+            ),
+            None => assert!(reasons.is_empty(), "{name}: {reasons:?}"),
+        }
     }
+}
+
+#[tokio::test]
+async fn dropping_the_gateway_stops_the_server() {
+    let gateway = spawn_gateway(|_| {}).await;
+    let addr = gateway.addr;
+    drop(gateway);
+    let mut refused = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_err() {
+            refused = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(refused, "server still accepting on {addr}");
 }
 
 #[test]

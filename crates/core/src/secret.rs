@@ -1,17 +1,30 @@
 //! Secret values that must never appear in logs.
-use serde::{Deserialize, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A value whose `Debug` output and serialised form are always `***`.
 ///
 /// Use [`Secret::expose`] at the single call site that needs the raw value.
 /// Do not log that call site.
-#[derive(Clone, Deserialize, PartialEq, Eq)]
-#[serde(transparent)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Secret<T>(T);
 
 impl<T> Serialize for Secret<T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str("***")
+    }
+}
+
+/// The redaction marker is not a secret. Loading a config that was written
+/// from a serialised (redacted) one fails instead of using `***` as the key.
+impl<'de> Deserialize<'de> for Secret<String> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        if value == "***" {
+            return Err(serde::de::Error::custom(
+                "\"***\" is the redaction marker, not a secret value",
+            ));
+        }
+        Ok(Self(value))
     }
 }
 
@@ -50,6 +63,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&secret).unwrap(), "\"***\"");
         let parsed: Secret<String> = serde_json::from_str("\"from-config\"").unwrap();
         assert_eq!(parsed.expose(), "from-config");
+        let err = serde_json::from_str::<Secret<String>>("\"***\"").expect_err("marker rejected");
+        assert!(err.to_string().contains("redaction marker"), "{err}");
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub const MESSAGES_ACCEPTED_TOTAL: &str = "currawong_messages_accepted_total";
 pub const MESSAGES_REJECTED_TOTAL: &str = "currawong_messages_rejected_total";
 pub const SPOOL_DEPTH: &str = "currawong_spool_depth";
 pub const SCAN_DURATION_SECONDS: &str = "currawong_scan_duration_seconds";
+pub const RESIDENCY_REPORT_FAILURES_TOTAL: &str = "currawong_residency_report_failures_total";
 
 /// Each readiness check gets this long before `/readyz` reports it as failed.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -28,7 +29,12 @@ pub trait ReadinessCheck: Send + Sync {
 #[derive(Clone)]
 struct HealthState {
     checks: Arc<Vec<Arc<dyn ReadinessCheck>>>,
+    /// Caps `/readyz` evaluations in flight; extra callers get 503 at once.
+    slots: Arc<tokio::sync::Semaphore>,
 }
+
+/// `/readyz` evaluations allowed at the same time.
+pub const MAX_READYZ: usize = 4;
 
 static RECORDER: OnceLock<PrometheusHandle> = OnceLock::new();
 
@@ -93,10 +99,15 @@ fn describe_metrics() {
         SCAN_DURATION_SECONDS,
         "Time spent scanning one message, in seconds"
     );
+    metrics::describe_counter!(
+        RESIDENCY_REPORT_FAILURES_TOTAL,
+        "Signed residency reports that could not be written"
+    );
     for name in [
         SMTP_CONNECTIONS_TOTAL,
         MESSAGES_ACCEPTED_TOTAL,
         MESSAGES_REJECTED_TOTAL,
+        RESIDENCY_REPORT_FAILURES_TOTAL,
     ] {
         metrics::counter!(name).increment(0);
     }
@@ -111,6 +122,7 @@ pub fn router(checks: Vec<Arc<dyn ReadinessCheck>>) -> Router {
     let _ = install_recorder();
     let state = HealthState {
         checks: Arc::new(checks),
+        slots: Arc::new(tokio::sync::Semaphore::new(MAX_READYZ)),
     };
     Router::new()
         .route("/metrics", get(|| async { metrics_body() }))
@@ -123,6 +135,9 @@ pub fn router(checks: Vec<Arc<dyn ReadinessCheck>>) -> Router {
 /// failed checks only. Details (paths, peer errors) go to the log, not to an
 /// unauthenticated caller.
 async fn readyz(State(state): State<HealthState>) -> (StatusCode, String) {
+    let Ok(_slot) = Arc::clone(&state.slots).try_acquire_owned() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "not ready: busy".into());
+    };
     let mut set = tokio::task::JoinSet::new();
     for check in state.checks.iter() {
         let check = Arc::clone(check);
@@ -334,6 +349,22 @@ mod tests {
         async fn check(&self) -> Result<(), String> {
             std::future::pending().await
         }
+    }
+
+    #[tokio::test]
+    async fn readyz_work_is_capped() {
+        let addr = serve(SocketAddr::from(([127, 0, 0, 1], 0)), vec![Arc::new(Hangs)]).unwrap();
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..MAX_READYZ + 2 {
+            set.spawn(get(addr, "/readyz"));
+        }
+        let mut busy = 0;
+        while let Some(text) = set.join_next().await {
+            let text = text.unwrap();
+            assert!(text.contains("503"), "{text}");
+            busy += usize::from(text.contains("not ready: busy"));
+        }
+        assert!(busy >= 2, "{busy}");
     }
 
     struct Leaks;

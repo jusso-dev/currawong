@@ -31,9 +31,27 @@ pub struct TestGateway {
     _dir: tempfile::TempDir,
 }
 
+/// Dropping the gateway stops its SMTP server.
+impl Drop for TestGateway {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 impl TestGateway {
     pub async fn shutdown(self) {
         self.shutdown.cancel();
+    }
+
+    /// The quarantine reason of every quarantined message.
+    pub async fn quarantine_reasons(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for env in self.spool.list(SpoolState::Done).await.expect("list spool") {
+            if env.pipeline == "quarantine" {
+                out.push(self.quarantine.reason(env.id.as_str()).expect("reason"));
+            }
+        }
+        out
     }
 
     /// One pass of the daemon's scan pipeline over everything spooled.

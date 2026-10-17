@@ -167,6 +167,8 @@ pub struct ResidencyConfig {
     pub off_approval: Option<ResidencyApproval>,
     pub signing_key_path: Option<PathBuf>,
     pub report_dir: PathBuf,
+    /// Signed reports older than this are deleted.
+    pub report_retention_days: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -384,6 +386,7 @@ impl Default for ResidencyConfig {
             off_approval: None,
             signing_key_path: None,
             report_dir: PathBuf::from("/var/lib/currawong/residency"),
+            report_retention_days: 400,
         }
     }
 }
@@ -691,7 +694,8 @@ pub fn parse_clamd_address(address: &str) -> Result<(), ConfigError> {
         }
         return Ok(());
     }
-    let tcp = address.strip_prefix("tcp:").unwrap_or(address);
+    // Same rule as the runtime parser: an explicit tcp: prefix and an IP.
+    let tcp = address.strip_prefix("tcp:").unwrap_or("");
     if tcp.parse::<SocketAddr>().is_err() {
         return Err(ConfigError::Invalid(format!(
             "clamd address '{address}' must be unix:/path or tcp:host:port"
@@ -705,7 +709,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Every test that loads a config takes this lock, so a test that sets a
+    /// `CURRAWONG_` variable cannot leak it into another test's load.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn load(path: &Path) -> Result<Config, ConfigError> {
+        let _guard = env_lock();
+        Config::load(path)
+    }
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/currawong.example.toml")
@@ -713,7 +730,7 @@ mod tests {
 
     #[test]
     fn example_loads_and_validates() {
-        let cfg = Config::load(&example_path()).expect("example config");
+        let cfg = load(&example_path()).expect("example config");
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
@@ -722,7 +739,7 @@ mod tests {
     #[test]
     fn blank_tenant_id_is_refused() {
         for id in ["", " ", " t1"] {
-            let mut cfg = Config::load(&example_path()).unwrap();
+            let mut cfg = load(&example_path()).unwrap();
             cfg.relay.tenants.push(TenantConfig {
                 id: id.into(),
                 domains: vec!["example.test".into()],
@@ -741,7 +758,7 @@ mod tests {
             "[spool]\ndir = \"/var/spool/currawong\"\nnot_a_real_key = 1\n",
         )
         .unwrap();
-        let err = Config::load(&path).unwrap_err();
+        let err = load(&path).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("not_a_real_key"),
@@ -751,7 +768,7 @@ mod tests {
 
     #[test]
     fn env_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("base.toml");
         std::fs::write(
@@ -773,23 +790,22 @@ mod tests {
     }
 
     #[test]
-    fn foreign_clamd_fails_validation_even_from_the_environment() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let previous = std::env::var("CURRAWONG_SCANNER__CLAMD__ADDRESS").ok();
-        // Safety: the mutex above serialises tests that touch this variable.
-        unsafe { std::env::set_var("CURRAWONG_SCANNER__CLAMD__ADDRESS", "tcp:8.8.8.8:3310") };
-        let loaded = Config::load(&example_path());
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var("CURRAWONG_SCANNER__CLAMD__ADDRESS", value),
-                None => std::env::remove_var("CURRAWONG_SCANNER__CLAMD__ADDRESS"),
-            }
-        }
-        let err = loaded.expect("load").validate().unwrap_err().to_string();
+    fn foreign_clamd_fails_validation() {
+        let mut cfg = load(&example_path()).expect("load");
+        cfg.scanner.clamd.address = "tcp:8.8.8.8:3310".into();
+        let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("clamd") && err.contains("8.8.8.8"), "{err}");
-        let mut cfg = Config::default();
         cfg.scanner.clamd.address = "tcp:127.0.0.1:3310".into();
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn clamd_address_needs_a_scheme_prefix() {
+        for bad in ["127.0.0.1:3310", "unix:", "tcp:localhost:3310"] {
+            assert!(parse_clamd_address(bad).is_err(), "{bad}");
+        }
+        parse_clamd_address("tcp:127.0.0.1:3310").unwrap();
+        parse_clamd_address("unix:/run/clamav/clamd.ctl").unwrap();
     }
 
     #[test]

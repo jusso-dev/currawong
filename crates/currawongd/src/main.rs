@@ -9,7 +9,7 @@ use currawong_smtp::{
 use currawong_spool::Spool;
 use currawongd::{
     check_config, checks_for, classify_pending, report_signing_key, residency_reports, spool_depth,
-    Pipeline,
+    Pipeline, ReportHealth, REPORT_CHECK,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
@@ -54,12 +54,16 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     let report_key = report_signing_key(&cfg)?;
     let cfg = Arc::new(cfg);
     let shutdown = CancellationToken::new();
+    let report_health = ReportHealth::default();
     if let Some(key) = report_key {
         tokio::spawn(residency_reports(
             Arc::clone(&cfg),
             Arc::clone(&guard),
             key,
+            report_health.clone(),
             shutdown.clone(),
+            time::OffsetDateTime::now_utc,
+            REPORT_CHECK,
         ));
     }
     let spool = Arc::new(
@@ -94,9 +98,11 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         tracing::info!(name = %listener.name, bind = %listener.bind, "smtp listening");
         listeners.push((bound, listener.mode.clone(), listener.role.clone()));
     }
+    let mut readiness = checks_for(&cfg);
+    readiness.push(Arc::new(report_health));
     currawong_core::telemetry::serve(
         cfg.metrics_addr().map_err(|err| err.to_string())?,
-        checks_for(&cfg),
+        readiness,
     )
     .map_err(|err| format!("metrics.listen {}: {err}", cfg.metrics.listen))?;
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;

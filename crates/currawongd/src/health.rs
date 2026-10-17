@@ -33,13 +33,15 @@ impl ReadinessCheck for SpoolWritable {
             std::process::id(),
             PROBE.fetch_add(1, Ordering::Relaxed)
         ));
-        tokio::fs::write(&probe, b"ok")
-            .await
-            .map_err(|err| err.to_string())?;
-        tokio::fs::remove_file(&probe)
-            .await
-            .map_err(|err| err.to_string())?;
-        Ok(())
+        // Write and remove in one blocking job. If /readyz times out and drops
+        // this future, the job still runs to the end and leaves no file behind.
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&probe, b"ok")?;
+            std::fs::remove_file(&probe)
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())
     }
 }
 
