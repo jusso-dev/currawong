@@ -83,6 +83,44 @@ async fn renamed_executable_is_quarantined_without_clamav() {
 }
 
 #[tokio::test]
+async fn classify_puts_spam_and_lookalike_scores_on_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.classify.bayes_database = dir.path().join("bayes.sqlite");
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let raw = b"From: Refunds <refunds@c0mmbank.com.au>\r\nReply-To: pay@examp1e.test\r\nTo: dest@example.test\r\nSubject: WINNER\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\nAct now at https://rnygov.au/claim\r\n";
+    let env = envelope("bounce@c0mmbank.com.au");
+    let (report, _verdict) = pipeline.evaluate(&env, raw, None).await;
+    let spam = report.spam.as_ref().expect("spam report");
+    let rules: Vec<&str> = spam.rules_hit.iter().map(|hit| hit.name.as_str()).collect();
+    assert!(rules.contains(&"subject_shouting"), "{rules:?}");
+    assert!(rules.contains(&"body_urgency"), "{rules:?}");
+    assert!(spam.total > 0.0);
+    let found: Vec<(&str, &str)> = report
+        .lookalikes
+        .iter()
+        .map(|f| (f.source.as_str(), f.target.as_str()))
+        .collect();
+    for expected in [
+        ("from", "commbank.com.au"),
+        ("reply-to", "example.test"),
+        ("envelope", "commbank.com.au"),
+        ("url", "mygov.au"),
+    ] {
+        assert!(found.contains(&expected), "{expected:?} in {found:?}");
+    }
+
+    let (clean, _verdict) = pipeline
+        .evaluate(&envelope("user@example.test"), &text_message(), None)
+        .await;
+    assert!(clean.lookalikes.is_empty(), "{:?}", clean.lookalikes);
+    assert!(clean.spam.unwrap().rules_hit.is_empty());
+}
+
+#[tokio::test]
 async fn pending_mail_is_not_marked_deliver_before_the_pipeline() {
     let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();

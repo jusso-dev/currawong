@@ -19,6 +19,10 @@ Unit tests use fakes for DNS, clamd and the downstream SMTP sink. They bind port
 - Live MX delivery. Delivery tests use an in-process SMTP sink. A real MX lookup and a remote 250 were not exercised.
 - `cargo +nightly fuzz build`. `cargo-fuzz` is not installed here. `cargo test -p currawong-fuzzstand` is the stand-in and does not need libFuzzer. See `docs/fuzzing.md`.
 - seccomp. The parser worker installs a seccompiler filter only on Linux. This machine is macOS, so workers run unsandboxed. The Linux filter is untested here.
+- Spam accuracy on real mail. `cargo test -p currawong-classify spam` trains on 200 spam and 200 ham messages generated from word lists with a fixed seed and checks held-out accuracy over 90% (it measured 99.5%). That proves the Robinson-Fisher classifier learns and generalises. It is not a measure of accuracy on real traffic, which needs a labelled Australian corpus that is not in the repository.
+- Spam training from the daemon. `SpamClassifier::learn` takes a quarantine release or a user report. Quarantine release and user reporting do not exist yet (M2 admin and quarantine work), so nothing in `currawongd` calls it, and a fresh tenant scores Bayes 0.5 until it is trained. Rules and lookalikes score from the first message. Razor and Pyzor have no hook.
+- Classify parsing isolation. The classify stage reads headers and text bodies with `mail-parser` in the supervisor process, not in a parser worker as ADR 0002 intends. Moving header and text extraction into the worker response is the follow-up.
+- Lookalike domains are matched with UTS 39 skeletons, edit distance and suffix swaps against `rules/brands-au.txt` plus tenant domains. There is no WHOIS or domain age lookup.
 - 7z extraction. 7z is recognised by magic and flagged, and it is not unpacked (no `sevenz` crate in the workspace). zip, tar, gz and a minimal ISO walk are implemented. RAR is detected and not extracted.
 
 ## ADR 0002 and the worker transport

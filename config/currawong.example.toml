@@ -184,3 +184,18 @@ seal_arc = true
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
 [auth]
 authserv_id = "currawong.example.test"
+
+# classify.enabled: spam score and lookalike domains on every report. Policy
+# decides what a score means; classify does not quarantine on its own.
+# classify.bayes_database: per-tenant Bayes token counts (hashes, not words).
+# The directory must exist. If it cannot be opened, rules still score.
+# classify.spam_rules_dir: directory of *.toml rules ([[rule]] name, target,
+# pattern, score). Leave unset for the built-in rules in rules/spam/.
+# classify.brands_file: "Name: domain ..." per line. Leave unset for the
+# built-in Australian list in rules/brands-au.txt.
+# classify.protected_domains: more domains to protect. domains.accept and
+# relay tenant domains are always protected.
+[classify]
+enabled = true
+bayes_database = "/var/lib/currawong/bayes.sqlite"
+protected_domains = []

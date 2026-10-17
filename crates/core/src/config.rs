@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub classify: ClassifyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +271,21 @@ pub struct AuthConfig {
     pub authserv_id: String,
 }
 
+/// Spam scoring and lookalike domains. Scores go on the report; policy decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClassifyConfig {
+    pub enabled: bool,
+    /// SQLite file holding per-tenant Bayes token counts.
+    pub bayes_database: PathBuf,
+    /// Directory of `*.toml` spam rules. Unset uses the built-in rules.
+    pub spam_rules_dir: Option<PathBuf>,
+    /// Brand list, `Name: domain ...` per line. Unset uses the built-in Australian list.
+    pub brands_file: Option<PathBuf>,
+    /// More domains to protect. Accepted and tenant domains are always protected.
+    pub protected_domains: Vec<String>,
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -440,6 +456,18 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bayes_database: PathBuf::from("/var/lib/currawong/bayes.sqlite"),
+            spam_rules_dir: None,
+            brands_file: None,
+            protected_domains: Vec::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -483,6 +511,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            classify: ClassifyConfig::default(),
         }
     }
 }

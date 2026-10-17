@@ -63,3 +63,8 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
 zeroize = "1"
+unicode-security = "0.1"
+strsim = "0.11"
+psl = "2"
+idna = "1"
+regex = "1"

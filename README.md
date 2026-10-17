@@ -52,6 +52,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/spool` | Durable on-disk queue |
 | `crates/auth` | SPF, DKIM, DMARC, ARC, BIMI |
 | `crates/scan` | Scanner orchestration and isolated parser workers |
+| `crates/classify` | Spam scoring (per-tenant Bayes and TOML rules) and lookalike domains |
 | `crates/dlp` | Australian identifier detection and protective markings |
 | `crates/policy` | Policy engine and scoring |
 | `crates/quarantine` | Quarantine store and digests |

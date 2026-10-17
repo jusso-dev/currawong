@@ -1,5 +1,6 @@
-//! Auth, parse, scan and the M1 policy decision.
+//! Auth, parse, scan, classify and the policy decision.
 use currawong_auth::AuthChecker;
+use currawong_classify::Classifier;
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
@@ -14,6 +15,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// Spam and lookalike scoring. `None` when `classify.enabled` is off.
+    pub classifier: Option<Classifier>,
 }
 
 impl Pipeline {
@@ -26,7 +29,22 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        // `--check-config` has already loaded the rules and brands, so a
+        // failure here is logged rather than stopping the daemon.
+        let classifier = match cfg.classify.enabled.then(|| Classifier::from_config(&cfg)) {
+            Some(Ok(classifier)) => Some(classifier),
+            Some(Err(err)) => {
+                tracing::error!(%err, "classifier disabled");
+                None
+            }
+            None => None,
+        };
+        Self {
+            cfg,
+            auth,
+            pool,
+            classifier,
+        }
     }
 
     pub async fn evaluate(
@@ -39,6 +57,7 @@ impl Pipeline {
         let auth = self.auth.check(raw, env).await;
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
+            self.classify(env, raw, &mut report);
             let verdict = decide(&report);
             return (report, verdict);
         }
@@ -102,8 +121,19 @@ impl Pipeline {
                 detail: String::new(),
             });
         }
+        self.classify(env, raw, &mut report);
         let verdict = decide(&report);
         (report, verdict)
+    }
+
+    fn classify(&self, env: &Envelope, raw: &[u8], report: &mut ScanReport) {
+        let Some(classifier) = &self.classifier else {
+            return;
+        };
+        let tenant = env.tenant_id.as_deref().unwrap_or("default");
+        let result = classifier.classify(tenant, raw, &env.mail_from, &report.urls);
+        report.spam = Some(result.spam);
+        report.lookalikes = result.lookalikes;
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {
