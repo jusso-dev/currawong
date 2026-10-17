@@ -66,6 +66,22 @@ priority = 44
 conditions = [{ direction = "outbound" }, { flag = "dlp.incomplete" }]
 actions = [{ quarantine = "dlp" }]
 
+# Business email compromise: impersonated staff, look-alike senders,
+# diverted replies and payment or gift-card requests (inbound only).
+[[policy]]
+id = "bec-quarantine"
+priority = 55
+conditions = [{ direction = "inbound" }, { score = { name = "bec", at_least = 0.6 } }]
+actions = [{ quarantine = "bec" }]
+
+# Below the quarantine score, a borrowed colleague's name is still marked so
+# mail clients and transport rules can warn the reader.
+[[policy]]
+id = "bec-warn"
+priority = 56
+conditions = [{ direction = "inbound" }, { flag = "bec.display_name_spoof" }]
+actions = [{ add_header = { name = "X-Currawong-Warning", value = "possible impersonation of a colleague" } }]
+
 [[policy]]
 id = "spam-quarantine"
 priority = 60
