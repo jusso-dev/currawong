@@ -165,11 +165,15 @@ fn documents_are_only_parsed_in_the_worker() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("m.eml");
     std::fs::write(&path, &raw).unwrap();
-    let worker = parse_request(&ParseRequest {
-        id: "id".into(),
-        raw_path: path,
-        limits: ExtractLimits::default(),
-    });
+    let worker = parse_request(
+        &ParseRequest {
+            id: "id".into(),
+            raw_path: path,
+            limits: ExtractLimits::default(),
+            yara_generation: None,
+        },
+        &mut currawong_parser::yara::RulesCache::default(),
+    );
     assert!(!worker.dlp.incomplete, "{:?}", worker.dlp);
     assert!(worker.dlp.text.contains("TFN 123 456 782"));
     assert!(worker.dlp.text.contains("staff.docx"));

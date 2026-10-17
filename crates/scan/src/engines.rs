@@ -1,6 +1,8 @@
 //! Scanner trait. Later on-premises engines implement the same trait.
 use async_trait::async_trait;
 
+pub mod yara;
+
 #[derive(Debug, Clone)]
 pub struct ScanItem<'a> {
     pub name: &'a str,

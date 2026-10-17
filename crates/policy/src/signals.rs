@@ -5,11 +5,12 @@
 //! Names produced today:
 //! - flags: `malware`, `active_content`, `fail_closed`, `defer`, plus part
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
-//!   `executable`, `limit_exceeded`, and `dlp.incomplete` when some text
-//!   could not be scanned for identifiers.
-//! - counts: `parts`, `urls`, and distinct identifiers found by DLP as
-//!   `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`, `dlp.driver_licence`,
-//!   `dlp.card` (present only when DLP ran and found that kind).
+//!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
+//!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
+//!   `dlp.incomplete` when some text could not be scanned for identifiers.
+//! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
+//!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
+//!   `dlp.driver_licence`, `dlp.card` (present only when found).
 //! - scores: none yet. Reserved: `spam`, `bec`, `lookalike`.
 use currawong_core::{AuthResults, PartFlag, ScanReport};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +52,13 @@ impl Signals {
             if dlp.incomplete {
                 signals.flag("dlp.incomplete");
             }
+        }
+        if !report.yara.is_empty() {
+            signals.flag("yara");
+            signals.count("yara", report.yara.len() as u64);
+        }
+        for tag in report.yara.iter().flat_map(|hit| &hit.tags) {
+            signals.flag(&format!("yara.{tag}"));
         }
         signals
     }

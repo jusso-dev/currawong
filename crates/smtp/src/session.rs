@@ -357,6 +357,9 @@ async fn session_loop(
                             dsn_sent: false,
                             pipeline: "pending".into(),
                         };
+                        // RFC 8601 section 5: forged results for our authserv-id never
+                        // reach the spool, so neither quarantine nor delivery sees them.
+                        let bytes = currawong_auth::strip_forged(&bytes, &ctx.cfg.auth.authserv_id);
                         match ctx.spool.accept(env, std::io::Cursor::new(bytes)).await {
                             Ok(stored) => {
                                 tracing::info!(message_id = %stored, "message spooled");

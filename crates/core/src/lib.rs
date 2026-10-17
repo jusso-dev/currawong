@@ -9,7 +9,7 @@ pub mod telemetry;
 pub use config::{Config, ConfigError};
 pub use report::{
     AuthMethodResult, AuthResults, DlpKind, DlpReport, DlpSample, EngineFinding, PartFlag,
-    PartInfo, ScanReport,
+    PartInfo, ScanReport, YaraMatch,
 };
 pub use residency::{ResidencyError, ResidencyGuard, SignedReport};
 pub use secret::Secret;

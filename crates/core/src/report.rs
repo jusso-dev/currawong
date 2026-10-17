@@ -71,6 +71,16 @@ pub struct EngineFinding {
     pub detail: String,
 }
 
+/// A YARA rule that matched the raw message, a MIME part or an archive member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YaraMatch {
+    pub rule: String,
+    pub namespace: String,
+    pub tags: Vec<String>,
+    /// File name, content type, or `message` for the raw message.
+    pub part: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     pub message_id: MessageId,
@@ -78,6 +88,9 @@ pub struct ScanReport {
     pub parts: Vec<PartInfo>,
     pub urls: Vec<String>,
     pub engines: Vec<EngineFinding>,
+    /// Every YARA rule match, for policy to act on by rule name or tag.
+    #[serde(default)]
+    pub yara: Vec<YaraMatch>,
     pub malware: bool,
     pub active_content: bool,
     /// Parser crash, limit or a hard scanner error. Policy quarantines.
@@ -85,6 +98,10 @@ pub struct ScanReport {
     /// Required engine configured but unreachable. Do not deliver; retry.
     pub defer: bool,
     pub notes: Vec<String>,
+    /// A stage changed the message (for example URL rewriting). Only
+    /// modified inbound mail is ARC sealed.
+    #[serde(default)]
+    pub modified: bool,
     /// Australian identifier findings. `None` when DLP did not run.
     #[serde(default)]
     pub dlp: Option<DlpReport>,
@@ -143,12 +160,14 @@ impl ScanReport {
             parts: Vec::new(),
             urls: Vec::new(),
             engines: Vec::new(),
+            yara: Vec::new(),
             malware: false,
             active_content: false,
             fail_closed: false,
             defer: false,
             notes: Vec::new(),
             dlp: None,
+            modified: false,
         }
     }
 }
