@@ -84,6 +84,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?);
     guard.enforce_config(&cfg).map_err(|err| err.to_string())?;
     let report_key = report_signing_key(&cfg)?;
+    currawongd::start_events(&cfg, Arc::clone(&guard))?;
     let cfg = Arc::new(cfg);
     let shutdown = CancellationToken::new();
     let report_health = ReportHealth::default();
@@ -223,7 +224,21 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             let mut guard = pipeline.lock().await;
             let (pipeline, quarantine) = &mut *guard;
             match pipeline.reload_policies().await {
-                Ok(true) => tracing::info!("policies reloaded"),
+                Ok(true) => {
+                    tracing::info!("policies reloaded");
+                    // No admin API yet: the policy files or database changed.
+                    // TODO: emit the admin user once the admin API exists.
+                    currawong_integrations::export::emit(
+                        currawong_integrations::export::Event::new(
+                            None,
+                            currawong_integrations::export::EventKind::AdminAction {
+                                actor: "policy-store".into(),
+                                action: "policy.reload".into(),
+                                target: format!("{} policies", pipeline.policies.policies.len()),
+                            },
+                        ),
+                    );
+                }
                 Ok(false) => {}
                 Err(err) => {
                     tracing::error!(%err, "policy reload failed, keeping the previous policies")
@@ -277,6 +292,8 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         });
     }
     while set.join_next().await.is_some() {}
+    // Events not sent by now stay in the overflow and go out on the next start.
+    currawong_integrations::export::flush(Duration::from_secs(10)).await;
     Ok(())
 }
 

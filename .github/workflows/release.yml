@@ -1,0 +1,274 @@
+# Packaging and release: container image, Debian package, appliance image, Helm chart.
+# The container, deb-install and appliance jobs each check one #46 acceptance
+# criterion and fail with an ::error:: line when it is not met.
+name: release
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Criterion: image under 80 MB passes /healthz.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the image
+        run: docker build -t currawong:ci .
+      - name: Image is under 80 MB
+        run: |
+          limit=80000000
+          size=$(docker image inspect currawong:ci --format '{{.Size}}')
+          echo "image size: $size bytes (limit $limit)"
+          if [ "$size" -ge "$limit" ]; then
+            docker history currawong:ci
+            echo "::error::image is $size bytes, over the 80 MB limit"
+            exit 1
+          fi
+      - name: Image runs as 65532
+        run: |
+          user=$(docker image inspect currawong:ci --format '{{.Config.User}}')
+          if [ "$user" != "65532:65532" ]; then
+            echo "::error::image user is '$user', expected 65532:65532"
+            exit 1
+          fi
+      - name: A started container answers /healthz with 200
+        run: |
+          tls=$(mktemp -d)
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -subj /CN=ci.example.test -keyout "$tls/key.pem" -out "$tls/cert.pem"
+          chmod 0644 "$tls/key.pem" "$tls/cert.pem"   # throwaway, readable by 65532
+          docker run -d --name cw -p 127.0.0.1:9090:9090 \
+            -v "$tls/cert.pem:/etc/currawong/cert.pem:ro" \
+            -v "$tls/key.pem:/etc/currawong/key.pem:ro" currawong:ci
+          code=000
+          for _ in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9090/healthz || true)
+            [ "$code" = 200 ] && break
+            sleep 2
+          done
+          if [ "$code" != 200 ]; then
+            docker logs cw
+            echo "::error::/healthz returned $code, expected 200"
+            exit 1
+          fi
+          echo "/healthz: 200"
+      - name: Docker HEALTHCHECK reports healthy
+        run: |
+          status=starting
+          for _ in $(seq 1 45); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' cw)
+            [ "$status" = healthy ] && break
+            sleep 2
+          done
+          if [ "$status" != healthy ]; then
+            docker logs cw
+            docker inspect -f '{{json .State.Health}}' cw
+            echo "::error::HEALTHCHECK status is '$status'"
+            exit 1
+          fi
+          echo "HEALTHCHECK: healthy"
+
+  deb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Build on bookworm so the binaries link against Debian 12's glibc.
+    container: rust:1-bookworm
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo install cargo-deb --locked
+      - run: cargo build --release --locked -p currawongd -p currawong-parser-worker -p currawong-setup-tui
+      - run: cargo deb -p currawongd --no-build
+      - name: Package contents
+        run: |
+          deb=$(ls target/debian/currawong_*.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb" | tee contents.txt
+          for path in ./usr/bin/currawongd ./usr/bin/currawong-parser-worker ./usr/sbin/currawong-setup \
+                      ./usr/lib/systemd/system/currawongd.service ./etc/currawong/currawong.toml; do
+            grep -q " $path\$" contents.txt || { echo "::error::$path missing from $deb"; exit 1; }
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb
+          path: target/debian/currawong_*.deb
+
+  # Criterion: the .deb installs and starts on Debian 12.
+  deb-install:
+    needs: deb
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: debs }
+      - name: Boot Debian 12 with systemd as PID 1
+        run: |
+          docker build -t deb12-systemd - <<'EOF'
+          FROM debian:12
+          RUN apt-get update \
+           && apt-get install -y --no-install-recommends systemd systemd-sysv dbus curl iproute2 ca-certificates \
+           && rm -rf /var/lib/apt/lists/*
+          STOPSIGNAL SIGRTMIN+3
+          CMD ["/sbin/init"]
+          EOF
+          docker run -d --name deb12 --privileged --cgroupns=host \
+            -v /sys/fs/cgroup:/sys/fs/cgroup:rw --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD/debs:/debs:ro" deb12-systemd
+          state=unknown
+          for _ in $(seq 1 60); do
+            state=$(docker exec deb12 systemctl is-system-running 2>/dev/null || true)
+            case "$state" in running|degraded) break ;; esac
+            sleep 1
+          done
+          echo "systemd: $state"
+          case "$state" in running|degraded) ;; *) echo "::error::systemd did not boot ($state)"; exit 1 ;; esac
+      - name: Install the package
+        run: docker exec deb12 sh -c 'apt-get update && apt-get install -y /debs/currawong_*.deb'
+      - name: currawongd is active and /healthz answers 200
+        run: |
+          active=no
+          for _ in $(seq 1 30); do
+            docker exec deb12 systemctl is-active --quiet currawongd && { active=yes; break; }
+            sleep 1
+          done
+          code=000
+          if [ "$active" = yes ]; then
+            for _ in $(seq 1 30); do
+              code=$(docker exec deb12 curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9090/healthz || true)
+              [ "$code" = 200 ] && break
+              sleep 1
+            done
+          fi
+          if [ "$active" != yes ] || [ "$code" != 200 ]; then
+            docker exec deb12 systemctl status currawongd --no-pager || true
+            docker exec deb12 journalctl -u currawongd --no-pager -n 200 || true
+            echo "::error::currawongd active=$active, /healthz=$code"
+            exit 1
+          fi
+          echo "currawongd: active, /healthz: 200"
+      - name: User, permissions and listeners
+        run: |
+          docker exec deb12 id currawong
+          perms=$(docker exec deb12 stat -c '%U:%G %a' /etc/currawong/key.pem)
+          [ "$perms" = "root:currawong 640" ] || { echo "::error::key.pem is '$perms'"; exit 1; }
+          perms=$(docker exec deb12 stat -c '%U:%G %a' /var/spool/currawong)
+          [ "$perms" = "currawong:currawong 750" ] || { echo "::error::spool is '$perms'"; exit 1; }
+          docker exec deb12 ss -ltn | tee listeners.txt
+          for port in 25 465 587; do
+            grep -q ":$port " listeners.txt || { echo "::error::nothing listening on $port"; exit 1; }
+          done
+      - name: Unit hardening report (informational)
+        run: |
+          docker exec deb12 systemd-analyze verify /usr/lib/systemd/system/currawongd.service || true
+          docker exec deb12 systemd-analyze security currawongd.service --no-pager || true
+
+  # Criterion: the appliance boots to the wizard in QEMU. The check also
+  # completes the wizard over the serial console and checks /healthz in the VM.
+  appliance:
+    needs: deb
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: deb, path: target/debian }
+      - uses: systemd/mkosi@v25.3
+      - name: Install QEMU and OVMF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils ovmf
+      - name: Build the appliance image
+        run: sudo mkosi -C packaging/appliance build
+      - name: Convert to qcow2 and VMDK
+        run: |
+          raw=packaging/appliance/mkosi.output/currawong-appliance.raw
+          test -f "$raw" || { echo "::error::mkosi produced no $raw"; exit 1; }
+          sudo chown "$(id -u):$(id -g)" "$raw"
+          qemu-img convert -O qcow2 "$raw" currawong-appliance.qcow2
+          qemu-img convert -O vmdk -o subformat=streamOptimized "$raw" currawong-appliance.vmdk
+      - name: Use KVM if the runner has it, else TCG with a longer timeout
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+              | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            { echo ACCEL=kvm; echo BOOT_TIMEOUT=600; } >> "$GITHUB_ENV"
+          else
+            echo "::warning::no usable /dev/kvm, booting under TCG"
+            { echo ACCEL=tcg; echo BOOT_TIMEOUT=2700; } >> "$GITHUB_ENV"
+          fi
+      - name: Boots to the wizard on the serial console, setup completes, /healthz 200
+        run: |
+          fw=""
+          for f in /usr/share/ovmf/OVMF.fd /usr/share/OVMF/OVMF.fd; do
+            [ -f "$f" ] && { fw=$f; break; }
+          done
+          [ -n "$fw" ] || { echo "::error::OVMF firmware not found"; exit 1; }
+          qemu-system-x86_64 -machine q35 -accel "$ACCEL" -m 2048 -smp 2 -bios "$fw" \
+            -drive if=virtio,format=qcow2,file=currawong-appliance.qcow2,snapshot=on \
+            -nic user,model=virtio-net-pci -display none -monitor none \
+            -chardev socket,id=ser0,path=serial.sock,server=on,wait=off -serial chardev:ser0 &
+          qemu=$!
+          trap 'kill "$qemu" 2>/dev/null || true' EXIT
+          if ! python3 packaging/appliance/serial-expect.py --socket serial.sock --log serial.log \
+               --timeout "$BOOT_TIMEOUT" --complete; then
+            echo "::error::appliance check failed under $ACCEL; see the serial-log artefact"
+            exit 1
+          fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: serial-log
+          path: serial.log
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appliance
+          path: |
+            currawong-appliance.qcow2
+            currawong-appliance.vmdk
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint deploy/helm/currawong
+      - run: helm template ci deploy/helm/currawong > /dev/null
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [container, deb-install, appliance, helm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { path: dist, merge-multiple: true }
+      - name: Push image to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          image=ghcr.io/${{ github.repository_owner }}/currawong:${GITHUB_REF_NAME#v}
+          docker build -t "$image" .
+          docker push "$image"
+      - name: Attach artefacts to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes || true
+          gh release upload "$GITHUB_REF_NAME" dist/currawong_*.deb dist/currawong-appliance.* --clobber

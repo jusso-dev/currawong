@@ -324,6 +324,17 @@ fn holds(
             Some(found) => found.eq_ignore_ascii_case(marking),
             None => marking.eq_ignore_ascii_case("none"),
         },
+        Condition::MarkingAtLeast(level) => {
+            let found = signals
+                .marking
+                .as_deref()
+                .and_then(currawong_core::Classification::parse);
+            match (found, currawong_core::Classification::parse(level)) {
+                (Some(found), Some(level)) => found >= level,
+                _ => false,
+            }
+        }
+        Condition::Not(inner) => !holds(inner, policy, signals, ctx, set),
         Condition::Auth { method, result } => signals
             .auth_result(method)
             .iter()
@@ -340,7 +351,15 @@ fn address_matches(pattern: &str, address: &str) -> bool {
         .strip_prefix("*@")
         .or_else(|| pattern.strip_prefix('@'))
     {
-        Some(domain) => domain_of(address) == canonical_domain(domain),
+        // `*@*.gov.au` matches gov.au and every subdomain of it.
+        Some(domain) => match domain.strip_prefix("*.") {
+            Some(suffix) => {
+                let found = domain_of(address);
+                let suffix = canonical_domain(suffix);
+                found == suffix || found.ends_with(&format!(".{suffix}"))
+            }
+            None => domain_of(address) == canonical_domain(domain),
+        },
         None => canonical_pattern(pattern) == canonical_address(address),
     }
 }

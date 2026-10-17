@@ -41,6 +41,7 @@ pub struct Config {
     pub policy: PolicyConfig,
     pub dlp: DlpProfile,
     pub encrypt: EncryptConfig,
+    pub events: EventsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -426,6 +427,12 @@ pub struct ClassifyConfig {
     /// Domains never flagged as lookalikes, such as partners or vendors whose
     /// names resemble a tenant's.
     pub allowed_domains: Vec<String>,
+    /// Staff directory CSV (`email,name[,vip]`) used to spot display-name
+    /// impersonation. Unset disables that check.
+    pub directory_csv: Option<PathBuf>,
+    /// SQLite file recording who has had mail delivered to whom, for
+    /// first-time sender checks.
+    pub history_database: PathBuf,
 }
 
 /// `[encrypt]`: the `encrypt`, `encrypt_smime` and `encrypt_portal` policy
@@ -488,6 +495,131 @@ pub struct PolicyConfig {
     pub database: Option<PathBuf>,
     /// Domains outside the tenant's own that redirect and bcc may send to.
     pub forward_domains: Vec<String>,
+}
+
+/// Event export to SIEMs. See `docs/events.md`. Every sink is off unless set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EventsConfig {
+    /// Events held in memory per sink before overflowing to disk.
+    pub queue_capacity: usize,
+    pub batch_size: usize,
+    /// Defaults to `<spool.dir>/events`.
+    pub overflow_dir: Option<PathBuf>,
+    /// Events held on disk per sink before new events are dropped.
+    pub overflow_max_files: usize,
+    pub syslog: Option<SyslogSinkConfig>,
+    pub webhook: Option<WebhookSinkConfig>,
+    pub wedgetail: Option<WedgetailSinkConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SyslogSinkConfig {
+    /// `host:port`, for example `siem.corp.example:6514`.
+    pub address: String,
+    #[serde(default = "default_true")]
+    pub tls: bool,
+    /// PEM bundle for a private CA. Public roots are always trusted.
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+    #[serde(default)]
+    pub payload: EventPayload,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum EventPayload {
+    #[default]
+    Cef,
+    Json,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookSinkConfig {
+    pub url: String,
+    /// File holding the HMAC key (at least 16 bytes, trailing newline ignored).
+    pub secret_file: PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WedgetailSinkConfig {
+    pub url: String,
+    pub token_file: PathBuf,
+    #[serde(default)]
+    pub ca_file: Option<PathBuf>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            queue_capacity: 1024,
+            batch_size: 100,
+            overflow_dir: None,
+            overflow_max_files: 100_000,
+            syslog: None,
+            webhook: None,
+            wedgetail: None,
+        }
+    }
+}
+
+impl EventsConfig {
+    /// Every sink destination as a URL, in the form the residency guard checks.
+    /// Syslog is `syslog://host:port` or `syslog-tls://host:port`.
+    pub fn destinations(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(syslog) = &self.syslog {
+            let scheme = if syslog.tls { "syslog-tls" } else { "syslog" };
+            out.push(format!("{scheme}://{}", syslog.address));
+        }
+        out.extend(self.webhook.iter().map(|w| w.url.clone()));
+        out.extend(self.wedgetail.iter().map(|w| w.url.clone()));
+        out
+    }
+
+    fn validate(&self) -> Result<(), ConfigError> {
+        if self.queue_capacity == 0 || self.batch_size == 0 {
+            return Err(ConfigError::Invalid(
+                "events.queue_capacity and events.batch_size must be at least 1".into(),
+            ));
+        }
+        if let Some(syslog) = &self.syslog {
+            let url = url::Url::parse(&format!("syslog://{}", syslog.address)).ok();
+            if url.as_ref().and_then(|u| u.host_str()).is_none()
+                || url.as_ref().and_then(|u| u.port()).is_none()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "events.syslog.address '{}' must be host:port",
+                    syslog.address
+                )));
+            }
+        }
+        let https = self
+            .webhook
+            .iter()
+            .map(|w| ("webhook", &w.url))
+            .chain(self.wedgetail.iter().map(|w| ("wedgetail", &w.url)));
+        for (name, url) in https {
+            match url::Url::parse(url) {
+                Ok(parsed) if parsed.scheme() == "https" && parsed.host_str().is_some() => {}
+                _ => {
+                    return Err(ConfigError::Invalid(format!(
+                        "events.{name}.url '{url}' must be an https URL"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Default for LogConfig {
@@ -694,6 +826,8 @@ impl Default for ClassifyConfig {
             brands_file: None,
             protected_domains: Vec::new(),
             allowed_domains: Vec::new(),
+            directory_csv: None,
+            history_database: PathBuf::from("/var/lib/currawong/sender-history.sqlite"),
         }
     }
 }
@@ -745,6 +879,7 @@ impl Default for Config {
             policy: PolicyConfig::default(),
             dlp: DlpProfile::default(),
             encrypt: EncryptConfig::default(),
+            events: EventsConfig::default(),
         }
     }
 }
@@ -959,6 +1094,7 @@ impl Config {
                 tenant.id
             )));
         }
+        self.events.validate()?;
         Ok(())
     }
 

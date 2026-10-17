@@ -1,0 +1,63 @@
+[Unit]
+Description=Currawong email security gateway
+Documentation=https://github.com/jusso-dev/currawong
+After=network-online.target clamav-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=currawong
+Group=currawong
+ExecStartPre=/usr/bin/currawongd --config /etc/currawong/currawong.toml --check-config
+ExecStart=/usr/bin/currawongd --config /etc/currawong/currawong.toml
+# SIGHUP reloads the TLS certificate and key.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+LimitNOFILE=65536
+
+# Files. /usr, /boot and /etc are read-only; only the spool and state are writable.
+# /var/lib/currawong is created by StateDirectory. postinst creates
+# /var/spool/currawong and /etc/currawong (root:currawong, 0750).
+StateDirectory=currawong
+StateDirectoryMode=0750
+ReadWritePaths=/var/spool/currawong
+UMask=0027
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Privileges. Bind 25, 465 and 587 without running as root.
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+# Kernel and namespaces.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_UNIX for a clamd socket, AF_NETLINK for interface enumeration.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# System calls. The parser worker installs its own seccomp filter on top of
+# this one and lowers its rlimits, so seccomp and @resources stay allowed.
+SystemCallArchitectures=native
+SystemCallFilter=@system-service seccomp
+SystemCallFilter=~@privileged @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

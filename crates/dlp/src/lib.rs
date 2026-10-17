@@ -1,5 +1,5 @@
 //! Australian identifier detection with checksum validation, and the
-//! protective-marking parser used by the fuzzer.
+//! PSPF protective-marking parser (`pspf`).
 //!
 //! `scan` returns counts and redacted samples only. Full identifiers stay in
 //! memory for the length of the scan and are never logged or stored.
@@ -8,10 +8,13 @@
 //! recipient certificate, or the secure pull portal.
 pub mod detectors;
 pub mod encrypt;
+pub mod pspf;
 
 pub use currawong_core::config::DlpProfile;
+use currawong_core::Classification;
 pub use currawong_core::{DlpKind, DlpReport, DlpSample, Error};
 pub use detectors::{Match, Scan};
+pub use pspf::ProtectiveMarking;
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -20,24 +23,19 @@ use std::collections::{BTreeMap, HashSet};
 pub const MAX_SCAN_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SAMPLES_PER_KIND: usize = 5;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProtectiveMarking {
-    Official,
-    OfficialSensitive,
-    Protected,
-}
-
-pub fn parse_pspf(value: &str) -> Option<ProtectiveMarking> {
-    let value = value.trim();
-    let value = value
-        .strip_prefix("X-Protective-Marking:")
-        .unwrap_or(value)
-        .trim();
-    match value.to_ascii_lowercase().as_str() {
-        "official" => Some(ProtectiveMarking::Official),
-        "official: sensitive" | "official:sensitive" => Some(ProtectiveMarking::OfficialSensitive),
-        "protected" => Some(ProtectiveMarking::Protected),
-        _ => None,
+/// The classification in an `X-Protective-Marking` value, or a bare
+/// classification word such as `OFFICIAL: Sensitive`.
+pub fn parse_pspf(value: &str) -> Option<Classification> {
+    match pspf::parse_header(value) {
+        Ok(marking) => Some(marking.sec),
+        Err(_) => Classification::parse(
+            value
+                .trim()
+                .trim_start_matches("X-Protective-Marking:")
+                .trim()
+                .replace(": ", ":")
+                .as_str(),
+        ),
     }
 }
 
@@ -143,6 +141,8 @@ pub fn fuzz_scan(data: &[u8]) {
     let text = String::from_utf8_lossy(&data[..end]);
     let _ = scan(&text, &DlpProfile::default());
     let _ = parse_pspf(&text);
+    let _ = pspf::parse_subject(&text);
+    let _ = pspf::inspect(&data[..end]);
 }
 
 #[cfg(test)]
@@ -156,9 +156,13 @@ mod tests {
         assert_eq!(report.samples[0].redacted, "123 *** ***");
         assert_eq!(
             parse_pspf("OFFICIAL: Sensitive"),
-            Some(ProtectiveMarking::OfficialSensitive)
+            Some(Classification::OfficialSensitive)
         );
-        assert_eq!(parse_pspf("PROTECTED"), Some(ProtectiveMarking::Protected));
-        assert_eq!(parse_pspf("SECRET"), None);
+        assert_eq!(parse_pspf("PROTECTED"), Some(Classification::Protected));
+        assert_eq!(parse_pspf("CONFIDENTIAL"), None);
+        assert_eq!(
+            parse_pspf("VER=2018.6, NS=gov.au, SEC=SECRET"),
+            Some(Classification::Secret)
+        );
     }
 }

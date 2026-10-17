@@ -1,0 +1,11 @@
+target/
+fuzz/target/
+fuzz/corpus/
+fuzz/artifacts/
+.git/
+.claude/
+spool/
+*.deb
+*.qcow2
+*.vmdk
+*.raw

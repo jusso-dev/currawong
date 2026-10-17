@@ -293,6 +293,10 @@ enabled = true
 bayes_database = "/var/lib/currawong/bayes.sqlite"
 protected_domains = []
 allowed_domains = []
+# BEC: staff directory (email,name[,vip] per line) for display-name spoofing,
+# and the sender history used for first-time sender checks.
+# directory_csv = "/etc/currawong/directory.csv"
+history_database = "/var/lib/currawong/sender-history.sqlite"
 
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.
@@ -300,6 +304,8 @@ allowed_domains = []
 # Policies are reloaded on every pipeline pass.
 [policy]
 # pack = "/etc/currawong/policies.toml"
+# Australian Government tenants: config/policies/government.toml adds PSPF
+# protective marking enforcement to the default pack (docs/pspf.md).
 # database = "/var/lib/currawong/policy.db"
 forward_domains = []
 
@@ -338,3 +344,30 @@ base_url = "https://secure.example.com.au"
 from = ""
 retention_days = 30
 requests_per_minute = 10
+
+
+# events: export to SIEMs (schema in docs/events.md). Every sink is off until configured.
+# Each sink has its own bounded queue; overflow goes to disk (default <spool.dir>/events),
+# then events are dropped and counted. Every destination must pass the residency rules.
+[events]
+queue_capacity = 1024
+batch_size = 100
+overflow_max_files = 100000
+# overflow_dir = "/var/lib/currawong/events"
+
+# RFC 5424 over TLS (or tls = false for plain TCP). payload = "cef" or "json".
+# [events.syslog]
+# address = "siem.corp.example:6514"
+# tls = true
+# ca_file = "/etc/currawong/siem-ca.pem"
+# payload = "cef"
+
+# HMAC-SHA256 signed webhook. The key file holds at least 16 bytes.
+# [events.webhook]
+# url = "https://10.20.0.5/currawong"
+# secret_file = "/etc/currawong/webhook.key"
+
+# Wedgetail: OCSF over HTTPS with a bearer token.
+# [events.wedgetail]
+# url = "https://wedgetail.corp.example/api/ingest/ocsf"
+# token_file = "/etc/currawong/wedgetail.token"

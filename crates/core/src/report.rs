@@ -115,6 +115,54 @@ pub struct SpamReport {
     pub total: f64,
 }
 
+/// Why a message looks like business email compromise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BecReason {
+    /// The display name is a directory person's, but the address is not theirs
+    /// and is outside the tenant.
+    DisplayNameSpoof,
+    /// The From or Reply-To domain imitates a protected domain.
+    LookalikeSender,
+    /// Replies go to free mail or another domain than the sender's.
+    ReplyToMismatch,
+    /// Asks to change bank or payment details, or quotes BSB and account numbers.
+    PaymentChange,
+    /// Asks for gift cards or vouchers.
+    GiftCard,
+    Urgency,
+    Secrecy,
+    /// No earlier delivered mail from this sender to the tenant.
+    FirstTimeSender,
+    /// DMARC failed for the From domain.
+    AuthFailure,
+}
+
+impl BecReason {
+    /// Policy flag suffix, `bec.<name>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DisplayNameSpoof => "display_name_spoof",
+            Self::LookalikeSender => "lookalike_sender",
+            Self::ReplyToMismatch => "reply_to_mismatch",
+            Self::PaymentChange => "payment_change",
+            Self::GiftCard => "gift_card",
+            Self::Urgency => "urgency",
+            Self::Secrecy => "secrecy",
+            Self::FirstTimeSender => "first_time_sender",
+            Self::AuthFailure => "auth_failure",
+        }
+    }
+}
+
+/// Score from 0 to 1 with the reasons that added to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BecReport {
+    pub score: f64,
+    pub reasons: Vec<BecReason>,
+    /// Human-readable explanation per reason, without message content.
+    pub explanation: Vec<String>,
+}
+
 /// A YARA rule that matched the raw message, a MIME part or an archive member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YaraMatch {
@@ -147,6 +195,9 @@ pub struct ScanReport {
     pub spam: Option<SpamReport>,
     #[serde(default)]
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Business email compromise score and reasons, for inbound mail.
+    #[serde(default)]
+    pub bec: Option<BecReport>,
     /// Named conditions from later stages, exposed to policy as flags, for
     /// example `classify_skipped` or `link_scan_truncated`.
     #[serde(default)]
@@ -158,6 +209,79 @@ pub struct ScanReport {
     /// Australian identifier findings. `None` when DLP did not run.
     #[serde(default)]
     pub dlp: Option<DlpReport>,
+    /// PSPF protective marking read from the `X-Protective-Marking` header
+    /// and the subject. `None` when markings were not inspected.
+    #[serde(default)]
+    pub marking: Option<MarkingReport>,
+}
+
+/// PSPF security classifications, lowest first, so `Ord` compares levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Classification {
+    Unofficial,
+    Official,
+    OfficialSensitive,
+    Protected,
+    Secret,
+    TopSecret,
+}
+
+impl Classification {
+    /// The form the Email Protective Marking Standard writes after `SEC=`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unofficial => "UNOFFICIAL",
+            Self::Official => "OFFICIAL",
+            Self::OfficialSensitive => "OFFICIAL:Sensitive",
+            Self::Protected => "PROTECTED",
+            Self::Secret => "SECRET",
+            Self::TopSecret => "TOP-SECRET",
+        }
+    }
+
+    /// Case-insensitive. Accepts `OFFICIAL:Sensitive`, `OFFICIAL Sensitive`,
+    /// `OFFICIAL-Sensitive`, `TOP-SECRET` and `TOP SECRET`.
+    pub fn parse(value: &str) -> Option<Self> {
+        let canonical: String = value
+            .trim()
+            .chars()
+            .map(|c| {
+                if matches!(c, ' ' | '-' | '_') {
+                    ':'
+                } else {
+                    c.to_ascii_uppercase()
+                }
+            })
+            .collect();
+        Some(match canonical.as_str() {
+            "UNOFFICIAL" => Self::Unofficial,
+            "OFFICIAL" => Self::Official,
+            "OFFICIAL:SENSITIVE" => Self::OfficialSensitive,
+            "PROTECTED" => Self::Protected,
+            "SECRET" => Self::Secret,
+            "TOP:SECRET" => Self::TopSecret,
+            _ => return None,
+        })
+    }
+}
+
+/// What the gateway found in a message's protective markings.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkingReport {
+    /// The effective classification: the header's when it is valid,
+    /// otherwise the subject's.
+    pub classification: Option<Classification>,
+    pub header: Option<Classification>,
+    pub subject: Option<Classification>,
+    pub caveats: Vec<String>,
+    pub access: Vec<String>,
+    /// A marking was present but did not follow the standard.
+    pub invalid: bool,
+    /// Header and subject both carry a marking and they disagree.
+    pub mismatch: bool,
+    /// Parse errors, for the explanation and the audit trail.
+    pub errors: Vec<String>,
 }
 
 /// Identifier kinds found by `currawong-dlp`.
@@ -222,7 +346,9 @@ impl ScanReport {
             dlp: None,
             spam: None,
             lookalikes: Vec::new(),
+            bec: None,
             flags: Vec::new(),
+            marking: None,
             modified: false,
         }
     }

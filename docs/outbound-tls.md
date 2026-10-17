@@ -28,7 +28,7 @@ WebPKI roots are the Mozilla set shipped in `webpki-roots`.
 - **Time and connections.** One `deliver` call is bounded at 30 minutes. At most `delivery.max_per_destination` sessions are open to one recipient domain.
 - **When the next host is tried.** A 4xx at MAIL or RCPT moves those recipients on to the next MX host. A recipient fails permanently only when every host that was tried failed permanently.
 - **Recipient domains.** A domain that is not a plain host name is refused before any DNS query.
-- **Outbound HTTP.** Policy fetches and TLS-RPT uploads use only `https` URLs on port 443 that name a plain host, and those names must resolve to public addresses. The one exception is `delivery.allow_private_mx`. The core residency guard is not yet wired in. Its single call site is `residency_check` in `crates/smtp/src/delivery/outbound_tls.rs`.
+- **Outbound HTTP.** Policy fetches and TLS-RPT uploads use only `https` URLs on port 443 that name a plain host, and those names must resolve to public addresses. The one exception is `delivery.allow_private_mx`. These requests are outside the residency guard by design; see [residency.md](residency.md#recipient-designated-hosts).
 
 ## DNSSEC
 

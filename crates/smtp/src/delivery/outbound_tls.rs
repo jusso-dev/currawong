@@ -108,6 +108,10 @@ impl Resolve for PublicResolver {
 
 /// The only URLs policy fetches and report uploads may use: `https`, a plain
 /// host name (no address literal, user or odd port) and port 443.
+///
+/// No residency check, by design: these hosts are chosen by the recipient
+/// domain's DNS, like the MX itself, and carry no stored content beyond what
+/// delivery sends. See docs/residency.md.
 pub fn checked_url(url: &str) -> Result<reqwest::Url, String> {
     let parsed = reqwest::Url::parse(url).map_err(|err| format!("{url}: {err}"))?;
     let host_ok = matches!(parsed.host(), Some(url::Host::Domain(host)) if valid_domain(host));
@@ -121,15 +125,7 @@ pub fn checked_url(url: &str) -> Result<reqwest::Url, String> {
             "{url}: not an https URL on port 443 of a host name"
         ));
     }
-    residency_check(&parsed)?;
     Ok(parsed)
-}
-
-/// RESIDENCY: the single call site for the core residency guard on outbound
-/// HTTP (MTA-STS policy fetches and TLS-RPT uploads). Wire
-/// `ResidencyGuard::check_request` here when it lands on main.
-fn residency_check(_url: &reqwest::Url) -> Result<(), String> {
-    Ok(())
 }
 
 #[cfg(test)]

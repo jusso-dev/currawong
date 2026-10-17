@@ -7,15 +7,24 @@
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
 //!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
 //!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
-//!   `dlp.incomplete` when some text could not be scanned for identifiers.
+//!   `dlp.incomplete` when some text could not be scanned for identifiers;
+//!   `pspf.invalid` (a protective marking that breaks the standard),
+//!   `pspf.mismatch` (header and subject markings disagree) and
+//!   `pspf.missing` (no protective marking at all), `pspf.caveat` and
+//!   `pspf.caveat.<caveat>` (for example `pspf.caveat.sh:cabinet`), and
+//!   `pspf.access.<marker>` (for example `pspf.access.legal-privilege`).
 //!   Classify adds `lookalike` when a sender or link domain imitates a
 //!   protected one, and passes on report flags such as `classify_skipped`
 //!   and `link_scan_truncated`.
+//! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
+//!   for the `marking` and `marking_at_least` conditions.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).
 //! - scores: `spam` (the classify total: Bayes points plus rule scores) and
-//!   `lookalike` (the strongest finding, 0 to 1). Reserved: `bec`.
+//!   `lookalike` (the strongest finding, 0 to 1); `bec` (0 to 1, inbound only)
+//!   with flags `bec.<reason>` such as `bec.display_name_spoof` and
+//!   `bec.payment_change`.
 use currawong_core::{AuthResults, PartFlag, ScanReport};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -53,6 +62,12 @@ impl Signals {
         if let Some(spam) = &report.spam {
             signals.score("spam", spam.total);
         }
+        if let Some(bec) = &report.bec {
+            signals.score("bec", bec.score);
+            for reason in &bec.reasons {
+                signals.flag(&format!("bec.{}", reason.as_str()));
+            }
+        }
         if let Some(strongest) = report.lookalikes.iter().map(|f| f.score).reduce(f64::max) {
             signals.flag("lookalike");
             signals.score("lookalike", strongest);
@@ -65,6 +80,25 @@ impl Signals {
             }
             if dlp.incomplete {
                 signals.flag("dlp.incomplete");
+            }
+        }
+        if let Some(marking) = &report.marking {
+            signals.marking = marking.classification.map(|c| c.as_str().to_string());
+            for (name, set) in [
+                ("pspf.invalid", marking.invalid),
+                ("pspf.mismatch", marking.mismatch),
+                ("pspf.missing", marking.classification.is_none()),
+            ] {
+                if set {
+                    signals.flag(name);
+                }
+            }
+            for caveat in &marking.caveats {
+                signals.flag("pspf.caveat");
+                signals.flag(&format!("pspf.caveat.{}", caveat.to_ascii_lowercase()));
+            }
+            for access in &marking.access {
+                signals.flag(&format!("pspf.access.{}", access.to_ascii_lowercase()));
             }
         }
         if !report.yara.is_empty() {

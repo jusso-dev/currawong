@@ -140,8 +140,8 @@ async fn report_domain(
     // A report spooled before a crash is not queued a second time.
     if spool.load(&id).await.is_err() && !rcpt_to.is_empty() {
         // Generated here, so there is nothing to scan: mark it deliverable.
-        // Reports leave through outbound delivery like any other message, so
-        // they pick up outbound DKIM signing once delivery applies it.
+        // Not DKIM signed yet: signing happens at classify with a tenant
+        // key, and a report skips classify and carries no tenant.
         let env = Envelope {
             id: id.clone(),
             tenant_id: None,

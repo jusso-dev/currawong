@@ -1,6 +1,7 @@
 //! Linear URL scan. Bounded, no regular expressions.
 //! Rewriting for click-time protection is an M2 product. This function only
 //! finds URLs and can substitute a local token of the same length budget.
+//! TODO: the click-time handler emits `currawong_integrations::export::EventKind::UrlClick`.
 
 pub fn find_urls(input: &str) -> Vec<String> {
     currawong_parser::fuzz::urls_in(input.as_bytes())
