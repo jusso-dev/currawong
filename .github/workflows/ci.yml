@@ -1,4 +1,3 @@
-# Move to .github/workflows/ci.yml once a token with workflow scope is available.
 name: ci
 on: [push, pull_request]
 jobs:

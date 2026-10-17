@@ -77,7 +77,7 @@ cargo test --workspace
 
 Packaging for the container image, Debian package, appliance image and Helm chart is described in [docs/packaging.md](docs/packaging.md). It is not yet verified end to end; see [docs/VALIDATION.md](docs/VALIDATION.md).
 
-CI config lives in `docs/ci/ci.yml` (checks) and `docs/ci/release.yml` (packaging) until it is moved into `.github/workflows/`.
+CI runs from `.github/workflows/`: `ci.yml` (checks), `release.yml` (packaging) and `fuzz.yml` (nightly fuzzing).
 
 ## Licence
 

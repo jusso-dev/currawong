@@ -25,6 +25,15 @@ ignore = [
     "RUSTSEC-2026-0359",
     "RUSTSEC-2026-0362", # async entrypoints: async not built
     "RUSTSEC-2026-0363", # component model handle tables: not built
+    # zip 2.4 (parser worker, until it moves to zip 9) and zip 8.6 (pulled in
+    # by calamine, no zip 9 release yet). All three advisories are in
+    # `ZipArchive::extract` / `ZipStreamReader::extract` writing entries to a
+    # directory (SUID bits, symlink targets, permissions through symlinks).
+    # Currawong never extracts archives to disk: entries are read into memory
+    # inside the sandboxed parser worker. Drop these when both are on zip >= 9.
+    "RUSTSEC-2026-0367",
+    "RUSTSEC-2026-0368",
+    "RUSTSEC-2026-0369",
 ]
 
 [licenses]

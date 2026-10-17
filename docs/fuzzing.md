@@ -6,7 +6,7 @@ Fuzz entry points live in library code so the normal test suite does not need li
 - `currawong_parser::fuzz::mime`.
 - `currawong_fuzzstand::*` for the rest: `archive_extract` (the first byte picks the attachment name, two passwords are tried), `office_detect` (file type and Office/RTF checks), `pspf_parse`, `dlp_scan`, `url_rewrite` (`find_urls` and `rewrite`), `auth_strip` (forged Authentication-Results), `clamd_address`, `parser_ipc` (length-prefixed frames and the JSON request) and `spool_envelope` (envelope JSON).
 
-`currawong_fuzzstand::TARGETS` lists every target. A test checks that it matches `fuzz/fuzz_targets/`, `fuzz/Cargo.toml` and `docs/ci/fuzz.yml`.
+`currawong_fuzzstand::TARGETS` lists every target. A test checks that it matches `fuzz/fuzz_targets/`, `fuzz/Cargo.toml` and `.github/workflows/fuzz.yml`.
 
 ## Stable stand-in
 
@@ -30,7 +30,7 @@ cargo +nightly fuzz build
 cargo +nightly fuzz run smtp_command -- -max_total_time=60 -rss_limit_mb=512
 ```
 
-`scripts/seed-fuzz.sh` copies `testdata/` fixtures and small protocol seeds into `fuzz/corpus/<target>/`. Nightly CI is described in `docs/ci/fuzz.yml` (10 minutes per target, 512 MiB RSS). Crashes go to `fuzz/artifacts/` (ignored by git). Do not add exploit inputs; a crash is a panic or a resource blow-up, and the fix is a tighter limit or a rejected parse. Add the minimised input as a unit test next to the fix.
+`scripts/seed-fuzz.sh` copies `testdata/` fixtures and small protocol seeds into `fuzz/corpus/<target>/`. Nightly CI is described in `.github/workflows/fuzz.yml` (10 minutes per target, 512 MiB RSS). Crashes go to `fuzz/artifacts/` (ignored by git). Do not add exploit inputs; a crash is a panic or a resource blow-up, and the fix is a tighter limit or a rejected parse. Add the minimised input as a unit test next to the fix.
 
 ## Gaps
 
