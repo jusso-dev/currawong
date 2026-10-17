@@ -67,6 +67,12 @@ zeroize = "1"
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
 proptest = "1"
+# S3-compatible quarantine blobs. TLS through rustls; certificates are verified.
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+askama = "0.16"
+# 0.13 needs the digest 0.11 line; sha2 here is 0.10.
+hmac = "0.12"
+tower = { version = "0.5", features = ["util"] }
 
 # RSA-2048 key generation is very slow unoptimised, and tests generate keys.
 [profile.dev.package.rsa]

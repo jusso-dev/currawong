@@ -148,8 +148,20 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             shutdown.clone(),
         )?;
     }
-    let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
-        .map_err(|err| err.to_string())?;
+    let quarantine_dir = cfg.quarantine_dir();
+    let blobs =
+        currawong_quarantine::open_blob_store(&cfg.quarantine.blob_store, &guard, &quarantine_dir)?;
+    let quarantine = currawong_quarantine::QuarantineStore::open(&quarantine_dir)
+        .map_err(|err| err.to_string())?
+        .with_config(&cfg.quarantine)
+        .with_blobs(blobs);
+    spawn_quarantine(
+        Arc::clone(&cfg),
+        Arc::clone(&spool),
+        quarantine.clone(),
+        shutdown.clone(),
+    )
+    .await?;
     if cfg.auth.bimi {
         // Its own resolver and queue: lookups never wait in the classify loop.
         let (jobs, queue) = tokio::sync::mpsc::channel(BIMI_QUEUE);
@@ -249,6 +261,77 @@ fn spawn_dmarc_reports(
                         tracing::error!(%err, "dmarc report pass failed");
                     }
                     tokio::time::sleep(Duration::from_secs(300)).await;
+                }
+            }
+        },
+    ));
+    Ok(())
+}
+
+/// Hourly retention purge and digests on their own supervised task, and the
+/// digest-link and release endpoints when `quarantine.listen` is set.
+async fn spawn_quarantine(
+    cfg: Arc<currawong_core::Config>,
+    spool: Arc<Spool>,
+    store: currawong_quarantine::QuarantineStore,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    use currawong_quarantine::{digest, http, LinkSigner};
+    let q = &cfg.quarantine;
+    let links =
+        if q.digests || q.listen.is_some() {
+            Some(LinkSigner::load_or_create(&q.link_key_path).map_err(|err| {
+                format!("quarantine link key {}: {err}", q.link_key_path.display())
+            })?)
+        } else {
+            None
+        };
+    if let (Some(listen), Some(links)) = (&q.listen, &links) {
+        let listener = TcpListener::bind(listen)
+            .await
+            .map_err(|err| format!("{listen}: {err}"))?;
+        tracing::info!(bind = %listen, "quarantine endpoints listening");
+        let app = http::router(http::HttpState {
+            store: store.clone(),
+            spool: Arc::clone(&spool),
+            links: links.clone(),
+        });
+        let stop = shutdown.clone();
+        tokio::spawn(async move {
+            let serve = axum::serve(listener, app).with_graceful_shutdown(stop.cancelled_owned());
+            if let Err(err) = serve.await {
+                tracing::error!(%err, "quarantine endpoints stopped");
+            }
+        });
+    }
+    let digests = q.digests.then(|| digest::DigestSettings::from_config(&cfg));
+    tokio::spawn(supervise(
+        "quarantine maintenance",
+        shutdown,
+        Duration::from_secs(5),
+        move || {
+            let (store, spool, links, digests) = (
+                store.clone(),
+                Arc::clone(&spool),
+                links.clone(),
+                digests.clone(),
+            );
+            async move {
+                loop {
+                    let now = time::OffsetDateTime::now_utc();
+                    match store.purge(now).await {
+                        Ok(0) => {}
+                        Ok(count) => tracing::info!(count, "expired quarantine items purged"),
+                        Err(err) => tracing::error!(%err, "quarantine purge failed"),
+                    }
+                    if let (Some(settings), Some(links)) = (&digests, &links) {
+                        if let Err(err) =
+                            digest::send_digests(&store, &spool, links, settings, now).await
+                        {
+                            tracing::error!(%err, "quarantine digests failed");
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(3600)).await;
                 }
             }
         },

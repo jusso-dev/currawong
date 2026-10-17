@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<title>Quarantine</title>
+</head>
+<body>
+<p>{{ message }}</p>
+{% if let Some(button) = button %}
+<form method="post"><button type="submit">{{ button }}</button></form>
+{% endif %}
+</body>
+</html>

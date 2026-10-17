@@ -4,7 +4,7 @@ use currawong_core::{
     config::{Config, DmarcReportConfig},
     AuthMethodResult, AuthResults, Direction, MessageId,
 };
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{Hold, QuarantineStore};
 use currawong_smtp::dns::MapDns;
 use currawong_spool::{Envelope, Spool, SpoolState};
 use currawongd::{ready_to_deliver, send_dmarc_reports, supervise, BimiJob, BimiWorker, Pipeline};
@@ -441,7 +441,22 @@ async fn bimi_logo_is_stored_off_the_classify_loop_with_a_domain_cache() {
     let quarantine = QuarantineStore::open(dir.path()).unwrap();
     let ids = ["01ARZ3NDEKTSV4RRFFQ69G5FAV", "01ARZ3NDEKTSV4RRFFQ69G5FAW"];
     for id in ids {
-        quarantine.hold(id, "spam", &message()).unwrap();
+        let hold = Hold {
+            message_id: MessageId(id.into()),
+            tenant_id: None,
+            queue: "spam".into(),
+            reason: "spam".into(),
+            reasons: Vec::new(),
+            sender: "user@example.test".into(),
+            recipients: vec!["dest@gateway.test".into()],
+            score: None,
+            direction: Direction::Inbound,
+            headers: Vec::new(),
+        };
+        quarantine
+            .hold(&hold, &message(), OffsetDateTime::now_utc())
+            .await
+            .unwrap();
     }
     let txt = Counting {
         records: HashMap::from([

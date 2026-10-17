@@ -1,7 +1,7 @@
 //! Run the pipeline before delivery. Unscanned mail is never handed to the deliverer.
 use currawong_core::{config::Config, Direction, MessageId, ScanReport, Verdict};
 use currawong_policy::{canonical_domain, Action, Decision};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{Hold, QuarantineStore, RELEASE_PIPELINE};
 use currawong_smtp::delivery::{build_dsn, is_null_sender};
 use currawong_spool::{Envelope, RcptStatus, Spool, SpoolState};
 use serde::{Deserialize, Serialize};
@@ -43,22 +43,57 @@ pub async fn classify_pending(
         .await
         .map_err(|err| err.to_string())?;
     let now = OffsetDateTime::now_utc();
-    let due = incoming.into_iter().filter(pending_scan).chain(
-        deferred
-            .into_iter()
-            .filter(|env| env.pipeline == "scan_defer")
-            .filter(|env| env.next_attempt_at.is_none_or(|when| when <= now))
-            .map(|mut env| {
-                env.state = SpoolState::Deferred;
-                env
-            }),
-    );
+    let due = incoming
+        .into_iter()
+        .filter(|env| pending_scan(env) || env.pipeline == RELEASE_PIPELINE)
+        .chain(
+            deferred
+                .into_iter()
+                .filter(|env| env.pipeline == "scan_defer")
+                .filter(|env| env.next_attempt_at.is_none_or(|when| when <= now))
+                .map(|mut env| {
+                    env.state = SpoolState::Deferred;
+                    env
+                }),
+        );
+    let mut released = Vec::new();
     for env in due {
         let id = env.id.clone();
-        if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
+        if env.pipeline == RELEASE_PIPELINE {
+            released.push(env);
+        } else if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
             tracing::error!(%id, %err, "classification failed");
         }
     }
+    for env in released {
+        let id = env.id.clone();
+        if let Err(err) = deliver_released(spool, pipeline, env).await {
+            tracing::error!(%id, %err, "released message not queued for delivery, will retry");
+        }
+    }
+    Ok(())
+}
+
+/// A message released from quarantine is delivered without running policy
+/// again, so this one release cannot be quarantined a second time. The
+/// release itself is in the quarantine audit trail. Inbound mail keeps the
+/// headers it was held with; outbound mail is signed now.
+async fn deliver_released(
+    spool: &Spool,
+    pipeline: &Pipeline,
+    mut env: Envelope,
+) -> Result<(), String> {
+    if env.direction == Direction::Outbound {
+        let raw = spool
+            .read_body(&env.id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let report = ScanReport::new(env.id.clone());
+        env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
+    }
+    env.pipeline = "deliver".into();
+    spool.update(&env).await.map_err(|err| err.to_string())?;
+    tracing::info!(id = %env.id, "released from quarantine, policy skipped");
     Ok(())
 }
 
@@ -210,8 +245,21 @@ async fn act(
                 Some(queue) => format!("{reason} (queue {queue})"),
                 None => reason.clone(),
             };
+            let hold = Hold {
+                message_id: env.id.clone(),
+                tenant_id: decision.tenant_id.clone(),
+                queue: decision.queue().unwrap_or("policy").to_string(),
+                reason: reason.clone(),
+                reasons: decision.explanation.clone(),
+                sender: env.mail_from.clone(),
+                recipients: env.rcpt_to.clone(),
+                score: None,
+                direction: env.direction,
+                headers: env.prepend_headers.clone(),
+            };
             quarantine
-                .hold(env.id.as_str(), &reason, raw)
+                .hold(&hold, raw, OffsetDateTime::now_utc())
+                .await
                 .map_err(|err| err.to_string())?;
             env.pipeline = "quarantine".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;

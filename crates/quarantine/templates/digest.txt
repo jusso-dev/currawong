@@ -1,0 +1,10 @@
+These messages to {{ recipient }} were held in quarantine. Release a message to have it delivered, or delete it. Each link works once.
+{% for entry in entries %}
+Received: {{ entry.received }}
+From: {{ entry.sender }}
+Subject: {{ entry.subject }}
+Queue: {{ entry.queue }}
+Release: {{ entry.release }}
+Delete: {{ entry.delete }}
+{% endfor %}
+Messages you do not act on are removed automatically. Do not forward this email: anyone with these links can release the messages.

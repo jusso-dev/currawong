@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<title>Quarantine digest</title>
+</head>
+<body style="font-family: sans-serif; color: #1a1a1a;">
+<p>These messages to {{ recipient }} were held in quarantine. Release a message to have it delivered, or delete it. Each link works once.</p>
+<table cellpadding="6" cellspacing="0" border="1" style="border-collapse: collapse;">
+<thead>
+<tr><th align="left">Received</th><th align="left">From</th><th align="left">Subject</th><th align="left">Queue</th><th></th></tr>
+</thead>
+<tbody>
+{% for entry in entries %}
+<tr>
+<td>{{ entry.received }}</td>
+<td>{{ entry.sender }}</td>
+<td>{{ entry.subject }}</td>
+<td>{{ entry.queue }}</td>
+<td><a href="{{ entry.release }}">Release</a> | <a href="{{ entry.delete }}">Delete</a></td>
+</tr>
+{% endfor %}
+</tbody>
+</table>
+<p>Messages you do not act on are removed automatically. Do not forward this email: anyone with these links can release the messages.</p>
+</body>
+</html>

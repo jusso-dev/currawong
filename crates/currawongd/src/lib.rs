@@ -27,6 +27,9 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
         currawong_core::content::ObjectStoreClient::new(&guard, endpoint)
             .map_err(|err| err.to_string())?;
     }
+    if cfg.quarantine.blob_store.kind == "s3" {
+        currawong_quarantine::S3BlobStore::new(&guard, &cfg.quarantine.blob_store)?;
+    }
     yara_summary(&cfg)?;
     Ok(cfg)
 }
