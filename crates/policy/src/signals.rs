@@ -5,11 +5,12 @@
 //! Names produced today:
 //! - flags: `malware`, `active_content`, `fail_closed`, `defer`, plus part
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
-//!   `executable`, `limit_exceeded`.
+//!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
+//!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`).
 //!   Classify adds `lookalike` when a sender or link domain imitates a
 //!   protected one, and passes on report flags such as `classify_skipped`
 //!   and `link_scan_truncated`.
-//! - counts: `parts`, `urls`.
+//! - counts: `parts`, `urls`, `yara` (matches).
 //! - scores: `spam` (the classify total: Bayes points plus rule scores) and
 //!   `lookalike` (the strongest finding, 0 to 1). Reserved: `bec`. DLP
 //!   counts use `dlp.<kind>`.
@@ -56,6 +57,13 @@ impl Signals {
         }
         signals.count("parts", report.parts.len() as u64);
         signals.count("urls", report.urls.len() as u64);
+        if !report.yara.is_empty() {
+            signals.flag("yara");
+            signals.count("yara", report.yara.len() as u64);
+        }
+        for tag in report.yara.iter().flat_map(|hit| &hit.tags) {
+            signals.flag(&format!("yara.{tag}"));
+        }
         signals
     }
 

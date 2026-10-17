@@ -1,16 +1,17 @@
 //! Auth, parse, scan, classify and the policy decision.
-use currawong_auth::AuthChecker;
+use currawong_auth::{strip_forged, AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
 use currawong_classify::{message::MAX_RAW_BYTES, Classifier, TenantContext};
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
-use currawong_parser::{parse::parse_bytes, ParseResponse};
+use currawong_parser::{parse::parse_bytes_with, ParseResponse};
 use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
 };
+use currawong_scan::engines::yara::{self, CompiledRules, PollWatcher};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
-    Scanner, WorkerPool,
+    Scanner, WorkerPool, YaraEngine,
 };
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
@@ -19,6 +20,12 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    pub yara: Option<Arc<YaraEngine>>,
+    /// YARA is configured but its rules could not be loaded: fail closed.
+    pub yara_error: Option<String>,
+    _yara_watch: Option<PollWatcher>,
+    /// DKIM and ARC keys. `None` means nothing is signed or sealed.
+    pub keys: Option<Arc<KeyStore>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
     /// Spam and lookalike scoring. `None` when `classify.enabled` is off or
@@ -36,6 +43,21 @@ impl Pipeline {
                 cfg.scanner.max_jobs_per_worker as u64,
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
+            .with_rules_load_timeout(cfg.scanner.yara.load_timeout_secs)
+        });
+        let (yara, yara_error) = match yara_engine(&cfg) {
+            Ok(yara) => (yara, None),
+            Err(err) => {
+                tracing::error!(%err, "yara rules unavailable, mail fails closed");
+                (None, Some(err))
+            }
+        };
+        let _yara_watch = yara.as_ref().and_then(|engine| match engine.watch() {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                tracing::error!(%err, "yara hot reload disabled");
+                None
+            }
         });
         // `--check-config` has already loaded the rules and brands, so a
         // failure here is logged rather than stopping the daemon.
@@ -52,10 +74,110 @@ impl Pipeline {
             cfg,
             auth,
             pool,
+            yara,
+            yara_error,
+            _yara_watch,
+            keys: None,
             policies: default_pack().clone(),
             policy_stamp: None,
             classifier,
             classify_error,
+        }
+    }
+
+    pub fn with_keys(mut self, keys: KeyStore) -> Self {
+        self.keys = Some(Arc::new(keys));
+        self
+    }
+
+    /// Forged Authentication-Results left in older spool files (accepted
+    /// before DATA stripped them) are removed from `body_path` too, so they
+    /// are never delivered. Returns the cleaned bytes.
+    pub async fn strip_spooled(
+        &self,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> Result<Vec<u8>, String> {
+        let cleaned = strip_forged(raw, self.auth.authserv_id());
+        if cleaned.len() != raw.len() {
+            if let Some(path) = body_path {
+                rewrite_body(path, &cleaned)
+                    .await
+                    .map_err(|err| format!("could not strip forged headers: {err}"))?;
+            }
+        }
+        Ok(cleaned)
+    }
+
+    /// Our Authentication-Results, for inbound mail only: on outbound mail
+    /// it would leak internal addresses and attest a meaningless SPF result.
+    pub fn auth_headers(&self, env: &Envelope, report: &ScanReport) -> Vec<String> {
+        match env.direction {
+            Direction::Inbound => report.auth.iter().map(auth_header).collect(),
+            Direction::Outbound => Vec::new(),
+        }
+    }
+
+    /// Headers the deliverer prepends. Inbound: Authentication-Results, plus
+    /// an ARC set when a stage modified the message. Outbound: DKIM
+    /// signatures with the tenant's active keys. Replaces any earlier set so
+    /// re-evaluating deferred mail never stacks. `Err` when the tenant has a
+    /// key but signing failed.
+    pub async fn delivery_headers(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &ScanReport,
+    ) -> Result<Vec<String>, String> {
+        if env.direction == Direction::Inbound {
+            if report.modified {
+                if let Some(sealer) = self.arc_sealer().await {
+                    let sealed = self.auth.check_and_seal(raw, env, Some(&sealer)).await;
+                    return Ok(vec![sealed.header]);
+                }
+            }
+            return Ok(self.auth_headers(env, report));
+        }
+        let (Some(keys), Some(tenant), true) =
+            (&self.keys, &env.tenant_id, self.cfg.dkim.sign_outbound)
+        else {
+            return Ok(Vec::new());
+        };
+        let (keys, tenant_id, owned) = (Arc::clone(keys), tenant.clone(), raw.to_vec());
+        let signed = tokio::task::spawn_blocking(move || {
+            currawong_auth::sign_outbound(&keys, &owned, &tenant_id)
+        })
+        .await
+        .map_err(|err| err.to_string())??;
+        if signed.is_empty() {
+            tracing::warn!(id = %env.id, %tenant, "no active DKIM key for sender domain");
+            return Ok(Vec::new());
+        }
+        Ok(vec![signed])
+    }
+
+    /// Active gateway key for the authserv-id domain, RSA first because
+    /// RFC 8617 verifiers are only required to support rsa-sha256.
+    async fn arc_sealer(&self) -> Option<StoredKey> {
+        if !self.cfg.dkim.seal_arc {
+            return None;
+        }
+        let keys = Arc::clone(self.keys.as_ref()?);
+        let domain = self.auth.authserv_id().to_string();
+        let found =
+            tokio::task::spawn_blocking(move || keys.signing_keys(GATEWAY_TENANT, &domain, now()))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|found| found);
+        match found {
+            Ok(mut found) => {
+                found.sort_by_key(|key| key.algorithm != "rsa-sha256");
+                found.into_iter().next()
+            }
+            Err(err) => {
+                tracing::error!(%err, "ARC key lookup failed");
+                None
+            }
         }
     }
 
@@ -118,15 +240,26 @@ impl Pipeline {
     ) -> (ScanReport, MessageDecision) {
         let mut report = ScanReport::new(env.id.clone());
         let auth = self.auth.check(raw, env).await;
+        // The DMARC record could not be fetched, so its policy is unknown:
+        // retry rather than deliver a possible p=reject spoof.
+        if auth.dmarc.result == "temperror" {
+            report.defer = true;
+            report
+                .notes
+                .push("dmarc temperror: policy DNS unreachable".into());
+        }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             self.classify(env, raw, &mut report).await;
             let decision = self.decide(env, &report);
             return (report, decision);
         }
-        let parsed = self.parse(env, raw, body_path).await;
+        let rules = self.yara.as_ref().map(|engine| engine.current());
+        let parsed = self.parse(env, raw, body_path, rules.as_deref()).await;
+        drop(rules);
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
+        report.yara = parsed.yara.clone();
         let parser_failed = parsed.error.is_some();
         if let Some(err) = parsed.error {
             report.notes.push(err);
@@ -145,6 +278,18 @@ impl Pipeline {
             })
             .await;
         outputs.push(finding("filetype", &result));
+        if self.yara.is_some() {
+            outputs.push(finding("yara", &yara::result_for(&report.yara)));
+        }
+        if let Some(reason) = &self.yara_error {
+            outputs.push(finding(
+                "yara",
+                &currawong_scan::EngineResult::Failed {
+                    reason: format!("rules unavailable: {reason}"),
+                    unreachable: false,
+                },
+            ));
+        }
         if !self.cfg.scanner.clamd.address.is_empty() {
             match ClamdAddress::parse(&self.cfg.scanner.clamd.address) {
                 Ok(address) => {
@@ -174,7 +319,7 @@ impl Pipeline {
         let combined = combine(&outputs, parser_failed);
         report.malware = combined.malware;
         report.active_content = report.active_content || combined.active_content;
-        report.defer = combined.defer;
+        report.defer = report.defer || combined.defer;
         report.fail_closed = combined.fail_closed;
         report.notes.extend(combined.notes);
         for output in &outputs {
@@ -319,17 +464,23 @@ impl Pipeline {
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
+        rules: Option<&CompiledRules>,
     ) -> ParseResponse {
         if let (Some(pool), Some(path)) = (self.pool.as_mut(), body_path) {
             return match pool
-                .scan_file(env.id.as_str(), path, &self.cfg.scanner.extract)
+                .scan_file_with_rules(env.id.as_str(), path, &self.cfg.scanner.extract, rules)
                 .await
             {
                 ScanOutcome::Parsed(response) => response,
                 ScanOutcome::Failed { reason } => ParseResponse::failed(env.id.as_str(), reason),
             };
         }
-        parse_bytes(env.id.as_str(), raw, &self.cfg.scanner.extract)
+        parse_bytes_with(
+            env.id.as_str(),
+            raw,
+            &self.cfg.scanner.extract,
+            rules.map(|compiled| &compiled.rules),
+        )
     }
 }
 
@@ -374,6 +525,14 @@ fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {
     }
 }
 
+fn yara_engine(cfg: &Config) -> Result<Option<Arc<YaraEngine>>, String> {
+    let dir = &cfg.scanner.yara.rules_dir;
+    if !cfg.scanner.enabled || dir.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    YaraEngine::new(dir).map(|engine| Some(Arc::new(engine)))
+}
+
 pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
     if let Some(path) = &cfg.scanner.worker_binary {
         if path.exists() {
@@ -398,4 +557,21 @@ fn domain_of(address: &str) -> String {
 
 pub fn auth_header(auth: &AuthResults) -> String {
     auth.header.clone()
+}
+
+/// Atomically replace a spool body (write beside it, fsync, rename).
+async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = path.with_extension("eml.strip");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
