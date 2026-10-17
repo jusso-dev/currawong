@@ -12,7 +12,8 @@
 //!   and `link_scan_truncated`.
 //! - counts: `parts`, `urls`, `yara` (matches).
 //! - scores: `spam` (the classify total: Bayes points plus rule scores) and
-//!   `lookalike` (the strongest finding, 0 to 1). Reserved: `bec`. DLP
+//!   `lookalike` (the strongest finding, 0 to 1). `bec` (0 to 1, inbound only) with flags `bec.<reason>` such as
+//!   `bec.display_name_spoof` and `bec.payment_change`. DLP
 //!   counts use `dlp.<kind>`.
 use currawong_core::{AuthResults, PartFlag, ScanReport};
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +51,12 @@ impl Signals {
         }
         if let Some(spam) = &report.spam {
             signals.score("spam", spam.total);
+        }
+        if let Some(bec) = &report.bec {
+            signals.score("bec", bec.score);
+            for reason in &bec.reasons {
+                signals.flag(&format!("bec.{}", reason.as_str()));
+            }
         }
         if let Some(strongest) = report.lookalikes.iter().map(|f| f.score).reduce(f64::max) {
             signals.flag("lookalike");

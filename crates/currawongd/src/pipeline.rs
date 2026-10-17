@@ -413,8 +413,16 @@ impl Pipeline {
         let raw = raw[..raw.len().min(MAX_RAW_BYTES + 1)].to_vec();
         let sender = env.mail_from.clone();
         let urls = report.urls.clone();
+        let bec =
+            (env.direction == Direction::Inbound).then(|| currawong_classify::bec::BecContext {
+                dmarc_failed: report
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.dmarc.result.eq_ignore_ascii_case("fail")),
+                ..Default::default()
+            });
         match tokio::task::spawn_blocking(move || {
-            classifier.classify(&tenant, &raw, &sender, &urls)
+            classifier.classify_with(&tenant, &raw, &sender, &urls, bec)
         })
         .await
         {
@@ -425,6 +433,7 @@ impl Pipeline {
                 }
                 report.spam = result.spam;
                 report.lookalikes = result.lookalikes;
+                report.bec = result.bec;
                 report.flags.extend(result.flags);
                 report.notes.extend(result.notes);
             }
@@ -481,6 +490,25 @@ impl Pipeline {
             &self.cfg.scanner.extract,
             rules.map(|compiled| &compiled.rules),
         )
+    }
+}
+
+impl Pipeline {
+    /// Inbound mail accepted for delivery: later mail from the same sender
+    /// is no longer a first-time sender for BEC scoring.
+    pub async fn record_delivery(&self, env: &Envelope, recipients: Vec<String>) {
+        if env.direction != Direction::Inbound || recipients.is_empty() {
+            return;
+        }
+        let Some(classifier) = self.classifier.clone() else {
+            return;
+        };
+        let tenant = tenant_context(&self.cfg, env);
+        let sender = env.mail_from.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            classifier.record_delivery(&tenant, &sender, &recipients)
+        })
+        .await;
     }
 }
 

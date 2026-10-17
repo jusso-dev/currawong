@@ -33,6 +33,8 @@ pub struct MessageView {
     /// Header names and decoded values (RFC 2047), in message order.
     pub headers: Vec<(String, String)>,
     pub from: Vec<String>,
+    /// Display names on From, decoded, in the same order as `from`.
+    pub from_names: Vec<String>,
     pub reply_to: Vec<String>,
     pub body: String,
     pub urls: Vec<String>,
@@ -142,6 +144,19 @@ impl MessageView {
         Some(Self {
             headers,
             from: addresses(message.from()),
+            from_names: message
+                .from()
+                .map(|list| {
+                    list.iter()
+                        .filter(|addr| addr.address().is_some())
+                        .map(|addr| {
+                            let mut name = addr.name().unwrap_or_default().to_string();
+                            truncate(&mut name, MAX_HEADER_CHARS);
+                            name
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             reply_to: addresses(message.reply_to()),
             body,
             urls,

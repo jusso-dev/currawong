@@ -1,0 +1,101 @@
+# Business email compromise lexicon (Australian English). Each phrase is
+# matched case-insensitively on word boundaries in the subject and body.
+# category: payment_change, gift_card, urgency, secrecy.
+# A payment_change phrase only counts with a bank-detail pattern (BSB,
+# account number) or a second payment_change phrase.
+
+[[phrase]]
+text = "change of bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "bank details have changed"
+category = "payment_change"
+
+[[phrase]]
+text = "new bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "updated bank details"
+category = "payment_change"
+
+[[phrase]]
+text = "new account details"
+category = "payment_change"
+
+[[phrase]]
+text = "changed our bank"
+category = "payment_change"
+
+[[phrase]]
+text = "update your records"
+category = "payment_change"
+
+[[phrase]]
+text = "remittance advice"
+category = "payment_change"
+
+[[phrase]]
+text = "outstanding invoice"
+category = "payment_change"
+
+[[phrase]]
+text = "gift card"
+category = "gift_card"
+
+[[phrase]]
+text = "gift cards"
+category = "gift_card"
+
+[[phrase]]
+text = "itunes card"
+category = "gift_card"
+
+[[phrase]]
+text = "google play card"
+category = "gift_card"
+
+[[phrase]]
+text = "scratch the back"
+category = "gift_card"
+
+[[phrase]]
+text = "urgent"
+category = "urgency"
+
+[[phrase]]
+text = "urgently"
+category = "urgency"
+
+[[phrase]]
+text = "as soon as possible"
+category = "urgency"
+
+[[phrase]]
+text = "today before"
+category = "urgency"
+
+[[phrase]]
+text = "are you at your desk"
+category = "urgency"
+
+[[phrase]]
+text = "keep this confidential"
+category = "secrecy"
+
+[[phrase]]
+text = "keep this between us"
+category = "secrecy"
+
+[[phrase]]
+text = "do not tell"
+category = "secrecy"
+
+[[phrase]]
+text = "don't call"
+category = "secrecy"
+
+[[phrase]]
+text = "in a meeting"
+category = "secrecy"

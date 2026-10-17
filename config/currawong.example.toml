@@ -228,6 +228,10 @@ enabled = true
 bayes_database = "/var/lib/currawong/bayes.sqlite"
 protected_domains = []
 allowed_domains = []
+# BEC: staff directory (email,name[,vip] per line) for display-name spoofing,
+# and the sender history used for first-time sender checks.
+# directory_csv = "/etc/currawong/directory.csv"
+history_database = "/var/lib/currawong/sender-history.sqlite"
 
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.

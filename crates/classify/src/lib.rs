@@ -1,17 +1,21 @@
-//! Classify stage: lookalike domains and spam scoring.
-//! BEC signals and the optional LLM classifier join this crate later.
+//! Classify stage: lookalike domains, spam scoring and business email
+//! compromise (BEC) heuristics. The optional LLM classifier joins later.
 //! Results go on the `ScanReport`; the policy engine decides what to do.
+pub mod bec;
 pub mod lookalike;
 pub mod message;
 pub mod spam;
 
+use bec::{BecContext, Lexicon, SenderHistory};
 use currawong_core::{
     config::{ClassifyConfig, Config},
-    LookalikeFinding, SpamReport,
+    directory::{CsvDirectory, Directory},
+    BecReport, LookalikeFinding, SpamReport,
 };
 use lookalike::Protected;
 use message::{address_domain, url_host, MessageView};
 use spam::{Bayes, Feedback, RuleSet, SpamClassifier, SpamError, Trained};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClassifyError {
@@ -19,6 +23,8 @@ pub enum ClassifyError {
     Spam(#[from] SpamError),
     #[error("brand list {0}")]
     Brands(String),
+    #[error("directory {0}")]
+    Directory(String),
 }
 
 /// Who a message is classified for. `key` partitions the Bayes store and
@@ -58,6 +64,8 @@ pub struct Classification {
     /// `None` when the message was skipped.
     pub spam: Option<SpamReport>,
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Inbound mail only.
+    pub bec: Option<BecReport>,
     /// Report flags for policy: `classify_skipped`, `link_scan_truncated`.
     pub flags: Vec<String>,
     /// Degraded scoring, for the report notes.
@@ -69,6 +77,8 @@ pub struct Classifier {
     /// by every tenant.
     protected: Protected,
     spam: SpamClassifier,
+    directory: Option<Arc<dyn Directory>>,
+    history: Option<SenderHistory>,
 }
 
 impl Classifier {
@@ -89,13 +99,60 @@ impl Classifier {
         let mut allowed = loaded.siblings;
         allowed.extend(cfg.classify.allowed_domains.iter().cloned());
         let rules = loaded.rules;
-        Ok(Self::new(&protected, SpamClassifier { bayes, rules }).with_allowed(&allowed))
+        let directory = match &cfg.classify.directory_csv {
+            Some(path) => Some(
+                CsvDirectory::load(path)
+                    .map_err(|err| ClassifyError::Directory(err.to_string()))?,
+            ),
+            None => None,
+        };
+        let history = match SenderHistory::open(&cfg.classify.history_database) {
+            Ok(history) => Some(history),
+            Err(err) => {
+                tracing::warn!(%err, path = %cfg.classify.history_database.display(), "sender history unavailable");
+                None
+            }
+        };
+        let mut classifier =
+            Self::new(&protected, SpamClassifier { bayes, rules }).with_allowed(&allowed);
+        if let Some(directory) = directory {
+            classifier = classifier.with_directory(Arc::new(directory));
+        }
+        if let Some(history) = history {
+            classifier = classifier.with_history(history);
+        }
+        Ok(classifier)
     }
 
     pub fn new(protected: &[String], spam: SpamClassifier) -> Self {
         Self {
             protected: Protected::new(protected),
             spam,
+            directory: None,
+            history: None,
+        }
+    }
+
+    pub fn with_directory(mut self, directory: Arc<dyn Directory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    pub fn with_history(mut self, history: SenderHistory) -> Self {
+        self.history = Some(history);
+        self
+    }
+
+    /// Note a delivery so later mail from `sender` is not a first-time sender.
+    pub fn record_delivery(&self, tenant: &TenantContext, sender: &str, recipients: &[String]) {
+        let Some(history) = &self.history else {
+            return;
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        if let Err(err) = history.record(&tenant.key, sender, recipients, now) {
+            tracing::warn!(%err, "sender history not recorded");
         }
     }
 
@@ -122,12 +179,25 @@ impl Classifier {
 
     /// Score one message for one tenant. `urls` are links the parser worker
     /// found, added to the links in the text and HTML bodies.
+    /// Spam and lookalike scoring only (no BEC), as for outbound mail.
     pub fn classify(
         &self,
         tenant: &TenantContext,
         raw: &[u8],
         envelope_sender: &str,
         urls: &[String],
+    ) -> Classification {
+        self.classify_with(tenant, raw, envelope_sender, urls, None)
+    }
+
+    /// `bec` is `Some` for inbound mail, with what the auth stage found.
+    pub fn classify_with(
+        &self,
+        tenant: &TenantContext,
+        raw: &[u8],
+        envelope_sender: &str,
+        urls: &[String],
+        bec: Option<BecContext>,
     ) -> Classification {
         let view = MessageView::parse(raw);
         let mut notes = Vec::new();
@@ -136,6 +206,7 @@ impl Classifier {
             return Classification {
                 spam: None,
                 lookalikes: Vec::new(),
+                bec: None,
                 flags: vec!["classify_skipped".into()],
                 notes: vec![format!(
                     "classify skipped: more than {} embedded messages or {} multiparts",
@@ -221,9 +292,34 @@ impl Classifier {
         }
         let (spam, note) = self.spam.score_noted(&tenant.key, &view, urls);
         notes.extend(note);
+        let bec = bec.map(|mut ctx| {
+            ctx.lookalike_sender |= lookalikes.iter().any(|f| f.source != "url");
+            if ctx.first_time.is_none() {
+                // The same address `record_delivery` stores: the envelope
+                // sender, or the From address for a null sender.
+                let sender = if envelope_sender.is_empty() {
+                    view.from.first().map(String::as_str).unwrap_or("")
+                } else {
+                    envelope_sender
+                };
+                ctx.first_time = self
+                    .history
+                    .as_ref()
+                    .and_then(|history| history.seen(&tenant.key, sender).ok())
+                    .map(|seen| !seen);
+            }
+            bec::analyse(
+                &view,
+                tenant,
+                &ctx,
+                self.directory.as_deref(),
+                Lexicon::builtin(),
+            )
+        });
         Classification {
             spam: Some(spam),
             lookalikes,
+            bec,
             flags,
             notes,
         }
@@ -234,6 +330,9 @@ impl Classifier {
 /// its directory exists, for `--check-config`.
 pub fn check_config(cfg: &ClassifyConfig) -> Result<(), ClassifyError> {
     load(cfg)?;
+    if let Some(path) = &cfg.directory_csv {
+        CsvDirectory::load(path).map_err(|err| ClassifyError::Directory(err.to_string()))?;
+    }
     if cfg.bayes_database.parent().is_some_and(|dir| dir.is_dir()) {
         Bayes::open(&cfg.bayes_database)?;
     }

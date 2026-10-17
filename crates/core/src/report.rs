@@ -110,6 +110,54 @@ pub struct SpamReport {
     pub total: f64,
 }
 
+/// Why a message looks like business email compromise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum BecReason {
+    /// The display name is a directory person's, but the address is not theirs
+    /// and is outside the tenant.
+    DisplayNameSpoof,
+    /// The From or Reply-To domain imitates a protected domain.
+    LookalikeSender,
+    /// Replies go to free mail or another domain than the sender's.
+    ReplyToMismatch,
+    /// Asks to change bank or payment details, or quotes BSB and account numbers.
+    PaymentChange,
+    /// Asks for gift cards or vouchers.
+    GiftCard,
+    Urgency,
+    Secrecy,
+    /// No earlier delivered mail from this sender to the tenant.
+    FirstTimeSender,
+    /// DMARC failed for the From domain.
+    AuthFailure,
+}
+
+impl BecReason {
+    /// Policy flag suffix, `bec.<name>`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DisplayNameSpoof => "display_name_spoof",
+            Self::LookalikeSender => "lookalike_sender",
+            Self::ReplyToMismatch => "reply_to_mismatch",
+            Self::PaymentChange => "payment_change",
+            Self::GiftCard => "gift_card",
+            Self::Urgency => "urgency",
+            Self::Secrecy => "secrecy",
+            Self::FirstTimeSender => "first_time_sender",
+            Self::AuthFailure => "auth_failure",
+        }
+    }
+}
+
+/// Score from 0 to 1 with the reasons that added to it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BecReport {
+    pub score: f64,
+    pub reasons: Vec<BecReason>,
+    /// Human-readable explanation per reason, without message content.
+    pub explanation: Vec<String>,
+}
+
 /// A YARA rule that matched the raw message, a MIME part or an archive member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YaraMatch {
@@ -142,6 +190,9 @@ pub struct ScanReport {
     pub spam: Option<SpamReport>,
     #[serde(default)]
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Business email compromise score and reasons, for inbound mail.
+    #[serde(default)]
+    pub bec: Option<BecReport>,
     /// Named conditions from later stages, exposed to policy as flags, for
     /// example `classify_skipped` or `link_scan_truncated`.
     #[serde(default)]
@@ -168,6 +219,7 @@ impl ScanReport {
             notes: Vec::new(),
             spam: None,
             lookalikes: Vec::new(),
+            bec: None,
             flags: Vec::new(),
             modified: false,
         }

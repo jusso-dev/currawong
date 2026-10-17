@@ -31,6 +31,14 @@ conditions = [
 ]
 actions = [{ quarantine = "spoofing" }]
 
+# Business email compromise: impersonated staff, look-alike senders,
+# diverted replies and payment or gift-card requests (inbound only).
+[[policy]]
+id = "bec-quarantine"
+priority = 55
+conditions = [{ direction = "inbound" }, { score = { name = "bec", at_least = 0.6 } }]
+actions = [{ quarantine = "bec" }]
+
 [[policy]]
 id = "spam-quarantine"
 priority = 60

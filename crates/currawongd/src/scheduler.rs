@@ -122,6 +122,14 @@ async fn classify_one(
             plan
         }
     };
+    let delivered: Vec<String> = plan
+        .groups
+        .iter()
+        .flatten()
+        .filter(|d| matches!(d.verdict, Verdict::Deliver))
+        .map(|d| d.recipient.clone())
+        .collect();
+    pipeline.record_delivery(&env, delivered).await;
     let cfg = &pipeline.cfg;
     if plan.groups.len() > 1 {
         // Copies get ids derived from the original and their recipients, so a

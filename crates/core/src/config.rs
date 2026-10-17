@@ -310,6 +310,12 @@ pub struct ClassifyConfig {
     /// Domains never flagged as lookalikes, such as partners or vendors whose
     /// names resemble a tenant's.
     pub allowed_domains: Vec<String>,
+    /// Staff directory CSV (`email,name[,vip]`) used to spot display-name
+    /// impersonation. Unset disables that check.
+    pub directory_csv: Option<PathBuf>,
+    /// SQLite file recording who has had mail delivered to whom, for
+    /// first-time sender checks.
+    pub history_database: PathBuf,
 }
 
 /// Policy engine. With neither set, the built-in default pack applies.
@@ -504,6 +510,8 @@ impl Default for ClassifyConfig {
             brands_file: None,
             protected_domains: Vec::new(),
             allowed_domains: Vec::new(),
+            directory_csv: None,
+            history_database: PathBuf::from("/var/lib/currawong/sender-history.sqlite"),
         }
     }
 }
