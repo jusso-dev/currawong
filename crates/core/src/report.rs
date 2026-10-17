@@ -75,6 +75,46 @@ pub struct EngineFinding {
     pub detail: String,
 }
 
+/// How a domain imitates a protected one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LookalikeTechnique {
+    /// Same UTS 39 confusable skeleton, for example `c0mmbank` or Cyrillic `а`.
+    Homoglyph,
+    /// Same label under another public suffix, for example `.net.au`.
+    SuffixSwap,
+    EditDistance,
+    /// Embeds the protected name, for example `ato-refunds.com`.
+    Cousin,
+}
+
+/// A sender or link domain that imitates a tenant domain or a brand.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LookalikeFinding {
+    /// `from`, `reply-to`, `envelope` or `url`.
+    pub source: String,
+    pub domain: String,
+    pub target: String,
+    pub technique: LookalikeTechnique,
+    /// 0 to 1. Higher is a closer imitation.
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleHit {
+    pub name: String,
+    pub score: f64,
+}
+
+/// Spam score from the classify stage. `bayes` is the Robinson-Fisher
+/// probability (0.5 when the tenant has not trained it). `total` is Bayes
+/// points plus rule scores. Policy chooses the threshold.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpamReport {
+    pub bayes: f64,
+    pub rules_hit: Vec<RuleHit>,
+    pub total: f64,
+}
+
 /// A YARA rule that matched the raw message, a MIME part or an archive member.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct YaraMatch {
@@ -102,6 +142,15 @@ pub struct ScanReport {
     /// Required engine configured but unreachable. Do not deliver; retry.
     pub defer: bool,
     pub notes: Vec<String>,
+    /// Set by the classify stage when it runs.
+    #[serde(default)]
+    pub spam: Option<SpamReport>,
+    #[serde(default)]
+    pub lookalikes: Vec<LookalikeFinding>,
+    /// Named conditions from later stages, exposed to policy as flags, for
+    /// example `classify_skipped` or `link_scan_truncated`.
+    #[serde(default)]
+    pub flags: Vec<String>,
     /// A stage changed the message (for example URL rewriting). Only
     /// modified inbound mail is ARC sealed.
     #[serde(default)]
@@ -171,6 +220,9 @@ impl ScanReport {
             defer: false,
             notes: Vec::new(),
             dlp: None,
+            spam: None,
+            lookalikes: Vec::new(),
+            flags: Vec::new(),
             modified: false,
         }
     }

@@ -70,6 +70,11 @@ pkcs8 = { version = "0.10", features = ["pem"] }
 zeroize = "1"
 pdf-extract = "0.12"
 calamine = { version = "0.36", default-features = false }
+unicode-security = "0.1"
+strsim = "0.11"
+psl = "2"
+idna = "1"
+regex = "1"
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"

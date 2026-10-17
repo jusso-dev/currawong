@@ -1002,6 +1002,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "currawong-classify"
+version = "0.0.1"
+dependencies = [
+ "currawong-core",
+ "idna",
+ "mail-parser",
+ "psl",
+ "regex",
+ "rusqlite",
+ "serde",
+ "sha2",
+ "strsim",
+ "tempfile",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "unicode-security",
+ "url",
+]
+
+[[package]]
 name = "currawong-core"
 version = "0.0.1"
 dependencies = [
@@ -1201,6 +1222,7 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "currawong-auth",
+ "currawong-classify",
  "currawong-core",
  "currawong-dlp",
  "currawong-parser-worker",
@@ -3447,6 +3469,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "psl"
+version = "2.1.241"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7319b480e204d67e759cad7886178335d26324c7c8573c126cc9dfa7350d064"
+dependencies = [
+ "psl-types",
+]
+
+[[package]]
+name = "psl-types"
+version = "2.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33cb294fe86a74cbcf50d4445b37da762029549ebeea341421c7c70370f86cac"
+
+[[package]]
 name = "pulley-interpreter"
 version = "45.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4830,6 +4867,22 @@ name = "unicode-properties"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
+
+[[package]]
+name = "unicode-security"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e4ddba1535dd35ed8b61c52166b7155d7f4e4b8847cec6f48e71dc66d8b5e50"
+dependencies = [
+ "unicode-normalization",
+ "unicode-script",
+]
 
 [[package]]
 name = "unicode-width"

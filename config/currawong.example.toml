@@ -239,6 +239,27 @@ max_rows_per_report = 1000
 max_report_bytes = 5242880
 retention_days = 7
 
+# classify.enabled: spam score and lookalike domains on every report. Policy
+# decides what a score means; classify does not quarantine on its own.
+# classify.bayes_database: per-tenant Bayes token counts (hashes, not words).
+# The directory must exist. If it cannot be opened, rules still score.
+# classify.spam_rules_dir: directory of *.toml rules ([[rule]] name, target,
+# pattern, score). Leave unset for the built-in rules in rules/spam/.
+# classify.brands_file: "Name: domain ..." per line. Leave unset for the
+# built-in Australian list in rules/brands-au.txt.
+# classify.protected_domains: more domains to protect in every tenant's mail.
+# Each relay tenant's own domains are protected in that tenant's mail only;
+# an accepted domain with no tenant protects itself and has its own Bayes store.
+# classify.allowed_domains: never flagged as lookalikes (partners or vendors
+# whose names resemble a tenant's). Brand siblings are `!domain` entries in
+# the brand list.
+# --check-config opens the Bayes store when its directory exists.
+[classify]
+enabled = true
+bayes_database = "/var/lib/currawong/bayes.sqlite"
+protected_domains = []
+allowed_domains = []
+
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.
 # policy.forward_domains: domains, beyond the recipient tenant's own, that redirect and bcc may target.

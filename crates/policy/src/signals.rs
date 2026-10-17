@@ -8,10 +8,14 @@
 //!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
 //!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
 //!   `dlp.incomplete` when some text could not be scanned for identifiers.
+//!   Classify adds `lookalike` when a sender or link domain imitates a
+//!   protected one, and passes on report flags such as `classify_skipped`
+//!   and `link_scan_truncated`.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).
-//! - scores: none yet. Reserved: `spam`, `bec`, `lookalike`.
+//! - scores: `spam` (the classify total: Bayes points plus rule scores) and
+//!   `lookalike` (the strongest finding, 0 to 1). Reserved: `bec`.
 use currawong_core::{AuthResults, PartFlag, ScanReport};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +46,16 @@ impl Signals {
         }
         for flag in report.parts.iter().flat_map(|part| &part.flags) {
             signals.flag(part_flag(*flag));
+        }
+        for flag in &report.flags {
+            signals.flag(flag);
+        }
+        if let Some(spam) = &report.spam {
+            signals.score("spam", spam.total);
+        }
+        if let Some(strongest) = report.lookalikes.iter().map(|f| f.score).reduce(f64::max) {
+            signals.flag("lookalike");
+            signals.score("lookalike", strongest);
         }
         signals.count("parts", report.parts.len() as u64);
         signals.count("urls", report.urls.len() as u64);

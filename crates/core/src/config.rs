@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
     pub dlp: DlpProfile,
 }
@@ -359,6 +360,25 @@ pub struct DlpProfile {
     pub min_confidence: u8,
 }
 
+/// Spam scoring and lookalike domains. Scores go on the report; policy decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClassifyConfig {
+    pub enabled: bool,
+    /// SQLite file holding per-tenant Bayes token counts.
+    pub bayes_database: PathBuf,
+    /// Directory of `*.toml` spam rules. Unset uses the built-in rules.
+    pub spam_rules_dir: Option<PathBuf>,
+    /// Brand list, `Name: domain ...` per line. Unset uses the built-in Australian list.
+    pub brands_file: Option<PathBuf>,
+    /// More domains to protect in every tenant's mail. A tenant's own domains
+    /// are protected in its own mail.
+    pub protected_domains: Vec<String>,
+    /// Domains never flagged as lookalikes, such as partners or vendors whose
+    /// names resemble a tenant's.
+    pub allowed_domains: Vec<String>,
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -557,6 +577,19 @@ impl Default for DlpProfile {
     }
 }
 
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bayes_database: PathBuf::from("/var/lib/currawong/bayes.sqlite"),
+            spam_rules_dir: None,
+            brands_file: None,
+            protected_domains: Vec::new(),
+            allowed_domains: Vec::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -600,6 +633,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
             dlp: DlpProfile::default(),
         }
