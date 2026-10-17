@@ -32,7 +32,10 @@ impl QuarantineStore {
     /// BIMI logo and VMC status for the quarantine UI, as JSON.
     pub fn set_bimi(&self, id: &str, json: &str) -> std::io::Result<()> {
         check_id(id)?;
-        fs::write(self.root.join(id).join("bimi.json"), json)
+        let dir = self.root.join(id);
+        let tmp = dir.join("bimi.json.tmp");
+        fs::write(&tmp, json)?;
+        fs::rename(tmp, dir.join("bimi.json"))
     }
 
     pub fn bimi(&self, id: &str) -> std::io::Result<Option<String>> {

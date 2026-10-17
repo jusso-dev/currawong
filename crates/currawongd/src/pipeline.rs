@@ -50,12 +50,13 @@ impl Pipeline {
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
         let mut report = ScanReport::new(env.id.clone());
-        let auth = self.auth.evaluate(raw, env).await;
+        let wants_event = self.dmarc_events.is_some() && env.direction == Direction::Inbound;
+        let auth = self.auth.evaluate(raw, env, wants_event).await;
+        // Recorded once per message id, however often a deferred message is
+        // classified again.
         if let (Some(store), Some(event)) = (&self.dmarc_events, &auth.dmarc_event) {
-            if env.direction == Direction::Inbound {
-                if let Err(err) = store.record(event) {
-                    tracing::warn!(id = %env.id, %err, "dmarc event not recorded");
-                }
+            if let Err(err) = store.record(event) {
+                tracing::warn!(id = %env.id, %err, "dmarc event not recorded");
             }
         }
         report.auth = Some(auth.results);

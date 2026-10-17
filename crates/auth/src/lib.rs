@@ -6,7 +6,7 @@ mod keys;
 mod sign;
 mod strip;
 
-pub use bimi::{Bimi, VmcStatus};
+pub use bimi::{Bimi, TxtLookup, VmcStatus};
 pub use cache::TxtCache;
 pub use dmarc_report::{DmarcEvent, DmarcEventStore, OutgoingReport};
 pub use keys::{publishable, KeyStore, StoredKey};
@@ -54,11 +54,12 @@ impl AuthChecker {
     }
 
     pub async fn check(&self, raw: &[u8], env: &Envelope) -> AuthResults {
-        self.evaluate(raw, env).await.results
+        self.evaluate(raw, env, false).await.results
     }
 
-    /// Results plus the aggregate report row when the author domain publishes DMARC.
-    pub async fn evaluate(&self, raw: &[u8], env: &Envelope) -> Evaluation {
+    /// Results, plus the aggregate report row when `report` is set and the
+    /// author domain publishes DMARC.
+    pub async fn evaluate(&self, raw: &[u8], env: &Envelope, report: bool) -> Evaluation {
         let stripped = strip_forged(raw, &self.authserv_id);
         let Some(message) = AuthenticatedMessage::parse(&stripped) else {
             return Evaluation {
@@ -97,14 +98,21 @@ impl AuthChecker {
             .with_spf_mailfrom_result(&spf, env.remote_ip, sender, helo)
             .with_dmarc_result(&dmarc)
             .with_arc_result(&arc, env.remote_ip);
+        // The domain only: a bare local part must not reach a report.
         let envelope_from = if env.mail_from.is_empty() {
             helo
         } else {
-            mail_from_domain
+            env.mail_from
+                .rsplit_once('@')
+                .map(|(_, domain)| domain)
+                .unwrap_or("")
         };
-        let dmarc_event = self
-            .dmarc_event(env, envelope_from, &dkim, &spf, &dmarc)
-            .await;
+        let dmarc_event = if report {
+            self.dmarc_event(env, envelope_from, &dkim, &spf, &dmarc)
+                .await
+        } else {
+            None
+        };
         let results = AuthResults {
             spf: spf_method(spf.result()),
             dkim: dkim
@@ -217,4 +225,14 @@ pub fn seed_txt(cache: &TxtCache, name: &str, record: &str) -> Result<(), String
     };
     cache.insert_record(name, value);
     Ok(())
+}
+
+/// Make `name` answer with a temporary DNS failure. For tests.
+pub fn seed_txt_error(cache: &TxtCache, name: &str) {
+    cache.insert_record(
+        name,
+        Txt::Error(mail_auth::Error::Dns(mail_auth::DnsError::Resolver(
+            "timed out".into(),
+        ))),
+    );
 }

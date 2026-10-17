@@ -81,7 +81,7 @@ async fn classify_one(
                 .hold(env.id.as_str(), &reason, &raw)
                 .map_err(|err| err.to_string())?;
             if pipeline.cfg.auth.bimi {
-                crate::dmarc::annotate_bimi(&pipeline.auth, quarantine, &report, &raw).await;
+                crate::dmarc::annotate_bimi(&pipeline.auth, quarantine, &report).await;
             }
             env.pipeline = "quarantine".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;

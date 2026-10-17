@@ -283,6 +283,16 @@ pub struct DmarcReportConfig {
     pub org_name: String,
     /// Report sender. Its domain is the report submitter.
     pub email: String,
+    /// Only the first N `rua` addresses of a record are considered.
+    pub max_rua_per_record: usize,
+    /// Policy domains recorded per day. Later domains are dropped.
+    pub max_domains_per_day: usize,
+    /// Rows per report. The rest are counted in the report's `error` field.
+    pub max_rows_per_report: usize,
+    /// Rendered report message size limit.
+    pub max_report_bytes: usize,
+    /// Unsent events older than this are dropped.
+    pub retention_days: u64,
 }
 
 impl Default for DmarcReportConfig {
@@ -292,6 +302,11 @@ impl Default for DmarcReportConfig {
             database: PathBuf::from("/var/lib/currawong/dmarc.sqlite"),
             org_name: "Currawong".into(),
             email: String::new(),
+            max_rua_per_record: 5,
+            max_domains_per_day: 5_000,
+            max_rows_per_report: 1_000,
+            max_report_bytes: 5 * 1024 * 1024,
+            retention_days: 7,
         }
     }
 }

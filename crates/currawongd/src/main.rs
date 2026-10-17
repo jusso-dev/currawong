@@ -97,13 +97,16 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
-    let dmarc_reports = if cfg.auth.dmarc_reports.enabled {
-        let store = DmarcEventStore::open(&cfg.auth.dmarc_reports.database)?;
+    if cfg.auth.dmarc_reports.enabled {
+        let store = DmarcEventStore::open(&cfg.auth.dmarc_reports)?;
         pipeline = pipeline.with_dmarc_events(store.clone());
-        Some(store)
-    } else {
-        None
-    };
+        spawn_dmarc_reports(
+            Arc::clone(&cfg),
+            Arc::clone(&spool),
+            store,
+            shutdown.clone(),
+        )?;
+    }
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -122,15 +125,6 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             }
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");
-            }
-            if let Some(store) = &dmarc_reports {
-                let now = time::OffsetDateTime::now_utc();
-                let reports = &pipeline.cfg.auth.dmarc_reports;
-                if let Err(err) =
-                    send_dmarc_reports(&spool_loop, &pipeline.auth, store, reports, now).await
-                {
-                    tracing::error!(%err, "dmarc report pass failed");
-                }
             }
             if let Err(err) = deliver_ready(&deliverer).await {
                 tracing::error!(%err, "delivery pass failed");
@@ -164,6 +158,31 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         });
     }
     while set.join_next().await.is_some() {}
+    Ok(())
+}
+
+/// The report pass runs on its own task with its own resolver, so slow or
+/// hostile DNS for `rua` checks cannot stall classification or delivery.
+fn spawn_dmarc_reports(
+    cfg: Arc<currawong_core::Config>,
+    spool: Arc<Spool>,
+    store: DmarcEventStore,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
+    let dns = HickoryDns::system().map_err(|err| err.to_string())?;
+    tokio::spawn(async move {
+        loop {
+            let now = time::OffsetDateTime::now_utc();
+            if let Err(err) = send_dmarc_reports(&spool, &auth, &store, &cfg, &dns, now).await {
+                tracing::error!(%err, "dmarc report pass failed");
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {}
+            }
+        }
+    });
     Ok(())
 }
 
