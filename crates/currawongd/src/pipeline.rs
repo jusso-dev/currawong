@@ -1,10 +1,12 @@
-//! Auth, parse, scan and the M1 policy decision.
+//! Auth, parse, scan and the policy decision.
 use currawong_auth::{strip_forged, AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
 use currawong_parser::{parse::parse_bytes, ParseResponse};
-use currawong_policy::decide;
+use currawong_policy::{
+    canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
+};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool,
@@ -18,6 +20,8 @@ pub struct Pipeline {
     pub pool: Option<WorkerPool>,
     /// DKIM and ARC keys. `None` means nothing is signed or sealed.
     pub keys: Option<Arc<KeyStore>>,
+    pub policies: PolicySet,
+    policy_stamp: Option<currawong_policy::Stamp>,
 }
 
 impl Pipeline {
@@ -35,6 +39,8 @@ impl Pipeline {
             auth,
             pool,
             keys: None,
+            policies: default_pack().clone(),
+            policy_stamp: None,
         }
     }
 
@@ -43,43 +49,28 @@ impl Pipeline {
         self
     }
 
-    /// Evaluate a spooled message and build the headers to prepend. Forged
-    /// Authentication-Results left in older spool files are stripped from
-    /// `body_path` first, so they are never delivered. A DKIM signing
-    /// failure defers rather than sending the mail unsigned.
-    pub async fn classify(
-        &mut self,
-        env: &Envelope,
+    /// Forged Authentication-Results left in older spool files (accepted
+    /// before DATA stripped them) are removed from `body_path` too, so they
+    /// are never delivered. Returns the cleaned bytes.
+    pub async fn strip_spooled(
+        &self,
         raw: &[u8],
         body_path: Option<&Path>,
-    ) -> (ScanReport, Verdict, Vec<String>) {
+    ) -> Result<Vec<u8>, String> {
         let cleaned = strip_forged(raw, self.auth.authserv_id());
         if cleaned.len() != raw.len() {
             if let Some(path) = body_path {
-                if let Err(err) = rewrite_body(path, &cleaned).await {
-                    let reason = format!("could not strip forged headers: {err}");
-                    let report = ScanReport::new(env.id.clone());
-                    return (report, Verdict::Defer { reason }, Vec::new());
-                }
+                rewrite_body(path, &cleaned)
+                    .await
+                    .map_err(|err| format!("could not strip forged headers: {err}"))?;
             }
         }
-        let (report, verdict) = self.evaluate(env, &cleaned, body_path).await;
-        if !matches!(verdict, Verdict::Deliver) {
-            let headers = self.auth_headers(env, &report);
-            return (report, verdict, headers);
-        }
-        match self.delivery_headers(env, &cleaned, &report).await {
-            Ok(headers) => (report, verdict, headers),
-            Err(reason) => {
-                tracing::error!(id = %env.id, %reason, "deferring: outbound signing failed");
-                (report, Verdict::Defer { reason }, Vec::new())
-            }
-        }
+        Ok(cleaned)
     }
 
     /// Our Authentication-Results, for inbound mail only: on outbound mail
     /// it would leak internal addresses and attest a meaningless SPF result.
-    fn auth_headers(&self, env: &Envelope, report: &ScanReport) -> Vec<String> {
+    pub fn auth_headers(&self, env: &Envelope, report: &ScanReport) -> Vec<String> {
         match env.direction {
             Direction::Inbound => report.auth.iter().map(auth_header).collect(),
             Direction::Outbound => Vec::new(),
@@ -149,12 +140,63 @@ impl Pipeline {
         }
     }
 
+    pub fn with_policies(mut self, policies: PolicySet) -> Self {
+        self.policies = policies;
+        self
+    }
+
+    /// Load the configured policies again if their source changed. Runs the
+    /// file and SQLite reads on a blocking thread. Returns whether they changed.
+    pub async fn reload_policies(&mut self) -> Result<bool, String> {
+        let cfg = self.cfg.policy.clone();
+        let last = self.policy_stamp.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let stamp = currawong_policy::stamp(&cfg)?;
+            if last.as_ref() == Some(&stamp) {
+                return Ok(None);
+            }
+            Ok(Some((stamp, currawong_policy::load(&cfg))))
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err: currawong_policy::PolicyError| err.to_string())?;
+        let Some((stamp, set)) = loaded else {
+            return Ok(false);
+        };
+        // A bad source is reported once, then again only after it changes.
+        self.policy_stamp = Some(stamp);
+        let set = set.map_err(|err| err.to_string())?;
+        if set == self.policies {
+            return Ok(false);
+        }
+        for policy in set.policies.iter().filter(|p| !p.override_floor.is_empty()) {
+            tracing::warn!(
+                policy = %policy.id,
+                rules = ?policy.override_floor,
+                "policy lifts the built-in floor for the mail it matches"
+            );
+        }
+        self.policies = set;
+        Ok(true)
+    }
+
+    /// One verdict for the whole message. See `assess` for per-recipient decisions.
     pub async fn evaluate(
         &mut self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
+        let (report, decision) = self.assess(env, raw, body_path).await;
+        (report, decision.verdict())
+    }
+
+    pub async fn assess(
+        &mut self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, MessageDecision) {
         let mut report = ScanReport::new(env.id.clone());
         let auth = self.auth.check(raw, env).await;
         // The DMARC record could not be fetched, so its policy is unknown:
@@ -167,8 +209,8 @@ impl Pipeline {
         }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
-            let verdict = decide(&report);
-            return (report, verdict);
+            let decision = self.decide(env, &report);
+            return (report, decision);
         }
         let parsed = self.parse(env, raw, body_path).await;
         report.parts = parsed.parts.clone();
@@ -220,7 +262,7 @@ impl Pipeline {
         let combined = combine(&outputs, parser_failed);
         report.malware = combined.malware;
         report.active_content = report.active_content || combined.active_content;
-        report.defer = combined.defer;
+        report.defer = report.defer || combined.defer;
         report.fail_closed = combined.fail_closed;
         report.notes.extend(combined.notes);
         for output in &outputs {
@@ -230,8 +272,74 @@ impl Pipeline {
                 detail: String::new(),
             });
         }
-        let verdict = decide(&report);
-        (report, verdict)
+        let decision = self.decide(env, &report);
+        (report, decision)
+    }
+
+    /// Tenant and direction per recipient: a message can reach several tenants,
+    /// and submitted mail to a local mailbox is decided for that mailbox.
+    fn decide(&self, env: &Envelope, report: &ScanReport) -> MessageDecision {
+        let tenants = &self.cfg.relay.tenants;
+        let tenant_of = |domain: &str| {
+            tenants
+                .iter()
+                .find(|t| t.domains.iter().any(|d| canonical_domain(d) == domain))
+                .map(|t| t.id.as_str())
+        };
+        let is_local = |domain: &str| {
+            tenant_of(domain).is_some()
+                || self
+                    .cfg
+                    .domains
+                    .accept
+                    .iter()
+                    .any(|d| canonical_domain(d) == domain)
+        };
+        let sender_tenant = env
+            .tenant_id
+            .as_deref()
+            .or_else(|| tenant_of(&domain_of(&env.mail_from)));
+        let empty = [String::new()];
+        let rcpts = if env.rcpt_to.is_empty() {
+            &empty[..]
+        } else {
+            &env.rcpt_to
+        };
+        let contexts: Vec<Context> = rcpts
+            .iter()
+            .map(|rcpt| {
+                let domain = domain_of(rcpt);
+                let direction = match env.direction {
+                    Direction::Outbound if !is_local(&domain) => Direction::Outbound,
+                    _ => Direction::Inbound,
+                };
+                Context {
+                    tenant_id: match direction {
+                        Direction::Inbound => tenant_of(&domain),
+                        Direction::Outbound => sender_tenant,
+                    },
+                    direction,
+                    sender: &env.mail_from,
+                    // The SMTP session does not record the login on the envelope yet,
+                    // so outbound user and group scopes do not match.
+                    sender_identity: None,
+                    recipient: rcpt,
+                }
+            })
+            .collect();
+        let mut decision = evaluate_message(report, &contexts, &self.policies);
+        if !tenants.is_empty() {
+            for d in decision
+                .decisions
+                .iter_mut()
+                .filter(|d| d.tenant_id.is_none())
+            {
+                tracing::warn!(id = %env.id, recipient = %d.recipient, "no tenant for recipient");
+                d.explanation
+                    .push("no tenant for this recipient: only platform policies applied".into());
+            }
+        }
+        decision
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {
@@ -301,6 +409,13 @@ pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+fn domain_of(address: &str) -> String {
+    address
+        .rsplit_once('@')
+        .map(|(_, d)| canonical_domain(d))
+        .unwrap_or_default()
 }
 
 pub fn auth_header(auth: &AuthResults) -> String {

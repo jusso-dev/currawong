@@ -119,7 +119,17 @@ async fn dmarc_temperror_defers() {
     let auth = AuthChecker::with_name_server(ID, dns.addr).unwrap();
     let mut pipeline = Pipeline::new(Arc::new(config(dir.path())), auth);
     let env = envelope("x@attacker.test", Direction::Inbound);
-    let (_, verdict, _) = pipeline.classify(&env, &message(), None).await;
+    let (_, verdict) = pipeline.evaluate(&env, &message(), None).await;
+    assert!(matches!(verdict, Verdict::Defer { .. }), "{verdict:?}");
+
+    // With scanning on, the scanners' result must not clear the defer.
+    let mut cfg = config(dir.path());
+    cfg.scanner.enabled = true;
+    cfg.scanner.clamd.address.clear();
+    let auth = AuthChecker::with_name_server(ID, dns.addr).unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let (report, verdict) = pipeline.evaluate(&env, &message(), None).await;
+    assert!(report.defer, "{report:?}");
     assert!(matches!(verdict, Verdict::Defer { .. }), "{verdict:?}");
 }
 
@@ -234,11 +244,16 @@ async fn signing_failure_defers_instead_of_sending_unsigned() {
     let mut broken = active("local", "example.test", "s1", "ed25519");
     broken.private_key = zeroize::Zeroizing::new(b"not a pkcs8 key".to_vec());
     store.insert(&broken).unwrap();
-    let mut pipeline = Pipeline::new(Arc::new(cfg), checker()).with_keys(store);
-    let env = envelope("user@example.test", Direction::Outbound);
-    let (_, verdict, headers) = pipeline.classify(&env, &message(), None).await;
-    assert!(matches!(verdict, Verdict::Defer { .. }), "{verdict:?}");
-    assert!(headers.is_empty());
+    let env = classify(
+        dir.path(),
+        cfg,
+        envelope("user@example.test", Direction::Outbound),
+        Some(store),
+    )
+    .await;
+    assert_eq!(env.pipeline, "scan_defer", "{env:?}");
+    assert_eq!(env.state, SpoolState::Deferred);
+    assert!(env.prepend_headers.is_empty(), "{env:?}");
 }
 
 /// Re-review finding 2: ARC sealing happens only for inbound mail a stage
