@@ -300,6 +300,14 @@ async fn act(
             tracing::info!(id = %env.id, "discarded");
         }
     }
+    currawong_integrations::export::emit(currawong_integrations::export::Event::message_verdict(
+        env.tenant_id.as_deref(),
+        &env.id,
+        env.direction,
+        &env.mail_from,
+        &env.rcpt_to,
+        &decision.verdict,
+    ));
     Ok(())
 }
 

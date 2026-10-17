@@ -1,4 +1,5 @@
 //! On-disk quarantine. Release and digests are M2.
+//! TODO: on release, emit `currawong_integrations::export::EventKind::QuarantineRelease`.
 use std::{fs, io::Write, path::PathBuf};
 
 #[derive(Debug, Clone)]
