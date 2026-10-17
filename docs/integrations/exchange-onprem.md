@@ -28,9 +28,11 @@ next one is tried. A host whose name does not resolve is skipped with a
 warning in the log. TLS is always required on this route, and the Exchange
 certificate must be valid for `tls_cert_name`. The domain is matched without
 regard to case or a trailing dot, the same way for the hosts and for the TLS
-rule. Host entries, `tls_cert_name` and the certificate files are checked
-when the configuration loads, so a typo stops `--check-config` rather than
-deferring mail.
+rule. Host entries and `tls_cert_name` are checked when the configuration
+loads, and the route's PEM files are parsed at startup and by
+`--check-config` (an unreadable or empty CA file, a bad certificate or key,
+or a key that does not match its certificate is an error), so a mistake
+stops startup rather than deferring mail.
 
 ```toml
 [domains]
@@ -43,8 +45,8 @@ exchange_version = "2019"            # "2016", "2019" or "se"
 mailbox_hosts = ["exch01.agency.example", "exch02.agency.example"]
 tls_cert_name = "mail.agency.example"
 # ca_file = "/etc/currawong/agency-ca.pem"   # internal CA, see Certificates
-# client_cert = "/etc/currawong/exchange-client.pem"  # default: tls.cert
-# client_key = "/etc/currawong/exchange-client.key"   # default: tls.key
+# client_cert = "/etc/currawong/exchange-client.pem"  # opt in: domain secure
+# client_key = "/etc/currawong/exchange-client.key"
 
 # Outbound: Currawong treats mail from the Exchange servers' source addresses
 # as outbound relay for this tenant (the trusted relay CIDRs).
@@ -86,17 +88,18 @@ created if missing, and the first run's backups are kept.
 
 | Script | Run | What it does |
 | --- | --- | --- |
-| `receive.ps1` | Once; it covers every Mailbox server | Creates "Currawong Inbound" on each server with `-RequireTLS $true`, `-RemoteIPRanges` limited to Currawong's addresses and a message size limit equal to Currawong's. Domain secure: `-Usage Partner`, `-PermissionGroups Partners`, `-AuthMechanism Tls`. Otherwise: `-Usage Custom -PermissionGroups AnonymousUsers`. |
+| `receive.ps1` | Once; it covers every Mailbox server | Creates "Currawong Inbound" on each server with `-RequireTLS $true`, `-RemoteIPRanges` limited to Currawong's addresses and a message size limit equal to Currawong's. Domain secure: `-Usage Partner`, `-PermissionGroups Partners`, `-AuthMechanism Tls`, `-DomainSecureEnabled $true`. Otherwise: `-Usage Custom -PermissionGroups AnonymousUsers`. |
 | `send.ps1` | Once | Creates "Currawong Outbound" with `-SmartHosts` set to Currawong, `-RequireTLS $true`, `-TlsAuthLevel DomainValidation` and `-TlsDomain` set to Currawong's host name, on port 25 (or 587 with `BasicAuthRequireTLS` and `Get-Credential` for SMTP AUTH). |
-| `transport.ps1` | Once | On its first run, saves the current `MaxReceiveSize` and `MaxSendSize` (and, when domain secure, whether Currawong was already on the domain secure lists) to `currawong-transport-backup.xml` in the admin's profile. Sets both sizes to Currawong's limit and, when domain secure, adds Currawong to `TLSReceiveDomainSecureList` and `TLSSendDomainSecureList` if missing. |
-| `rollback.ps1` | Only to back out | Removes both connectors, restores the saved sizes, takes Currawong off the domain secure lists only if the transport script added it, and restores Default Frontend's saved ranges if it was locked down. It deletes the backups it used. |
+| `transport.ps1` | Once | On its first run, saves the current `MaxReceiveSize` and `MaxSendSize`, and whether Currawong was already on the domain secure lists, to `currawong-transport-backup.xml` in the admin's profile. Sets both sizes to Currawong's limit and, when domain secure, adds Currawong to `TLSReceiveDomainSecureList` and `TLSSendDomainSecureList` if missing. |
+| `rollback.ps1` | Only to back out | Removes both connectors, restores the saved sizes, takes Currawong off the domain secure lists only if the transport script added it, and restores Default Frontend's saved ranges if it was locked down (warning if that backup is missing, for example when run from another account). It deletes the backups it used. |
 
-The Receive connector is domain secure (Partner, mutual TLS) only when
-Currawong has a client certificate to present: the route's `client_cert` and
-`client_key`, or else the gateway's `tls.cert` and `tls.key`. Currawong then
-presents that certificate whenever Exchange asks for one. Without a client
-certificate the wizard renders the anonymous connector instead, since a
-Partner connector would refuse every delivery:
+The Receive connector is domain secure (Partner, mutual TLS) only when the
+route sets `client_cert` and `client_key`. This is opt in: the gateway's
+`tls.cert` is never used as the client certificate, because a public-CA server
+certificate often lacks the client authentication usage Exchange requires.
+Currawong presents the route's certificate whenever Exchange asks for one.
+Without it the wizard renders the anonymous connector, since a Partner
+connector would refuse every delivery:
 
 - **Anonymous Receive connector.** `-Usage Custom -PermissionGroups
   AnonymousUsers` with `-RequireTLS $true`. The remote IP restriction is then
@@ -165,7 +168,7 @@ the other trusts.
   `-TlsAuthLevel DomainValidation -TlsDomain <Currawong host name>`, so
   Exchange must trust the certificate configured in `tls.cert`. For a domain
   secure Receive connector, Exchange also checks the client certificate
-  Currawong presents (`client_cert`, or `tls.cert`): it must name Currawong's
+  Currawong presents (the route's `client_cert`): it must name Currawong's
   host name, allow client authentication (the TLS Web Client Authentication
   extended key usage, or none), and chain to a CA the Exchange servers trust.
   Use a public CA, or add your CA to the Exchange servers' Trusted Root

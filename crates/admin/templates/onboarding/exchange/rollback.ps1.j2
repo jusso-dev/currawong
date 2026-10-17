@@ -13,6 +13,10 @@ if (Test-Path $saved) {
     Set-ReceiveConnector "{{ server }}\Default Frontend {{ server }}" -RemoteIPRanges (Import-Clixml -Path $saved)
     Remove-Item -Path $saved
 }
+{%- if c.lockdown %} else {
+    Write-Warning "$saved was not found (run rollback as the account that ran receive.ps1). Set the RemoteIPRanges of {{ server }}\Default Frontend {{ server }} back by hand."
+}
+{%- endif %}
 {% endfor -%}
 if (Get-SendConnector "Currawong Outbound" -ErrorAction SilentlyContinue) {
     Remove-SendConnector "Currawong Outbound" -Confirm:$false
@@ -22,15 +26,14 @@ if (Test-Path $backup) {
     # Saved values read like "10 MB (10,485,760 bytes)"; the part before the bracket is enough.
     $previous = Import-Clixml -Path $backup
     Set-TransportConfig -MaxReceiveSize ($previous.MaxReceiveSize -replace '\s*\(.*$', '') -MaxSendSize ($previous.MaxSendSize -replace '\s*\(.*$', '')
-{%- if c.domain_secure %}
-    # Take Currawong off the domain secure lists only if the transport script added it.
-    if (-not $previous.ReceiveSecure) {
+    # Take Currawong off a domain secure list only if it was not there before.
+    $config = Get-TransportConfig
+    if ($previous.ReceiveSecure -eq $false -and @($config.TLSReceiveDomainSecureList | ForEach-Object { $_.ToString() }) -contains "{{ c.fqdn }}") {
         Set-TransportConfig -TLSReceiveDomainSecureList @{Remove="{{ c.fqdn }}"}
     }
-    if (-not $previous.SendSecure) {
+    if ($previous.SendSecure -eq $false -and @($config.TLSSendDomainSecureList | ForEach-Object { $_.ToString() }) -contains "{{ c.fqdn }}") {
         Set-TransportConfig -TLSSendDomainSecureList @{Remove="{{ c.fqdn }}"}
     }
-{%- endif %}
     Remove-Item -Path $backup
 } else {
     Write-Warning "$backup was not found. Set MaxReceiveSize and MaxSendSize back by hand, and check the domain secure lists."

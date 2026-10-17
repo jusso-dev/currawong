@@ -181,8 +181,8 @@ next_hop = "127.0.0.1:2526"
 # order, failing over on connect or session errors. TLS is required and the
 # certificate must be valid for tls_cert_name; ca_file adds an internal CA to
 # the WebPKI roots for this route. client_cert and client_key (both or
-# neither, default tls.cert and tls.key) are presented to a domain secure
-# Receive connector. Put the Exchange servers' source addresses in that
+# neither, opt in; tls.cert is not used) are presented to a domain secure
+# Receive connector and must allow client authentication. Put the Exchange servers' source addresses in that
 # tenant's relay.tenants trusted_cidrs for outbound.
 # mailbox_platform = "m365" or "google_workspace" is a label only for now;
 # those routes use next_hop.

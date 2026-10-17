@@ -28,6 +28,7 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     let cfg = Config::load(path).map_err(|err| err.to_string())?;
     cfg.validate().map_err(|err| err.to_string())?;
     cfg.check_clamd().map_err(|err| err.to_string())?;
+    currawong_smtp::delivery::check_exchange_tls(&cfg)?;
     if cfg.classify.enabled {
         currawong_classify::check_config(&cfg.classify).map_err(|err| err.to_string())?;
     }

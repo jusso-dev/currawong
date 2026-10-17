@@ -3,11 +3,12 @@
 # Mailbox server and is safe to run again. Only Currawong
 # ({{ c.remote_ips }}) may use it, over TLS.
 {%- if c.domain_secure %}
-# Partner usage (domain secure): Currawong presents a client certificate for
-# {{ c.fqdn }}, which the transport script adds to the domain secure lists.
+# Partner usage (domain secure): Currawong presents the route's client
+# certificate for {{ c.fqdn }}, which the transport script adds to the domain
+# secure lists. The certificate must allow client authentication.
 {%- else %}
-# Anonymous usage: Currawong has no client certificate configured, so the
-# connector cannot be domain secure. Hosts at these addresses may send
+# Anonymous usage: the route sets no client certificate, so the connector
+# is not domain secure. Hosts at these addresses may send
 # without one. The RemoteIPRanges restriction is the key control, so keep it
 # to Currawong's addresses only. TLS is still required.
 {%- endif %}
@@ -20,7 +21,7 @@ if (-not (Get-ReceiveConnector "{{ server }}\Currawong Inbound" -ErrorAction Sil
 {%- endif %}
 }
 {%- if c.domain_secure %}
-Set-ReceiveConnector "{{ server }}\Currawong Inbound" -RemoteIPRanges {{ c.remote_ips }} -MaxMessageSize {{ c.size }} -TlsDomainCapabilities "{{ c.fqdn }}:AcceptCloudServicesMail" -ProtocolLoggingLevel Verbose
+Set-ReceiveConnector "{{ server }}\Currawong Inbound" -RemoteIPRanges {{ c.remote_ips }} -MaxMessageSize {{ c.size }} -DomainSecureEnabled $true -TlsDomainCapabilities "{{ c.fqdn }}:AcceptCloudServicesMail" -ProtocolLoggingLevel Verbose
 {%- else %}
 Set-ReceiveConnector "{{ server }}\Currawong Inbound" -RemoteIPRanges {{ c.remote_ips }} -MaxMessageSize {{ c.size }} -ProtocolLoggingLevel Verbose
 {%- endif %}

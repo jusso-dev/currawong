@@ -267,18 +267,20 @@ pub enum MailboxPlatform {
         /// in addition to the WebPKI roots. For an internal enterprise CA.
         ca_file: Option<PathBuf>,
         /// Client certificate and key (PEM) presented to Exchange, for a
-        /// domain secure (mutual TLS) Receive connector. Both or neither;
-        /// when unset the gateway's `tls.cert` and `tls.key` are used.
+        /// domain secure (mutual TLS) Receive connector. Both or neither.
+        /// Opt in: with neither, no client certificate is presented and the
+        /// connector is the anonymous, IP-restricted one. The gateway's
+        /// `tls.cert` is not used, as a server certificate often lacks the
+        /// client authentication usage Exchange needs.
         client_cert: Option<PathBuf>,
         client_key: Option<PathBuf>,
     },
 }
 
 impl MailboxPlatform {
-    /// The certificate and key Currawong presents to an Exchange route: the
-    /// route's own pair, else the gateway's inbound `tls.cert` and `tls.key`.
-    /// `None` when neither is set, so the connector cannot be domain secure.
-    pub fn client_identity<'a>(&'a self, tls: &'a TlsConfig) -> Option<(&'a Path, &'a Path)> {
+    /// The certificate and key Currawong presents to an Exchange route, set
+    /// explicitly on the route. `None` means the connector is not domain secure.
+    pub fn client_identity(&self) -> Option<(&Path, &Path)> {
         let Self::ExchangeOnPrem {
             client_cert,
             client_key,
@@ -287,10 +289,8 @@ impl MailboxPlatform {
         else {
             return None;
         };
-        match (client_cert, client_key, &tls.cert, &tls.key) {
-            (Some(cert), Some(key), _, _) | (None, None, Some(cert), Some(key)) => {
-                Some((cert.as_path(), key.as_path()))
-            }
+        match (client_cert, client_key) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
             _ => None,
         }
     }
@@ -1582,8 +1582,7 @@ mod tests {
     }
 
     #[test]
-    fn exchange_client_identity_defaults_to_the_gateway_certificate() {
-        let mut tls = TlsConfig::default();
+    fn exchange_client_identity_is_opt_in_per_route() {
         let route = |cert: Option<&str>| MailboxPlatform::ExchangeOnPrem {
             version: ExchangeVersion::Ex2019,
             mailbox_hosts: vec!["e".into()],
@@ -1592,18 +1591,13 @@ mod tests {
             client_cert: cert.map(PathBuf::from),
             client_key: cert.map(|_| PathBuf::from("/route.key")),
         };
-        assert_eq!(route(None).client_identity(&tls), None);
-        tls.cert = Some("/gw.pem".into());
-        tls.key = Some("/gw.key".into());
+        // The gateway's tls.cert is never used as the client certificate.
+        assert_eq!(route(None).client_identity(), None);
         assert_eq!(
-            route(None).client_identity(&tls),
-            Some((Path::new("/gw.pem"), Path::new("/gw.key")))
-        );
-        assert_eq!(
-            route(Some("/route.pem")).client_identity(&tls),
+            route(Some("/route.pem")).client_identity(),
             Some((Path::new("/route.pem"), Path::new("/route.key")))
         );
-        assert_eq!(MailboxPlatform::M365.client_identity(&tls), None);
+        assert_eq!(MailboxPlatform::M365.client_identity(), None);
     }
 
     #[test]

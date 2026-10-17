@@ -9,6 +9,7 @@ pub mod outbound_tls;
 pub mod route;
 
 use crate::{dns::DnsLookup, tlsrpt::TlsRpt};
+pub use exchange::check_exchange_tls;
 pub use dsn::{build_dsn, status_code};
 pub use outbound_tls::OutboundTls;
 pub use route::{resolve_route, RouteError};
@@ -536,24 +537,15 @@ impl<D: DnsLookup> Deliverer<D> {
         report: bool,
     ) -> Result<Plan, HostFailure> {
         if !route.via_mx {
-            if let Some(
-                platform @ MailboxPlatform::ExchangeOnPrem {
-                    tls_cert_name,
-                    ca_file,
-                    ..
-                },
-            ) = &route.platform
+            if let Some(platform @ MailboxPlatform::ExchangeOnPrem { tls_cert_name, .. }) =
+                &route.platform
             {
-                let client = platform
-                    .client_identity(&self.cfg.tls)
-                    .map(|(cert, key)| (cert.to_path_buf(), key.to_path_buf()));
-                return Ok(Plan::Exchange {
-                    name: tls_cert_name.clone(),
-                    files: exchange::ExchangeTlsFiles {
-                        ca_file: ca_file.clone(),
-                        client,
-                    },
-                });
+                if let Some(files) = exchange::ExchangeTlsFiles::from_platform(platform) {
+                    return Ok(Plan::Exchange {
+                        name: tls_cert_name.clone(),
+                        files,
+                    });
+                }
             }
             return Ok(Plan::Opportunistic);
         }

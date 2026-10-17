@@ -6,7 +6,7 @@ use currawong_core::config::{Config, DomainRoute, ExchangeVersion, MailboxPlatfo
 use currawong_smtp::{
     delivery::{
         mta_sts::{MtaSts, PolicyFetcher},
-        Deliverer, DeliveryOutcome, OutboundTls,
+        check_exchange_tls, Deliverer, DeliveryOutcome, OutboundTls,
     },
     dns::{MapDns, Tlsa},
     tls::build_server_config,
@@ -809,9 +809,16 @@ async fn exchange_setup(hosts: &[String], ca_pem: Option<&str>) -> Setup {
 }
 
 /// A port nothing listens on, so connecting is refused.
+/// A port that refuses connections. Port 1 (tcpmux) is privileged, so no
+/// test can bind it, and is outside every ephemeral range, so no other test
+/// can be handed it. Checked first, so a host that does run tcpmux fails
+/// loudly rather than passing for the wrong reason.
 async fn refused_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    listener.local_addr().unwrap().port()
+    let err = tokio::net::TcpStream::connect("127.0.0.1:1")
+        .await
+        .expect_err("something listens on 127.0.0.1:1");
+    assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused, "{err}");
+    1
 }
 
 #[tokio::test]
@@ -921,10 +928,10 @@ async fn exchange_delivery_route_domain_is_normalised_for_tls_too() {
     assert!(plain.drain().await.iter().all(|s| !s.sent_mail()));
 }
 
-/// The gateway's inbound certificate is presented to a Receive connector that
-/// asks for one (domain secure mail), unless the route names its own pair.
+/// The route's client certificate is presented to a Receive connector that
+/// asks for one (domain secure mail). The gateway's `tls.cert` never is.
 #[tokio::test]
-async fn exchange_delivery_presents_the_gateway_client_certificate() {
+async fn exchange_delivery_presents_the_route_client_certificate() {
     let pki = Pki::new();
     // The fake Exchange server requires a client certificate from the CA.
     let mut roots = RootCertStore::empty();
@@ -947,25 +954,18 @@ async fn exchange_delivery_presents_the_gateway_client_certificate() {
     .unwrap();
     let mut exchange = sink_with(Some(TlsAcceptor::from(Arc::new(config)))).await;
 
-    // Currawong's inbound certificate, usable as a client certificate too.
-    let gw_key = KeyPair::generate().unwrap();
-    let mut params = CertificateParams::new(vec!["gw.currawong.test".to_string()]).unwrap();
-    params.extended_key_usages = vec![
-        ExtendedKeyUsagePurpose::ServerAuth,
-        ExtendedKeyUsagePurpose::ClientAuth,
-    ];
-    let gw_cert = params
-        .signed_by(&gw_key, &pki.ca_cert, &pki.ca_key)
-        .unwrap();
+    // The gateway's server certificate and the route's client certificate.
+    let gateway = client_identity(&pki, "gw.currawong.test");
+    let route = client_identity(&pki, "gw.currawong.test");
 
     let hosts = [format!("exch01.example.test:{}", exchange.addr.port())];
     let mut setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
-    let cert_path = setup._dir.path().join("gw.pem");
-    let key_path = setup._dir.path().join("gw.key");
-    std::fs::write(&cert_path, gw_cert.pem()).unwrap();
-    std::fs::write(&key_path, gw_key.serialize_pem()).unwrap();
-    setup.cfg.tls.cert = Some(cert_path);
-    setup.cfg.tls.key = Some(key_path);
+    let dir = setup._dir.path().to_path_buf();
+    let (gw_cert, gw_key) = gateway.write(&dir, "gw");
+    setup.cfg.tls.cert = Some(gw_cert.clone());
+    setup.cfg.tls.key = Some(gw_key.clone());
+    let (route_cert, route_key) = route.write(&dir, "route");
+    set_client(&mut setup, Some((route_cert, route_key)));
     let done = setup.deliver(&exchange, OutboundTls::webpki()).await;
     assert_eq!(
         done.outcome,
@@ -975,13 +975,16 @@ async fn exchange_delivery_presents_the_gateway_client_certificate() {
     );
     let session = exchange.next().await;
     assert!(session.sent_mail(), "{session:?}");
-    assert_eq!(session.client_cert.as_deref(), Some(gw_cert.der().as_ref()));
+    // The route's pair wins over tls.cert.
+    assert_eq!(session.client_cert.as_deref(), Some(route.der.as_slice()));
 
-    // Without a client certificate the same server refuses the session (TLS
-    // 1.3 reports it on the first read), and the message defers rather than
-    // going in plaintext.
+    // With only the gateway's tls.cert, no client certificate is presented:
+    // the same server refuses the session (TLS 1.3 reports it on the first
+    // read), and the message defers rather than going in plaintext.
     let hosts = [format!("exch01.example.test:{}", exchange.addr.port())];
-    let setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let mut setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    setup.cfg.tls.cert = Some(gw_cert);
+    setup.cfg.tls.key = Some(gw_key);
     let done = setup.deliver(&exchange, OutboundTls::webpki()).await;
     assert!(
         matches!(&done.outcome, DeliveryOutcome::TempFail(d) if d.contains("CertificateRequired")),
@@ -989,4 +992,82 @@ async fn exchange_delivery_presents_the_gateway_client_certificate() {
         done.outcome
     );
     assert!(exchange.drain().await.iter().all(|s| !s.sent_mail()));
+}
+
+/// A certificate for `name` from the test CA that allows client authentication.
+struct ClientIdentity {
+    pem: String,
+    key_pem: String,
+    der: Vec<u8>,
+}
+
+impl ClientIdentity {
+    fn write(&self, dir: &std::path::Path, stem: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cert = dir.join(format!("{stem}.pem"));
+        let key = dir.join(format!("{stem}.key"));
+        std::fs::write(&cert, &self.pem).unwrap();
+        std::fs::write(&key, &self.key_pem).unwrap();
+        (cert, key)
+    }
+}
+
+fn client_identity(pki: &Pki, name: &str) -> ClientIdentity {
+    let key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec![name.to_string()]).unwrap();
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let cert = params.signed_by(&key, &pki.ca_cert, &pki.ca_key).unwrap();
+    ClientIdentity {
+        pem: cert.pem(),
+        key_pem: key.serialize_pem(),
+        der: cert.der().to_vec(),
+    }
+}
+
+fn set_client(setup: &mut Setup, pair: Option<(std::path::PathBuf, std::path::PathBuf)>) {
+    if let Some(MailboxPlatform::ExchangeOnPrem {
+        client_cert,
+        client_key,
+        ..
+    }) = &mut setup.cfg.domains.routes[0].platform
+    {
+        *client_cert = pair.as_ref().map(|(cert, _)| cert.clone());
+        *client_key = pair.map(|(_, key)| key);
+    }
+}
+
+/// `--check-config` and startup parse the route's PEM files, so a bad file
+/// or a key that does not match its certificate is caught before any mail.
+#[tokio::test]
+async fn exchange_tls_files_are_parsed_at_startup() {
+    let pki = Pki::new();
+    let mut setup = exchange_setup(&["exch01.example.test".into()], Some(&pki.ca_cert.pem())).await;
+    let dir = setup._dir.path().to_path_buf();
+    let mine = client_identity(&pki, "gw.currawong.test");
+    let other = client_identity(&pki, "gw.currawong.test");
+    let (cert, key) = mine.write(&dir, "mine");
+    let (_, other_key) = other.write(&dir, "other");
+    set_client(&mut setup, Some((cert.clone(), key)));
+    check_exchange_tls(&setup.cfg).unwrap();
+
+    // The key belongs to another certificate.
+    set_client(&mut setup, Some((cert.clone(), other_key)));
+    let err = check_exchange_tls(&setup.cfg).unwrap_err();
+    assert!(err.contains("route example.test") && err.contains("client"), "{err}");
+
+    // Not PEM at all, an empty CA file, and a certificate file with no certificate.
+    let junk = dir.join("junk.pem");
+    std::fs::write(&junk, "not a certificate").unwrap();
+    set_client(&mut setup, Some((junk.clone(), dir.join("mine.key"))));
+    assert!(check_exchange_tls(&setup.cfg).is_err());
+    set_client(&mut setup, None);
+    if let Some(MailboxPlatform::ExchangeOnPrem { ca_file, .. }) =
+        &mut setup.cfg.domains.routes[0].platform
+    {
+        *ca_file = Some(junk);
+    }
+    let err = check_exchange_tls(&setup.cfg).unwrap_err();
+    assert!(err.contains("ca_file"), "{err}");
 }

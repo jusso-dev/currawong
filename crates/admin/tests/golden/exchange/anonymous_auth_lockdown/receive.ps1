@@ -2,8 +2,8 @@
 # Run in the Exchange Management Shell. This creates the connector on each
 # Mailbox server and is safe to run again. Only Currawong
 # (198.51.100.20,2001:db8::25) may use it, over TLS.
-# Anonymous usage: Currawong has no client certificate configured, so the
-# connector cannot be domain secure. Hosts at these addresses may send
+# Anonymous usage: the route sets no client certificate, so the connector
+# is not domain secure. Hosts at these addresses may send
 # without one. The RemoteIPRanges restriction is the key control, so keep it
 # to Currawong's addresses only. TLS is still required.
 

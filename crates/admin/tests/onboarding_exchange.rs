@@ -111,6 +111,7 @@ fn onboarding_exchange_partner_matches_golden() {
     assert!(!scripts.receive.contains("Default Frontend"));
     // Domain secure, so Currawong goes on the secure lists, once.
     assert!(scripts.receive.contains("-TlsDomainCapabilities"));
+    assert!(scripts.receive.contains("-DomainSecureEnabled $true"));
     assert!(scripts.transport.contains(
         "Set-TransportConfig -TLSReceiveDomainSecureList @{Add=\"gw.currawong.example\"}"
     ));
@@ -128,7 +129,7 @@ fn onboarding_exchange_partner_matches_golden() {
     // Rollback removes only what the transport script added.
     assert!(scripts
         .rollback
-        .contains("if (-not $previous.ReceiveSecure)"));
+        .contains("if ($previous.ReceiveSecure -eq $false"));
     assert!(scripts
         .rollback
         .contains("Remove-ReceiveConnector \"EXCH01\\Currawong Inbound\""));
@@ -152,12 +153,25 @@ fn onboarding_exchange_variants_match_golden() {
         }
     }
     assert!(scripts.receive.contains("-Usage Custom"));
-    // No client certificate: nothing domain secure is rendered.
+    // No client certificate: nothing domain secure is set up.
     for (name, text) in files(&scripts) {
-        for secure in ["Partner", "DomainSecureList", "TlsDomainCapabilities"] {
+        for secure in [
+            "Partner",
+            "DomainSecureList @{Add",
+            "DomainSecureEnabled",
+            "TlsDomainCapabilities",
+        ] {
             assert!(!text.contains(secure), "{name} contains {secure}");
         }
     }
+    // The backup still records the secure lists, so rollback does not depend
+    // on which mode the wizard is in when it is run.
+    assert!(scripts.transport.contains("ReceiveSecure = $receiveSecure"));
+    assert!(scripts.rollback.contains("if ($previous.ReceiveSecure -eq $false"));
+    // A missing lock-down backup is reported, not skipped silently.
+    assert!(scripts
+        .rollback
+        .contains("Write-Warning \"$saved was not found"));
     assert!(scripts.receive.contains("-PermissionGroups AnonymousUsers"));
     assert!(scripts
         .receive
@@ -215,12 +229,21 @@ fn onboarding_exchange_wizard_defaults_come_from_config() {
         .transport
         .contains("-MaxReceiveSize 40MB -MaxSendSize 40MB"));
     assert!(scripts.receive.contains("Exchange Server 2016"));
-    // Config::default has a gateway certificate, so the connector is domain secure.
-    assert!(wizard.domain_secure);
-    cfg.tls.cert = None;
-    cfg.tls.key = None;
-    let wizard = ExchangeOnboarding::from_config(&cfg, "AGENCY.example.").unwrap();
+    // Config::default has a gateway certificate, but domain secure is opt in:
+    // only a client certificate set on the route turns it on.
+    assert!(cfg.tls.cert.is_some());
     assert!(!wizard.domain_secure);
+    if let Some(MailboxPlatform::ExchangeOnPrem {
+        client_cert,
+        client_key,
+        ..
+    }) = &mut cfg.domains.routes[0].platform
+    {
+        *client_cert = Some("/etc/currawong/exchange-client.pem".into());
+        *client_key = Some("/etc/currawong/exchange-client.key".into());
+    }
+    let wizard = ExchangeOnboarding::from_config(&cfg, "AGENCY.example.").unwrap();
+    assert!(wizard.domain_secure);
 
     assert!(ExchangeOnboarding::from_config(&cfg, "other.example").is_err());
 }

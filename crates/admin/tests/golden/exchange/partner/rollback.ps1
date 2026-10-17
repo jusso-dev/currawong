@@ -29,11 +29,12 @@ if (Test-Path $backup) {
     # Saved values read like "10 MB (10,485,760 bytes)"; the part before the bracket is enough.
     $previous = Import-Clixml -Path $backup
     Set-TransportConfig -MaxReceiveSize ($previous.MaxReceiveSize -replace '\s*\(.*$', '') -MaxSendSize ($previous.MaxSendSize -replace '\s*\(.*$', '')
-    # Take Currawong off the domain secure lists only if the transport script added it.
-    if (-not $previous.ReceiveSecure) {
+    # Take Currawong off a domain secure list only if it was not there before.
+    $config = Get-TransportConfig
+    if ($previous.ReceiveSecure -eq $false -and @($config.TLSReceiveDomainSecureList | ForEach-Object { $_.ToString() }) -contains "gw.currawong.example") {
         Set-TransportConfig -TLSReceiveDomainSecureList @{Remove="gw.currawong.example"}
     }
-    if (-not $previous.SendSecure) {
+    if ($previous.SendSecure -eq $false -and @($config.TLSSendDomainSecureList | ForEach-Object { $_.ToString() }) -contains "gw.currawong.example") {
         Set-TransportConfig -TLSSendDomainSecureList @{Remove="gw.currawong.example"}
     }
     Remove-Item -Path $backup

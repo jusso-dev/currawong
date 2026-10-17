@@ -21,8 +21,8 @@ pub struct ExchangeOnboarding {
     pub servers: Vec<String>,
     /// `limits.max_message_bytes`, so Exchange and Currawong agree on size.
     pub max_message_bytes: u64,
-    /// Currawong presents a client certificate to Exchange (`client_cert`, or
-    /// the gateway's `tls.cert`). Only then is the Receive connector rendered
+    /// Currawong presents a client certificate to Exchange (the route's
+    /// `client_cert`, opt in). Only then is the Receive connector rendered
     /// as Partner (domain secure, mutual TLS); without one it is the
     /// AnonymousUsers connector, TLS required, limited by RemoteIPRanges.
     pub domain_secure: bool,
@@ -95,7 +95,7 @@ impl ExchangeOnboarding {
             domains: vec![route.domain.to_ascii_lowercase()],
             servers,
             max_message_bytes: cfg.limits.max_message_bytes,
-            domain_secure: platform.client_identity(&cfg.tls).is_some(),
+            domain_secure: platform.client_identity().is_some(),
             smtp_auth: false,
             lock_down_default_frontend: None,
         })
