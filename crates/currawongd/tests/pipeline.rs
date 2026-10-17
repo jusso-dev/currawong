@@ -770,3 +770,111 @@ async fn outbound_user_policy_matches_only_the_logged_in_user() {
         "only ada's login matches; bob sending as ada and trusted relay do not"
     );
 }
+
+fn marked_message(header: Option<&str>, subject: &str, to: &str) -> Vec<u8> {
+    let header = header
+        .map(|value| format!("X-Protective-Marking: {value}\r\n"))
+        .unwrap_or_default();
+    format!(
+        "From: officer@agency.gov.au\r\nTo: {to}\r\n{header}Subject: {subject}\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\nbriefing\r\n"
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn pspf_outbound_protected_to_gmail_is_blocked_under_the_government_pack() {
+    let mut cfg = Config::default();
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.policy.pack = Some(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/policies/government.toml"),
+    );
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "agency.gov.au", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg.clone()), auth);
+    pipeline.policies = currawong_policy::load_pack(&cfg.policy).unwrap();
+    let protected = "VER=2018.6, NS=gov.au, SEC=PROTECTED, ORIGIN=officer@agency.gov.au";
+    let send = |to: &str| {
+        let mut env = envelope("officer@agency.gov.au");
+        env.direction = Direction::Outbound;
+        env.rcpt_to = vec![to.into()];
+        env
+    };
+
+    let to_gmail = send("someone@gmail.com");
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "someone@gmail.com",
+    );
+    let (report, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    let marking = report.marking.as_ref().unwrap();
+    assert_eq!(
+        marking.classification,
+        Some(currawong_core::Classification::Protected)
+    );
+    assert!(
+        matches!(&verdict, Verdict::Reject { reason, .. } if reason == "pspf-protected-external"),
+        "{verdict:?}"
+    );
+
+    // The same message to a government domain is delivered.
+    let to_gov = send("officer@finance.gov.au");
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "officer@finance.gov.au",
+    );
+    let (_, verdict) = pipeline.evaluate(&to_gov, &raw, None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+
+    // A PROTECTED header under an OFFICIAL subject is a mismatch and held.
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=OFFICIAL]",
+        "officer@finance.gov.au",
+    );
+    let (report, verdict) = pipeline.evaluate(&to_gov, &raw, None).await;
+    assert!(report.marking.as_ref().unwrap().mismatch);
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "pspf-mismatch"),
+        "{verdict:?}"
+    );
+
+    // Subject-only PROTECTED marking still blocks external mail.
+    let raw = marked_message(None, "Brief [SEC=PROTECTED]", "someone@gmail.com");
+    let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    assert!(matches!(verdict, Verdict::Reject { .. }), "{verdict:?}");
+
+    // Government tenants must mark outbound mail: unmarked mail is held.
+    let raw = marked_message(None, "Lunch", "someone@gmail.com");
+    let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "pspf-required"),
+        "{verdict:?}"
+    );
+
+    // Mixed recipients are decided one by one: gov.au delivers, gmail is refused.
+    let mut mixed = send("officer@finance.gov.au");
+    mixed.rcpt_to.push("someone@gmail.com".into());
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "officer@finance.gov.au",
+    );
+    let (_, decision) = pipeline.assess(&mixed, &raw, None).await;
+    let verdicts: Vec<(String, bool)> = decision
+        .decisions
+        .iter()
+        .map(|d| (d.recipient.clone(), matches!(d.verdict, Verdict::Deliver)))
+        .collect();
+    assert!(
+        verdicts.contains(&("officer@finance.gov.au".into(), true)),
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts.contains(&("someone@gmail.com".into(), false)),
+        "{verdicts:?}"
+    );
+}

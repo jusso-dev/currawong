@@ -1128,6 +1128,7 @@ name = "currawong-dlp"
 version = "0.0.1"
 dependencies = [
  "currawong-core",
+ "mail-parser",
  "serde_json",
 ]
 

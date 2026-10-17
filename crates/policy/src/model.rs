@@ -113,6 +113,12 @@ pub enum Condition {
     },
     /// Protective marking, for example `OFFICIAL:Sensitive`. `none` means unmarked.
     Marking(String),
+    /// The PSPF classification is this level or higher, for example
+    /// `PROTECTED` also matches `SECRET`. Unmarked mail never matches.
+    MarkingAtLeast(String),
+    /// The inner condition does not hold, for example
+    /// `{ not = { recipient = "*@*.gov.au" } }`.
+    Not(Box<Condition>),
     /// `method` is `spf`, `dkim`, `dmarc`, `arc` or `dmarc_policy`.
     Auth {
         method: String,
@@ -272,28 +278,8 @@ impl Policy {
             return bad("scope value is empty".into());
         }
         for condition in &self.conditions {
-            match condition {
-                Condition::Auth { method, .. }
-                    if !["spf", "dkim", "dmarc", "arc", "dmarc_policy"]
-                        .contains(&method.as_str()) =>
-                {
-                    return bad(format!("unknown auth method {method}"));
-                }
-                Condition::Score {
-                    name,
-                    at_least,
-                    below,
-                } => {
-                    if [*at_least, *below].iter().flatten().any(|v| !v.is_finite()) {
-                        return bad(format!("score {name} bound is not a finite number"));
-                    }
-                    if let (Some(min), Some(max)) = (at_least, below) {
-                        if max <= min {
-                            return bad(format!("score {name} range is empty"));
-                        }
-                    }
-                }
-                _ => {}
+            if let Err(message) = check_condition(condition, true) {
+                return bad(message);
             }
         }
         for action in &self.actions {
@@ -419,4 +405,37 @@ pub fn canonical_pattern(address: &str) -> String {
 
 pub fn canonical_domain(domain: &str) -> String {
     domain.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn check_condition(condition: &Condition, top: bool) -> Result<(), String> {
+    match condition {
+        Condition::Auth { method, .. }
+            if !["spf", "dkim", "dmarc", "arc", "dmarc_policy"].contains(&method.as_str()) =>
+        {
+            Err(format!("unknown auth method {method}"))
+        }
+        Condition::Score {
+            name,
+            at_least,
+            below,
+        } => {
+            if [*at_least, *below].iter().flatten().any(|v| !v.is_finite()) {
+                return Err(format!("score {name} bound is not a finite number"));
+            }
+            if let (Some(min), Some(max)) = (at_least, below) {
+                if max <= min {
+                    return Err(format!("score {name} range is empty"));
+                }
+            }
+            Ok(())
+        }
+        Condition::MarkingAtLeast(level)
+            if currawong_core::Classification::parse(level).is_none() =>
+        {
+            Err(format!("{level} is not a PSPF classification"))
+        }
+        Condition::Not(_) if !top => Err("not conditions cannot be nested".into()),
+        Condition::Not(inner) => check_condition(inner, false),
+        _ => Ok(()),
+    }
 }
