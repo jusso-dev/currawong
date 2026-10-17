@@ -1288,15 +1288,18 @@ dependencies = [
  "hickory-resolver",
  "ipnet",
  "libc",
+ "mail-auth",
  "mail-builder 0.4.4",
  "mail-send",
  "metrics",
  "pin-project-lite",
  "rand 0.8.8",
  "rcgen",
+ "reqwest",
  "rusqlite",
  "rustls",
  "rustls-pemfile",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "sha2",
@@ -1307,6 +1310,9 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "ulid",
+ "url",
+ "webpki-roots",
 ]
 
 [[package]]
