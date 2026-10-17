@@ -3,3 +3,5 @@ target/
 /spool/
 /fuzz/corpus/
 /fuzz/artifacts/
+.claude/worktrees/
+.claude/scratch/

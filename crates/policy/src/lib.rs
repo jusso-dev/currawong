@@ -1,89 +1,98 @@
-//! M1 policy. Spam, phishing, BEC and DLP blocking stay in M2.
-//! A message is quarantined for malware, active content, a fail-closed scan,
-//! or a DMARC `p=reject` failure. Anything else is delivered.
-use currawong_core::{ScanReport, Verdict};
+//! Policy engine: `ScanReport` -> `Signals` -> built-in floor and layered
+//! policies -> one `Decision` per recipient, with an explanation of which
+//! policies matched.
+pub mod eval;
+pub mod model;
+pub mod signals;
+pub mod store;
 
-pub fn decide(report: &ScanReport) -> Verdict {
-    if report.malware {
-        return Verdict::Quarantine {
-            reason: "malware".into(),
-        };
-    }
-    if report.defer {
-        let reason = report
-            .notes
-            .iter()
-            .find(|note| note.contains("unreachable"))
-            .cloned()
-            .unwrap_or_else(|| "required scanner is unreachable".into());
-        return Verdict::Defer { reason };
-    }
-    if report.active_content {
-        return Verdict::Quarantine {
-            reason: "active content".into(),
-        };
-    }
-    if report.fail_closed {
-        return Verdict::Quarantine {
-            reason: "scan failed closed".into(),
-        };
-    }
-    if let Some(auth) = &report.auth {
-        if auth.dmarc.result == "fail" && auth.dmarc_policy == "reject" {
-            return Verdict::Quarantine {
-                reason: "dmarc p=reject".into(),
-            };
-        }
-    }
-    Verdict::Deliver
+pub use eval::{
+    evaluate, evaluate_message, evaluate_signals, Context, Decision, Matched, MessageDecision,
+};
+pub use model::{
+    canonical_address, canonical_domain, canonical_pattern, valid_name, valid_tenant, Action,
+    Condition, Flow, Policy, PolicyError, PolicySet, Scope, FLOOR_RULES,
+};
+pub use signals::Signals;
+pub use store::PolicyStore;
+
+use currawong_core::{config::PolicyConfig, Direction, ScanReport, Verdict};
+use std::{sync::OnceLock, time::SystemTime};
+
+pub const DEFAULT_PACK: &str = include_str!("../../../config/policies/default.toml");
+
+pub fn default_pack() -> &'static PolicySet {
+    static PACK: OnceLock<PolicySet> = OnceLock::new();
+    PACK.get_or_init(|| PolicySet::from_toml(DEFAULT_PACK).expect("default policy pack is valid"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::decide;
-    use currawong_core::{AuthMethodResult, AuthResults, MessageId, ScanReport, Verdict};
-
-    fn report() -> ScanReport {
-        ScanReport::new(MessageId("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()))
+/// The configured pack file, or the default pack. Does not touch the database.
+pub fn load_pack(cfg: &PolicyConfig) -> Result<PolicySet, PolicyError> {
+    match &cfg.pack {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .map_err(|err| PolicyError::Toml(format!("{}: {err}", path.display())))?;
+            PolicySet::from_toml(&text)
+        }
+        None => Ok(default_pack().clone()),
     }
+}
 
-    #[test]
-    fn dmarc_reject_is_quarantined_and_unscored_mail_is_delivered() {
-        let mut spoof = report();
-        spoof.auth = Some(AuthResults {
-            spf: AuthMethodResult {
-                result: "fail".into(),
-                detail: String::new(),
-            },
-            dkim: Vec::new(),
-            dmarc: AuthMethodResult {
-                result: "fail".into(),
-                detail: String::new(),
-            },
-            arc: AuthMethodResult::none(),
-            dmarc_policy: "reject".into(),
-            header: String::new(),
+/// Policies for the running gateway: the database when configured (seeded
+/// from the pack the first time only), otherwise the pack. Once the database
+/// is seeded the pack file is not read, so a bad pack cannot block it.
+pub fn load(cfg: &PolicyConfig) -> Result<PolicySet, PolicyError> {
+    let Some(path) = &cfg.database else {
+        return load_pack(cfg);
+    };
+    let mut store = PolicyStore::open(path)?;
+    if !store.seeded()? {
+        store.seed(&load_pack(cfg)?)?;
+    }
+    store.load()
+}
+
+/// Changes whenever the configured policy source might have: the pack file's
+/// modification time and size, and the database revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pack: Option<(SystemTime, u64)>,
+    revision: Option<i64>,
+}
+
+pub fn stamp(cfg: &PolicyConfig) -> Result<Stamp, PolicyError> {
+    // A configured database is the source; the pack only seeds it once.
+    if let Some(path) = &cfg.database {
+        return Ok(Stamp {
+            pack: None,
+            revision: Some(PolicyStore::open(path)?.revision()?),
         });
-        assert!(matches!(decide(&spoof), Verdict::Quarantine { .. }));
-
-        let mut clean = report();
-        clean
-            .notes
-            .push("corpus sample labelled spam is not scored in M1".into());
-        assert!(matches!(decide(&clean), Verdict::Deliver));
     }
+    let pack = match &cfg.pack {
+        Some(path) => {
+            let meta = std::fs::metadata(path)
+                .map_err(|err| PolicyError::Toml(format!("{}: {err}", path.display())))?;
+            Some((
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.len(),
+            ))
+        }
+        None => None,
+    };
+    Ok(Stamp {
+        pack,
+        revision: None,
+    })
+}
 
-    #[test]
-    fn malware_and_unreachable_engine_take_priority() {
-        let mut infected = report();
-        infected.malware = true;
-        assert!(matches!(decide(&infected), Verdict::Quarantine { reason } if reason == "malware"));
-        let mut deferred = report();
-        deferred.defer = true;
-        assert!(matches!(decide(&deferred), Verdict::Defer { .. }));
-        let mut both = report();
-        both.defer = true;
-        both.malware = true;
-        assert!(matches!(decide(&both), Verdict::Quarantine { .. }));
-    }
+/// The default pack with no envelope context. Kept for callers that only have a report.
+pub fn decide(report: &ScanReport) -> Verdict {
+    let ctx = Context {
+        tenant_id: None,
+        direction: Direction::Inbound,
+        sender: "",
+        sender_identity: None,
+        recipient: "",
+    };
+    evaluate_message(report, &[ctx], default_pack()).verdict()
 }

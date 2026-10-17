@@ -1,0 +1,46 @@
+# Currawong default policy pack. Built into the binary and used when
+# `[policy]` names no pack and no database.
+#
+# Before any pack runs, a built-in floor quarantines malware, defers mail a
+# required scanner could not see and quarantines mail whose scan failed. Packs
+# cannot remove it; only a platform global policy with `override_floor = true`
+# lifts it for the mail it matches.
+#
+# Evaluation: most specific scope first (user, group, domain, tenant, global),
+# then lower `priority` first. The first matching policy with a terminal action
+# (deliver, quarantine, reject, discard, defer) sets the verdict. Header,
+# redirect and bcc actions accumulate; `mandatory = true` policies add theirs
+# even after the verdict is set. `dry_run = true` explains a match without
+# acting on it. Unmatched mail is delivered.
+#
+# Spam scores are not produced yet; the spam policies take effect once the
+# spam stage reports a `spam` score.
+
+[[policy]]
+id = "active-content"
+priority = 30
+conditions = [{ flag = "active_content" }]
+actions = [{ quarantine = "active-content" }]
+
+[[policy]]
+id = "dmarc-reject"
+priority = 50
+conditions = [
+    { auth = { method = "dmarc", result = "fail" } },
+    { auth = { method = "dmarc_policy", result = "reject" } },
+]
+actions = [{ quarantine = "spoofing" }]
+
+[[policy]]
+id = "spam-quarantine"
+priority = 60
+conditions = [{ score = { name = "spam", at_least = 8.0 } }]
+actions = [{ quarantine = "spam" }]
+
+# Subject rewriting needs a body rewrite the spool does not do yet, so the
+# [SPAM] tag is carried in a header that mail clients can filter on.
+[[policy]]
+id = "spam-tag"
+priority = 70
+conditions = [{ score = { name = "spam", at_least = 5.0, below = 8.0 } }]
+actions = [{ add_header = { name = "X-Currawong-Spam", value = "[SPAM]" } }]
