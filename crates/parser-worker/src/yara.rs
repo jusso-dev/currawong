@@ -36,6 +36,7 @@ impl RulesCache {
                     parts: Vec::new(),
                     urls: Vec::new(),
                     error: None,
+                    warnings: Vec::new(),
                     yara: Vec::new(),
                     dlp: Default::default(),
                 }

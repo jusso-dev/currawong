@@ -42,6 +42,9 @@ pub enum PartFlag {
     HasOleObject,
     Executable,
     LimitExceeded,
+    /// An archive or document that could not be opened (unsupported format,
+    /// corrupt, RAR). Treated as a fail-closed scan.
+    Unscannable,
 }
 
 impl PartFlag {
@@ -53,6 +56,7 @@ impl PartFlag {
             Self::HasOleObject => "HasOleObject",
             Self::Executable => "Executable",
             Self::LimitExceeded => "LimitExceeded",
+            Self::Unscannable => "Unscannable",
         }
     }
 }

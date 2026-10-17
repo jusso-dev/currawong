@@ -78,6 +78,13 @@ async fn main() {
 }
 
 async fn run(cfg: currawong_core::Config) -> Result<(), String> {
+    // Parser workers run as this user; they must not be able to ptrace the
+    // daemon or read /proc/<pid>/mem.
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain prctl with constant arguments.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } != 0 {
+        return Err("PR_SET_DUMPABLE failed".into());
+    }
     let guard =
         Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?);
     guard.enforce_config(&cfg).map_err(|err| err.to_string())?;
@@ -136,9 +143,17 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         readiness,
     )
     .map_err(|err| format!("metrics.listen {}: {err}", cfg.metrics.listen))?;
+    if cfg.scanner.enabled && currawongd::worker_binary(&cfg).is_none() {
+        return Err("parser worker binary not found: set scanner.worker_binary".into());
+    }
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     checks.spawn_housekeeping();
     let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth).with_checks(Arc::clone(&checks));
+    if let Some(pool) = &pipeline.pool {
+        pool.self_test()
+            .await
+            .map_err(|err| format!("parser worker self-test failed: {err}"))?;
+    }
     // Keys exist once `currawongd dkim generate` has run; until then nothing is signed.
     if (cfg.dkim.sign_outbound || cfg.dkim.seal_arc) && cfg.dkim.database.exists() {
         let keys = currawong_auth::KeyStore::open(&cfg.dkim.database, &cfg.dkim.kek_path)?;

@@ -170,6 +170,7 @@ fn documents_are_only_parsed_in_the_worker() {
             id: "id".into(),
             raw_path: path,
             limits: ExtractLimits::default(),
+            out_dir: None,
             yara_generation: None,
         },
         &mut currawong_parser::yara::RulesCache::default(),
