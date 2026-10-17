@@ -18,13 +18,18 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 sha2 = { workspace = true }
+tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
 yara-x = { workspace = true }
 notify = { workspace = true }
 arc-swap = { workspace = true }
 base64 = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 tokio = { workspace = true }
 tracing-subscriber = { workspace = true }
 zip = { workspace = true }
+base64 = { workspace = true }
+flate2 = { workspace = true }

@@ -2,7 +2,15 @@ services:
   clamd:
     image: clamav/clamav:stable
     ports:
-      - "3310:3310"
+      # Loopback only: clamd has no authentication.
+      - "127.0.0.1:3310:3310"
+    healthcheck:
+      # Ships in the image. The first signature download takes minutes.
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 6m
     volumes:
       - clamav:/var/lib/clamav
       # Mount supplemental on-premises signatures here and set

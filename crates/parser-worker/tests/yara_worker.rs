@@ -9,14 +9,21 @@ use std::process::{Child, Command, Stdio};
 struct Worker(Child);
 
 impl Worker {
-    fn spawn() -> Self {
+    /// Started as the pool starts it: in its own directory (Landlock on
+    /// Linux allows only `in/` and `out/`), and ready before the first job.
+    fn spawn(dir: &std::path::Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_currawong-parser-worker"))
+            .env_clear()
+            .env("CURRAWONG_WORKER_DIR", dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        Self(child)
+        let mut worker = Self(child);
+        let ready = worker.read();
+        assert_eq!(ready.id, "ready", "{ready:?}");
+        worker
     }
 
     fn send(&mut self, frame: &[u8]) -> ParseResponse {
@@ -26,6 +33,10 @@ impl Worker {
             .unwrap();
         stdin.write_all(frame).unwrap();
         stdin.flush().unwrap();
+        self.read()
+    }
+
+    fn read(&mut self) -> ParseResponse {
         let stdout = self.0.stdout.as_mut().unwrap();
         let mut len = [0u8; 4];
         stdout.read_exact(&mut len).unwrap();
@@ -48,6 +59,7 @@ impl Worker {
             id: "job".into(),
             raw_path: path.to_path_buf(),
             limits: ExtractLimits::default(),
+            out_dir: None,
             yara_generation,
         })
         .unwrap();
@@ -71,13 +83,16 @@ fn encoded(source: &str) -> String {
 #[test]
 fn yara_rules_load_over_stdin_and_the_generation_is_checked() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("msg.eml");
+    for sub in ["in", "out"] {
+        std::fs::create_dir(dir.path().join(sub)).unwrap();
+    }
+    let path = dir.path().join("in/msg.eml");
     std::fs::write(
         &path,
         b"From: a@example.test\r\nTo: b@example.test\r\nSubject: hi\r\n\r\ncurrawong-worker-marker\r\n",
     )
     .unwrap();
-    let mut worker = Worker::spawn();
+    let mut worker = Worker::spawn(dir.path());
 
     let before = worker.parse(&path, Some(7));
     assert!(before.error.unwrap().contains("not loaded"));

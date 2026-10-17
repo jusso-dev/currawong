@@ -29,14 +29,22 @@ async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
+tempfile = { workspace = true }
+url = { workspace = true }
 metrics = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }
+flate2 = { workspace = true }
+zip = { workspace = true }
+sevenz-rust2 = { workspace = true, features = ["compress"] }
 tempfile = { workspace = true }
 zeroize = { workspace = true }
 tokio = { workspace = true }

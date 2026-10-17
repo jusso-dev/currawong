@@ -78,7 +78,11 @@ async fn a_pipeline_verdict_reaches_the_syslog_sink() {
     let mut cfg = Config::default();
     cfg.spool.dir = dir.path().join("spool");
     cfg.scanner.clamd.address.clear();
-    cfg.scanner.worker_binary = None;
+    cfg.scanner.clamd.required = false;
+    // `cargo test --workspace` builds the parser worker next to the tests.
+    cfg.scanner.worker_binary = std::env::current_exe()
+        .ok()
+        .and_then(|exe| Some(exe.parent()?.parent()?.join("currawong-parser-worker")));
     cfg.events.syslog = Some(SyslogSinkConfig {
         address,
         tls: false,
@@ -126,6 +130,8 @@ fn check_config_refuses_a_foreign_event_sink() {
     let base = r#"
 [spool]
 dir = "/var/spool/currawong"
+[scanner.clamd]
+required = false
 [[listeners]]
 name = "in"
 bind = "127.0.0.1:2525"

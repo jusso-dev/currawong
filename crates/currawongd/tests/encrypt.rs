@@ -57,6 +57,18 @@ fn pack(actions: Vec<Action>) -> PolicySet {
     set
 }
 
+/// The parser worker built beside this test binary.
+fn worker_bin() -> std::path::PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let worker = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .map(|dir| dir.join("currawong-parser-worker"))
+        .unwrap();
+    assert!(worker.is_file(), "build the parser worker first");
+    worker
+}
+
 struct Harness {
     _dir: tempfile::TempDir,
     cfg: Config,
@@ -71,7 +83,8 @@ impl Harness {
         let mut cfg = Config::default();
         cfg.spool.dir = dir.path().join("spool");
         cfg.scanner.clamd.address.clear();
-        cfg.scanner.worker_binary = None;
+        cfg.scanner.clamd.required = false;
+        cfg.scanner.worker_binary = Some(worker_bin());
         cfg.gateway.hostname = "gw.example.test".into();
         cfg.relay.tenants = vec![TenantConfig {
             id: "t1".into(),

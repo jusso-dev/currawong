@@ -345,8 +345,10 @@ fn encode_hashes(hashes: &[i64]) -> Vec<u8> {
 
 fn decode_hashes(bytes: &[u8]) -> impl Iterator<Item = i64> + '_ {
     bytes
-        .chunks_exact(8)
-        .map(|chunk| i64::from_be_bytes(chunk.try_into().expect("eight bytes")))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| i64::from_be_bytes(*chunk))
 }
 
 /// Robinson's f(w): the token's spam ratio pulled towards 0.5 when it is rare.

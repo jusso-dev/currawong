@@ -65,11 +65,27 @@ fn with(extra: Vec<Policy>) -> PolicySet {
     set
 }
 
+/// `cargo test --workspace` builds the parser worker next to the tests.
+fn worker_bin() -> PathBuf {
+    let exe = std::env::current_exe().unwrap();
+    let candidate = exe
+        .parent()
+        .and_then(|deps| deps.parent())
+        .map(|dir| dir.join("currawong-parser-worker"))
+        .unwrap();
+    assert!(
+        candidate.is_file(),
+        "parser worker binary: run cargo build -p currawong-parser-worker"
+    );
+    candidate
+}
+
 fn config(dir: &std::path::Path) -> Config {
     let mut cfg = Config::default();
     cfg.spool.dir = dir.join("spool");
     cfg.scanner.clamd.address.clear();
-    cfg.scanner.worker_binary = None;
+    cfg.scanner.clamd.required = false;
+    cfg.scanner.worker_binary = Some(worker_bin());
     cfg.relay.tenants = vec![
         TenantConfig {
             id: "t1".into(),
@@ -154,8 +170,10 @@ async fn default_pack_matches_the_corpus_expectations() {
     let corpus = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../testdata/corpus");
     let expected: toml::Table =
         toml::from_str(&std::fs::read_to_string(corpus.join("expected.toml")).unwrap()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let mut cfg = Config::default();
-    cfg.scanner.worker_binary = None;
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.worker_binary = Some(worker_bin());
     cfg.scanner.clamd.address = fake_clamd(false).await;
     let mut pipeline = pipeline(cfg, default_pack().clone());
     assert!(expected.len() >= 6);
@@ -211,7 +229,7 @@ async fn inbound_tenant_comes_from_each_recipient_domain() {
         Scope::Tenant,
         vec![Action::Quarantine("t1".into())],
     );
-    let mut pipeline = pipeline(config(dir.path()), with(vec![hold]));
+    let pipeline = pipeline(config(dir.path()), with(vec![hold]));
     // MX mail: no tenant on the envelope.
     let env = envelope(ID, &["a@example.test", "b@other.test", "c@nobody.test"]);
     let (_, decision) = pipeline.assess(&env, RAW, None).await;
@@ -243,7 +261,7 @@ async fn submitted_mail_to_a_local_mailbox_is_scoped_by_that_mailbox() {
         Scope::User("colleague@example.test".into()),
         vec![Action::Quarantine("review".into())],
     );
-    let mut pipeline = pipeline(config(dir.path()), with(vec![hold]));
+    let pipeline = pipeline(config(dir.path()), with(vec![hold]));
     let mut env = envelope(ID, &["colleague@example.test", "partner@elsewhere.test"]);
     env.direction = Direction::Outbound;
     env.tenant_id = Some("t1".into());
