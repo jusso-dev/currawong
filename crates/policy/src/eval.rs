@@ -1,17 +1,30 @@
-//! Deterministic evaluation. Policies run most specific scope first, then by
-//! priority (lower first), then by id. The first matching policy with a
-//! terminal action sets the verdict; non-terminal actions from every matching
-//! policy up to that point are kept. Dry-run policies are explained only.
-use crate::model::{Action, Condition, Flow, Policy, PolicySet, Scope};
+//! Deterministic evaluation.
+//!
+//! 1. The built-in floor runs first and is not part of any pack: malware is
+//!    quarantined, a deferred scan is deferred, a failed scan is quarantined.
+//!    Only a matching platform global policy with `override_floor` lifts it.
+//! 2. Policies run most specific scope first, then by priority (lower first),
+//!    then by tenant and id. The first matching policy with a terminal action
+//!    sets the verdict; non-terminal actions from matching policies up to then
+//!    are kept, and mandatory policies add theirs afterwards too.
+//! 3. Dry-run policies are explained only.
+use crate::model::{
+    canonical_address, canonical_domain, Action, Condition, Flow, Policy, PolicySet, Scope,
+};
 use crate::signals::Signals;
 use currawong_core::{Direction, ScanReport, Verdict};
 
-/// The recipient being decided, and the message facts scopes need.
+/// One recipient being decided. A message can span tenants and directions,
+/// so both are resolved per recipient.
 #[derive(Debug, Clone, Copy)]
 pub struct Context<'a> {
     pub tenant_id: Option<&'a str>,
+    /// Inbound: scope by recipient. Outbound: scope by sender.
     pub direction: Direction,
     pub sender: &'a str,
+    /// Authenticated submission identity. Outbound user and group scopes match
+    /// only this, never the unauthenticated MAIL FROM.
+    pub sender_identity: Option<&'a str>,
     pub recipient: &'a str,
 }
 
@@ -25,6 +38,7 @@ pub struct Matched {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Decision {
     pub recipient: String,
+    pub tenant_id: Option<String>,
     pub verdict: Verdict,
     /// Every action that took effect, terminal one included, in order.
     pub actions: Vec<Action>,
@@ -32,30 +46,94 @@ pub struct Decision {
     pub explanation: Vec<String>,
 }
 
+impl Decision {
+    /// Quarantine queue named by the terminal action, if any.
+    pub fn queue(&self) -> Option<&str> {
+        self.actions.iter().find_map(|action| match action {
+            Action::Quarantine(queue) => Some(queue.as_str()),
+            _ => None,
+        })
+    }
+}
+
+/// Flag, rule id and queue. Order matters: malware wins over a deferred scan.
+const FLOOR: [(&str, &str, Option<&str>); 3] = [
+    ("malware", "malware", Some("malware")),
+    ("defer", "scan-deferred", None),
+    ("fail_closed", "scan-failed", Some("scan-failed")),
+];
+
 pub fn evaluate(signals: &Signals, ctx: &Context, set: &PolicySet) -> Decision {
+    evaluate_ordered(signals, ctx, set, &ordered(set))
+}
+
+fn ordered(set: &PolicySet) -> Vec<&Policy> {
     let mut order: Vec<&Policy> = set.policies.iter().filter(|p| p.enabled).collect();
     order.sort_by(|a, b| {
         b.scope
             .specificity()
             .cmp(&a.scope.specificity())
             .then(a.priority.cmp(&b.priority))
+            .then(a.tenant_id.cmp(&b.tenant_id))
             .then(a.id.cmp(&b.id))
     });
+    order
+}
+
+fn evaluate_ordered(
+    signals: &Signals,
+    ctx: &Context,
+    set: &PolicySet,
+    order: &[&Policy],
+) -> Decision {
     let mut verdict = None;
     let mut actions = Vec::new();
     let mut matched = Vec::new();
     let mut explanation = Vec::new();
-    for policy in order {
-        // Once decided, keep looking only so dry-run matches are still reported.
-        if verdict.is_some() && !policy.dry_run {
-            continue;
-        }
-        if !applies(policy, ctx, set)
-            || !policy
+    let matches = |policy: &Policy| {
+        applies(policy, ctx, set)
+            && policy
                 .conditions
                 .iter()
-                .all(|c| holds(c, signals, ctx, set))
-        {
+                .all(|c| holds(c, policy, signals, ctx, set))
+    };
+
+    if let Some((_, rule, queue)) = FLOOR
+        .iter()
+        .find(|(flag, ..)| signals.flags.contains(*flag))
+    {
+        let lifted = order.iter().find(|p| {
+            p.override_floor
+                && !p.dry_run
+                && p.tenant_id.is_none()
+                && p.scope == Scope::Global
+                && matches(p)
+        });
+        match lifted {
+            Some(policy) => explanation.push(format!("floor {rule} lifted by {}", policy.id)),
+            None => {
+                let action = match queue {
+                    Some(queue) => Action::Quarantine(queue.to_string()),
+                    None => Action::Defer,
+                };
+                explanation.push(format!("floor {rule} matched: {}", describe(&action)));
+                matched.push(Matched {
+                    id: format!("floor:{rule}"),
+                    dry_run: false,
+                });
+                verdict = Some(to_verdict(&action, rule));
+                actions.push(action);
+            }
+        }
+    }
+
+    for policy in order {
+        // Once decided, only dry-run (to report) and mandatory (for their
+        // non-terminal actions) policies are still looked at.
+        if verdict.is_some() && !policy.dry_run && !policy.mandatory {
+            continue;
+        }
+        if !matches(policy) {
             continue;
         }
         matched.push(Matched {
@@ -64,8 +142,13 @@ pub fn evaluate(signals: &Signals, ctx: &Context, set: &PolicySet) -> Decision {
         });
         let summary: Vec<String> = policy.actions.iter().map(describe).collect();
         let label = format!(
-            "{} [{}{}, priority {}]",
+            "{} [{}{}{}, priority {}]",
             policy.id,
+            policy
+                .tenant_id
+                .as_deref()
+                .map(|t| format!("tenant {t}, "))
+                .unwrap_or_default(),
             policy.scope.kind(),
             policy
                 .scope
@@ -83,29 +166,21 @@ pub fn evaluate(signals: &Signals, ctx: &Context, set: &PolicySet) -> Decision {
         }
         explanation.push(format!("{label} matched: {}", summary.join(", ")));
         for action in &policy.actions {
-            if action.is_terminal() {
-                if verdict.is_none() {
-                    verdict = Some(to_verdict(action, &policy.id));
-                    actions.push(action.clone());
-                }
-            } else {
+            if !action.is_terminal() {
+                actions.push(action.clone());
+            } else if verdict.is_none() {
+                verdict = Some(to_verdict(action, &policy.id));
                 actions.push(action.clone());
             }
         }
     }
-    let mut verdict = verdict.unwrap_or_else(|| {
+    let verdict = verdict.unwrap_or_else(|| {
         explanation.push("no policy set a verdict: deliver".into());
         Verdict::Deliver
     });
-    // Never deliver mail a required scanner did not see, whatever the policy says.
-    if verdict == Verdict::Deliver && signals.flags.contains("defer") {
-        explanation.push("required scanner unreachable: defer instead of deliver".into());
-        verdict = Verdict::Defer {
-            reason: "required scanner unreachable".into(),
-        };
-    }
     Decision {
         recipient: ctx.recipient.to_string(),
+        tenant_id: ctx.tenant_id.map(str::to_string),
         verdict,
         actions,
         matched,
@@ -113,46 +188,32 @@ pub fn evaluate(signals: &Signals, ctx: &Context, set: &PolicySet) -> Decision {
     }
 }
 
-/// Envelope facts for a whole message.
-#[derive(Debug, Clone, Copy)]
-pub struct Message<'a> {
-    pub tenant_id: Option<&'a str>,
-    pub direction: Direction,
-    pub sender: &'a str,
-    pub recipients: &'a [String],
-}
-
-/// One decision per recipient. A message without recipients still gets one
-/// decision, for an empty recipient, so it is never left undecided.
+/// One decision per context, in order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MessageDecision {
     pub decisions: Vec<Decision>,
 }
 
-pub fn evaluate_message(report: &ScanReport, msg: &Message, set: &PolicySet) -> MessageDecision {
-    evaluate_signals(&Signals::from_report(report), msg, set)
+pub fn evaluate_message(
+    report: &ScanReport,
+    recipients: &[Context],
+    set: &PolicySet,
+) -> MessageDecision {
+    evaluate_signals(&Signals::from_report(report), recipients, set)
 }
 
-pub fn evaluate_signals(signals: &Signals, msg: &Message, set: &PolicySet) -> MessageDecision {
-    let empty = [String::new()];
-    let recipients = if msg.recipients.is_empty() {
-        &empty[..]
-    } else {
-        msg.recipients
-    };
-    let decisions = recipients
-        .iter()
-        .map(|recipient| {
-            let ctx = Context {
-                tenant_id: msg.tenant_id,
-                direction: msg.direction,
-                sender: msg.sender,
-                recipient,
-            };
-            evaluate(signals, &ctx, set)
-        })
-        .collect();
-    MessageDecision { decisions }
+pub fn evaluate_signals(
+    signals: &Signals,
+    recipients: &[Context],
+    set: &PolicySet,
+) -> MessageDecision {
+    let order = ordered(set);
+    MessageDecision {
+        decisions: recipients
+            .iter()
+            .map(|ctx| evaluate_ordered(signals, ctx, set, &order))
+            .collect(),
+    }
 }
 
 impl MessageDecision {
@@ -171,15 +232,15 @@ impl MessageDecision {
         groups
     }
 
-    /// One verdict for callers that do not split: the shared verdict, or the
-    /// one that holds the message rather than losing or releasing it.
+    /// One verdict for callers that do not split: hold rather than release,
+    /// and never let one recipient's discard drop everyone's mail.
     pub fn verdict(&self) -> Verdict {
         let rank = |v: &Verdict| match v {
             Verdict::Quarantine { .. } => 4,
             Verdict::Reject { .. } => 3,
             Verdict::Defer { .. } => 2,
-            Verdict::Discard => 1,
-            Verdict::Deliver => 0,
+            Verdict::Deliver => 1,
+            Verdict::Discard => 0,
         };
         self.decisions
             .iter()
@@ -196,25 +257,42 @@ fn applies(policy: &Policy, ctx: &Context, set: &PolicySet) -> bool {
             return false;
         }
     }
-    // Scope means our side of the conversation.
-    let party = match ctx.direction {
-        Direction::Inbound => ctx.recipient,
-        Direction::Outbound => ctx.sender,
-    };
-    match &policy.scope {
-        Scope::Global | Scope::Tenant => true,
-        Scope::Domain(domain) => domain_of(party).eq_ignore_ascii_case(domain),
-        Scope::Group(group) => set.in_group(group, party),
-        Scope::User(user) => party.eq_ignore_ascii_case(user),
+    let owner = policy.tenant_id.as_deref();
+    match (&policy.scope, ctx.direction) {
+        (Scope::Global | Scope::Tenant, _) => true,
+        (Scope::Domain(domain), Direction::Inbound) => {
+            domain_of(ctx.recipient) == canonical_domain(domain)
+        }
+        (Scope::Group(group), Direction::Inbound) => set.in_group(owner, group, ctx.recipient),
+        (Scope::User(user), Direction::Inbound) => {
+            canonical_address(ctx.recipient) == canonical_address(user)
+        }
+        // Outbound: the submission service checks the sender domain belongs to
+        // the tenant, but not the mailbox, so user and group need the login.
+        (Scope::Domain(domain), Direction::Outbound) => {
+            domain_of(ctx.sender_identity.unwrap_or(ctx.sender)) == canonical_domain(domain)
+        }
+        (Scope::Group(group), Direction::Outbound) => ctx
+            .sender_identity
+            .is_some_and(|id| set.in_group(owner, group, id)),
+        (Scope::User(user), Direction::Outbound) => ctx
+            .sender_identity
+            .is_some_and(|id| canonical_address(id) == canonical_address(user)),
     }
 }
 
-fn holds(condition: &Condition, signals: &Signals, ctx: &Context, set: &PolicySet) -> bool {
+fn holds(
+    condition: &Condition,
+    policy: &Policy,
+    signals: &Signals,
+    ctx: &Context,
+    set: &PolicySet,
+) -> bool {
     match condition {
         Condition::Direction(flow) => Flow::from(ctx.direction) == *flow,
         Condition::Sender(pattern) => address_matches(pattern, ctx.sender),
         Condition::Recipient(pattern) => address_matches(pattern, ctx.recipient),
-        Condition::Group(group) => set.in_group(group, ctx.recipient),
+        Condition::Group(group) => set.in_group(policy.tenant_id.as_deref(), group, ctx.recipient),
         Condition::Flag(name) => signals.flags.contains(name),
         Condition::Score {
             name,
@@ -246,13 +324,16 @@ fn address_matches(pattern: &str, address: &str) -> bool {
         .strip_prefix("*@")
         .or_else(|| pattern.strip_prefix('@'))
     {
-        Some(domain) => domain_of(address).eq_ignore_ascii_case(domain),
-        None => pattern.eq_ignore_ascii_case(address),
+        Some(domain) => domain_of(address) == canonical_domain(domain),
+        None => canonical_address(pattern) == canonical_address(address),
     }
 }
 
-fn domain_of(address: &str) -> &str {
-    address.rsplit_once('@').map(|(_, d)| d).unwrap_or("")
+fn domain_of(address: &str) -> String {
+    address
+        .rsplit_once('@')
+        .map(|(_, d)| canonical_domain(d))
+        .unwrap_or_default()
 }
 
 fn to_verdict(action: &Action, id: &str) -> Verdict {

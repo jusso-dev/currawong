@@ -1,6 +1,6 @@
 use currawong_core::{AuthMethodResult, AuthResults, Direction, MessageId, ScanReport, Verdict};
 use currawong_policy::{
-    decide, default_pack, evaluate, evaluate_signals, Action, Condition, Context, Message, Policy,
+    decide, default_pack, evaluate, evaluate_signals, Action, Condition, Context, Policy,
     PolicySet, PolicyStore, Scope, Signals,
 };
 
@@ -13,6 +13,7 @@ fn ctx(recipient: &str) -> Context<'_> {
         tenant_id: Some("t1"),
         direction: Direction::Inbound,
         sender: "someone@sender.test",
+        sender_identity: None,
         recipient,
     }
 }
@@ -28,9 +29,24 @@ fn policy(id: &str, scope: Scope, priority: i64, actions: Vec<Action>) -> Policy
         priority,
         enabled: true,
         dry_run: false,
+        mandatory: false,
+        override_floor: false,
         conditions: Vec::new(),
         actions,
     }
+}
+
+fn set(policies: Vec<Policy>) -> PolicySet {
+    PolicySet {
+        policies,
+        ..Default::default()
+    }
+}
+
+fn flagged(flag: &str) -> Signals {
+    let mut signals = Signals::default();
+    signals.flag(flag);
+    signals
 }
 
 fn spoofed() -> AuthResults {
@@ -52,29 +68,31 @@ fn default_verdict(signals: &Signals) -> Verdict {
     evaluate(signals, &ctx("user@example.com.au"), default_pack()).verdict
 }
 
+fn quarantine(reason: &str) -> Verdict {
+    Verdict::Quarantine {
+        reason: reason.into(),
+    }
+}
+
 #[test]
-fn default_pack_covers_each_signal() {
-    let quarantined = |reason: &str, signals: &Signals| {
-        assert_eq!(
-            default_verdict(signals),
-            Verdict::Quarantine {
-                reason: reason.into()
-            },
-            "{signals:?}"
-        );
-    };
+fn default_pack_and_floor_cover_each_signal() {
     for (flag, id) in [
         ("malware", "malware"),
         ("active_content", "active-content"),
         ("fail_closed", "scan-failed"),
     ] {
-        let mut signals = Signals::default();
-        signals.flag(flag);
-        quarantined(id, &signals);
+        assert_eq!(default_verdict(&flagged(flag)), quarantine(id), "{flag}");
     }
+    assert!(matches!(
+        default_verdict(&flagged("defer")),
+        Verdict::Defer { .. }
+    ));
     let mut spoof = report();
     spoof.auth = Some(spoofed());
-    quarantined("dmarc-reject", &Signals::from_report(&spoof));
+    assert_eq!(
+        default_verdict(&Signals::from_report(&spoof)),
+        quarantine("dmarc-reject")
+    );
     // DMARC fail under p=none is delivered.
     spoof.auth.as_mut().unwrap().dmarc_policy = "none".into();
     assert_eq!(
@@ -84,9 +102,9 @@ fn default_pack_covers_each_signal() {
 
     let mut spam = Signals::default();
     spam.score("spam", 9.5);
-    quarantined("spam-quarantine", &spam);
+    assert_eq!(default_verdict(&spam), quarantine("spam-quarantine"));
     spam.score("spam", 8.0);
-    quarantined("spam-quarantine", &spam);
+    assert_eq!(default_verdict(&spam), quarantine("spam-quarantine"));
     spam.score("spam", 6.0);
     let tagged = evaluate(&spam, &ctx("user@example.com.au"), default_pack());
     assert_eq!(tagged.verdict, Verdict::Deliver);
@@ -108,17 +126,73 @@ fn old_m1_priorities_hold() {
     let mut infected = report();
     infected.malware = true;
     infected.defer = true;
-    assert_eq!(
-        decide(&infected),
-        Verdict::Quarantine {
-            reason: "malware".into()
-        }
-    );
+    assert_eq!(decide(&infected), quarantine("malware"));
     let mut deferred = report();
     deferred.defer = true;
     deferred.active_content = true;
     assert!(matches!(decide(&deferred), Verdict::Defer { .. }));
     assert_eq!(decide(&report()), Verdict::Deliver);
+}
+
+#[test]
+fn floor_cannot_be_overridden_by_tenant_policies_or_an_operator_pack() {
+    let user_deliver = policy(
+        "vip",
+        Scope::User("ceo@example.com.au".into()),
+        1,
+        vec![Action::Deliver],
+    );
+    let tenant_deliver = policy("all", Scope::Tenant, 1, vec![Action::Deliver]);
+    // An operator pack with no malware policy at all.
+    let pack = set(vec![user_deliver, tenant_deliver]);
+    for flag in ["malware", "fail_closed"] {
+        let decision = evaluate(&flagged(flag), &ctx("ceo@example.com.au"), &pack);
+        assert!(
+            matches!(decision.verdict, Verdict::Quarantine { .. }),
+            "{flag}: {decision:?}"
+        );
+        assert!(decision.matched[0].id.starts_with("floor:"));
+    }
+    assert!(matches!(
+        evaluate(&flagged("defer"), &ctx("ceo@example.com.au"), &pack).verdict,
+        Verdict::Defer { .. }
+    ));
+    // Active content is pack policy, so a tenant may allow it.
+    assert_eq!(
+        evaluate(
+            &flagged("active_content"),
+            &ctx("ceo@example.com.au"),
+            &pack
+        )
+        .verdict,
+        Verdict::Deliver
+    );
+
+    let mut tenant_override = policy("t-override", Scope::Tenant, 1, vec![Action::Deliver]);
+    tenant_override.override_floor = true;
+    assert!(tenant_override.validate().is_err());
+    let mut user_override = policy("u", Scope::User("a@x.test".into()), 1, vec![]);
+    user_override.tenant_id = None;
+    user_override.override_floor = true;
+    assert!(user_override.validate().is_err());
+
+    let mut platform = policy("lab", Scope::Global, 1, vec![Action::Deliver]);
+    platform.override_floor = true;
+    platform.conditions = vec![Condition::Recipient("malware-lab@example.com.au".into())];
+    let pack = set(vec![platform]);
+    assert_eq!(
+        evaluate(
+            &flagged("malware"),
+            &ctx("malware-lab@example.com.au"),
+            &pack
+        )
+        .verdict,
+        Verdict::Deliver
+    );
+    assert!(matches!(
+        evaluate(&flagged("malware"), &ctx("someone@example.com.au"), &pack).verdict,
+        Verdict::Quarantine { .. }
+    ));
 }
 
 #[test]
@@ -132,24 +206,25 @@ fn explanation_lists_every_matched_policy() {
             value: "yes".into(),
         }],
     );
-    header.conditions.push(Condition::Flag("malware".into()));
-    let quarantine = policy(
-        "infected",
+    header
+        .conditions
+        .push(Condition::Flag("active_content".into()));
+    let hold = policy(
+        "active",
         Scope::Global,
         10,
-        vec![Action::Quarantine("malware".into())],
+        vec![Action::Quarantine("active".into())],
     );
     let mut trial = policy("trial-reject", Scope::Global, 5, vec![Action::Discard]);
     trial.dry_run = true;
-    let set = PolicySet {
-        policies: vec![quarantine, trial, header],
-        ..Default::default()
-    };
-    let mut signals = Signals::default();
-    signals.flag("malware");
-    let decision = evaluate(&signals, &ctx("ceo@example.com.au"), &set);
+    let pack = set(vec![hold, trial, header]);
+    let decision = evaluate(
+        &flagged("active_content"),
+        &ctx("ceo@example.com.au"),
+        &pack,
+    );
     let ids: Vec<&str> = decision.matched.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["vip-header", "trial-reject", "infected"]);
+    assert_eq!(ids, ["vip-header", "trial-reject", "active"]);
     for id in ids {
         assert!(
             decision.explanation.iter().any(|line| line.starts_with(id)),
@@ -158,20 +233,15 @@ fn explanation_lists_every_matched_policy() {
         );
     }
     assert!(decision.explanation[1].contains("dry run"));
-    assert_eq!(
-        decision.verdict,
-        Verdict::Quarantine {
-            reason: "infected".into()
-        }
-    );
+    assert_eq!(decision.verdict, quarantine("active"));
+    assert_eq!(decision.queue(), Some("active"));
 }
 
 #[test]
 fn dry_run_policy_does_not_change_the_verdict() {
-    let mut signals = Signals::default();
-    signals.flag("malware");
-    let mut set = default_pack().clone();
-    let before = evaluate(&signals, &ctx("a@example.com.au"), &set);
+    let signals = flagged("active_content");
+    let mut pack = default_pack().clone();
+    let before = evaluate(&signals, &ctx("a@example.com.au"), &pack);
     let mut trial = policy(
         "trial-deliver",
         Scope::User("a@example.com.au".into()),
@@ -179,8 +249,8 @@ fn dry_run_policy_does_not_change_the_verdict() {
         vec![Action::Bcc("audit@example.com.au".into()), Action::Deliver],
     );
     trial.dry_run = true;
-    set.policies.push(trial);
-    let after = evaluate(&signals, &ctx("a@example.com.au"), &set);
+    pack.policies.push(trial);
+    let after = evaluate(&signals, &ctx("a@example.com.au"), &pack);
     assert_eq!(before.verdict, after.verdict);
     assert_eq!(before.actions, after.actions);
     assert!(after
@@ -190,10 +260,43 @@ fn dry_run_policy_does_not_change_the_verdict() {
 }
 
 #[test]
+fn mandatory_policies_add_actions_after_a_more_specific_verdict() {
+    let deliver = policy(
+        "vip",
+        Scope::User("ceo@example.com.au".into()),
+        1,
+        vec![Action::Deliver],
+    );
+    let journal = Action::AddHeader {
+        name: "X-Journal".into(),
+        value: "yes".into(),
+    };
+    let mut compliance = policy("compliance", Scope::Global, 1, vec![journal.clone()]);
+    let optional = evaluate(
+        &Signals::default(),
+        &ctx("ceo@example.com.au"),
+        &set(vec![deliver.clone(), compliance.clone()]),
+    );
+    assert!(!optional.actions.contains(&journal));
+    compliance.mandatory = true;
+    let decision = evaluate(
+        &Signals::default(),
+        &ctx("ceo@example.com.au"),
+        &set(vec![deliver, compliance]),
+    );
+    assert_eq!(decision.verdict, Verdict::Deliver);
+    assert!(decision.actions.contains(&journal), "{decision:?}");
+}
+
+#[test]
 fn specificity_beats_priority_and_priority_orders_within_a_scope() {
-    let set = PolicySet {
-        groups: [("finance".into(), vec!["pay@example.com.au".into()])].into(),
-        policies: vec![
+    let pack = PolicySet {
+        tenant_groups: [(
+            "t1".into(),
+            [("finance".into(), vec!["pay@example.com.au".into()])].into(),
+        )]
+        .into(),
+        ..set(vec![
             policy(
                 "global",
                 Scope::Global,
@@ -225,17 +328,19 @@ fn specificity_beats_priority_and_priority_orders_within_a_scope() {
                 99,
                 vec![Action::Deliver],
             ),
-        ],
+        ])
     };
     let signals = Signals::default();
-    let verdict = |rcpt: &str| evaluate(&signals, &ctx(rcpt), &set).verdict;
+    let verdict = |rcpt: &str| evaluate(&signals, &ctx(rcpt), &pack).verdict;
     assert_eq!(verdict("boss@example.com.au"), Verdict::Deliver);
+    // Sub-addressing and a trailing dot do not dodge user and domain scope.
+    assert_eq!(verdict("Boss+news@Example.com.au."), Verdict::Deliver);
     assert!(matches!(
         verdict("pay@example.com.au"),
         Verdict::Defer { .. }
     ));
     assert!(matches!(
-        verdict("other@example.com.au"),
+        verdict("other@example.com.au."),
         Verdict::Reject { code: 554, .. }
     ));
     assert_eq!(verdict("other@elsewhere.test"), Verdict::Discard);
@@ -244,31 +349,79 @@ fn specificity_beats_priority_and_priority_orders_within_a_scope() {
         ..ctx("boss@example.com.au")
     };
     assert!(matches!(
-        evaluate(&signals, &other_tenant, &set).verdict,
+        evaluate(&signals, &other_tenant, &pack).verdict,
         Verdict::Quarantine { .. }
     ));
 }
 
 #[test]
-fn outbound_scope_follows_the_sender() {
-    let set = PolicySet {
-        policies: vec![policy(
-            "outbound-tls",
-            Scope::Domain("example.com.au".into()),
-            10,
-            vec![Action::RequireTls],
-        )],
-        ..Default::default()
+fn groups_belong_to_their_tenant() {
+    let mut finance = policy(
+        "finance",
+        Scope::Group("finance".into()),
+        1,
+        vec![Action::Discard],
+    );
+    finance.tenant_id = Some("t2".into());
+    let pack = PolicySet {
+        groups: [("finance".into(), vec!["pay@example.com.au".into()])].into(),
+        tenant_groups: [(
+            "t1".into(),
+            [("finance".into(), vec!["pay@example.com.au".into()])].into(),
+        )]
+        .into(),
+        ..set(vec![finance])
     };
-    let out = Context {
+    // pay@ is in t1's and the platform's "finance", not t2's.
+    let t2 = Context {
+        tenant_id: Some("t2"),
+        ..ctx("pay@example.com.au")
+    };
+    assert_eq!(
+        evaluate(&Signals::default(), &t2, &pack).verdict,
+        Verdict::Deliver
+    );
+}
+
+#[test]
+fn outbound_user_scope_needs_the_authenticated_identity() {
+    let mut exempt = policy(
+        "ceo-exempt",
+        Scope::User("ceo@example.com.au".into()),
+        1,
+        vec![Action::Discard],
+    );
+    exempt
+        .conditions
+        .push(Condition::Direction(currawong_policy::Flow::Outbound));
+    let domain = policy(
+        "domain-header",
+        Scope::Domain("example.com.au".into()),
+        1,
+        vec![Action::AddHeader {
+            name: "X-Out".into(),
+            value: "1".into(),
+        }],
+    );
+    let pack = set(vec![exempt, domain]);
+    let forged = Context {
         tenant_id: Some("t1"),
         direction: Direction::Outbound,
-        sender: "staff@example.com.au",
+        sender: "ceo@example.com.au",
+        sender_identity: None,
         recipient: "partner@elsewhere.test",
     };
-    let decision = evaluate(&Signals::default(), &out, &set);
-    assert_eq!(decision.actions, vec![Action::RequireTls]);
+    let decision = evaluate(&Signals::default(), &forged, &pack);
     assert_eq!(decision.verdict, Verdict::Deliver);
+    assert_eq!(decision.matched.len(), 1, "{decision:?}");
+    let logged_in = Context {
+        sender_identity: Some("ceo@example.com.au"),
+        ..forged
+    };
+    assert_eq!(
+        evaluate(&Signals::default(), &logged_in, &pack).verdict,
+        Verdict::Discard
+    );
 }
 
 #[test]
@@ -289,9 +442,9 @@ fn conditions_on_direction_sender_recipient_group_counts_marking_and_auth() {
             result: "FAIL".into(),
         },
     ];
-    let set = PolicySet {
+    let pack = PolicySet {
         groups: [("finance".into(), vec!["PAY@example.com.au".into()])].into(),
-        policies: vec![p],
+        ..set(vec![p])
     };
     let mut signals = Signals::from_report(&{
         let mut r = report();
@@ -300,36 +453,27 @@ fn conditions_on_direction_sender_recipient_group_counts_marking_and_auth() {
     });
     signals.count("dlp.tfn", 5);
     signals.marking = Some("official:sensitive".into());
-    let hit = evaluate(&signals, &ctx("pay@example.com.au"), &set);
+    let hit = evaluate(&signals, &ctx("pay+x@example.com.au"), &pack);
     assert_eq!(hit.verdict, Verdict::Discard);
     signals.count("dlp.tfn", 4);
-    let miss = evaluate(&signals, &ctx("pay@example.com.au"), &set);
+    let miss = evaluate(&signals, &ctx("pay@example.com.au"), &pack);
     assert_eq!(miss.verdict, Verdict::Deliver);
 }
 
 #[test]
-fn recipients_that_differ_split_the_message() {
-    let set = PolicySet {
-        policies: vec![policy(
-            "boss-bcc",
-            Scope::User("boss@example.com.au".into()),
-            1,
-            vec![Action::Bcc("audit@example.com.au".into())],
-        )],
-        ..Default::default()
-    };
-    let recipients = vec![
-        "a@example.com.au".to_string(),
-        "boss@example.com.au".to_string(),
-        "b@example.com.au".to_string(),
+fn recipients_that_differ_split_and_the_combined_verdict_never_discards_everyone() {
+    let pack = set(vec![policy(
+        "boss-drop",
+        Scope::User("boss@example.com.au".into()),
+        1,
+        vec![Action::Discard],
+    )]);
+    let contexts = [
+        ctx("a@example.com.au"),
+        ctx("boss@example.com.au"),
+        ctx("b@example.com.au"),
     ];
-    let msg = Message {
-        tenant_id: Some("t1"),
-        direction: Direction::Inbound,
-        sender: "x@sender.test",
-        recipients: &recipients,
-    };
-    let decision = evaluate_signals(&Signals::default(), &msg, &set);
+    let decision = evaluate_signals(&Signals::default(), &contexts, &pack);
     let groups: Vec<Vec<&str>> = decision
         .split()
         .iter()
@@ -342,30 +486,32 @@ fn recipients_that_differ_split_the_message() {
             vec!["boss@example.com.au"]
         ]
     );
-}
-
-#[test]
-fn defer_signal_is_never_delivered() {
-    let set = PolicySet {
-        policies: vec![policy("allow", Scope::Global, 1, vec![Action::Deliver])],
-        ..Default::default()
-    };
-    let mut signals = Signals::default();
-    signals.flag("defer");
-    assert!(matches!(
-        evaluate(&signals, &ctx("a@example.com.au"), &set).verdict,
-        Verdict::Defer { .. }
-    ));
+    assert_eq!(decision.verdict(), Verdict::Deliver);
 }
 
 #[test]
 fn invalid_policies_are_refused() {
     let base = || policy("p", Scope::Global, 1, vec![]);
-    let mut header = base();
-    header.actions.push(Action::AddHeader {
-        name: "X-A".into(),
-        value: "x\r\nBcc: evil@attacker.test".into(),
-    });
+    let with = |action: Action| {
+        let mut p = base();
+        p.actions.push(action);
+        p
+    };
+    let header = |name: &str, value: &str| {
+        with(Action::AddHeader {
+            name: name.into(),
+            value: value.into(),
+        })
+    };
+    let score = |at_least: Option<f64>, below: Option<f64>| {
+        let mut p = base();
+        p.conditions.push(Condition::Score {
+            name: "spam".into(),
+            at_least,
+            below,
+        });
+        p
+    };
     let mut tenant = base();
     tenant.tenant_id = Some("t1".into());
     let mut auth = base();
@@ -373,18 +519,29 @@ fn invalid_policies_are_refused() {
         method: "dkmi".into(),
         result: "pass".into(),
     });
-    let mut redirect = base();
-    redirect
-        .actions
-        .push(Action::Redirect("not an address".into()));
-    for bad in [header, tenant, auth, redirect] {
-        assert!(bad.validate().is_err(), "{bad:?}");
+    let bad = [
+        header("X-A", "x\r\nBcc: evil@attacker.test"),
+        header("X-A", "nul\0byte"),
+        header("Authentication-Results", "forged; dmarc=pass"),
+        header("arc-seal", "i=1"),
+        header("Received", "from nowhere"),
+        header("X-Long", &"a".repeat(1000)),
+        tenant,
+        auth,
+        with(Action::Redirect("not an address".into())),
+        with(Action::Banner("External sender".into())),
+        with(Action::Encrypt),
+        with(Action::RequireTls),
+        score(Some(f64::NAN), None),
+        score(None, Some(f64::INFINITY)),
+        score(Some(8.0), Some(5.0)),
+        score(Some(5.0), Some(5.0)),
+    ];
+    for policy in bad {
+        assert!(policy.validate().is_err(), "{policy:?}");
     }
-    let dup = PolicySet {
-        policies: vec![base(), base()],
-        ..Default::default()
-    };
-    assert!(dup.validate().is_err());
+    assert!(header("X-Fine", "ok\tvalue").validate().is_ok());
+    assert!(set(vec![base(), base()]).validate().is_err());
     assert!(PolicySet::from_toml("[[policy]]\nid = \"x\"\nscope = \"galaxy\"\n").is_err());
 }
 
@@ -395,11 +552,13 @@ fn pack_round_trips_through_toml_and_the_store() {
         .insert("finance".into(), vec!["pay@example.com.au".into()]);
     pack.policies.push(Policy {
         dry_run: true,
+        mandatory: true,
+        tenant_id: None,
         ..policy(
-            "finance-banner",
+            "finance-bcc",
             Scope::Group("finance".into()),
             5,
-            vec![Action::Banner("External sender".into()), Action::Encrypt],
+            vec![Action::Bcc("audit@example.com.au".into())],
         )
     });
     let text = pack.to_toml().unwrap();
@@ -408,30 +567,33 @@ fn pack_round_trips_through_toml_and_the_store() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("policy.db");
     let mut store = PolicyStore::open(&path).unwrap();
-    assert!(store.is_empty().unwrap());
-    store.import_toml(&text).unwrap();
+    store.import_toml(None, &text).unwrap();
     let mut loaded = store.load().unwrap();
     loaded.policies.sort_by(|a, b| a.id.cmp(&b.id));
     let mut expected = pack.clone();
     expected.policies.sort_by(|a, b| a.id.cmp(&b.id));
     assert_eq!(loaded, expected);
     assert_eq!(
-        PolicySet::from_toml(&store.export_toml().unwrap()).unwrap(),
+        PolicySet::from_toml(&store.export_toml(None).unwrap()).unwrap(),
         loaded
     );
 
-    let mut edited = store.get("spam-tag").unwrap().unwrap();
+    let mut edited = store.get(None, "spam-tag").unwrap().unwrap();
     edited.enabled = false;
-    store.upsert(&edited).unwrap();
-    assert!(store.delete("malware").unwrap());
-    assert!(!store.delete("malware").unwrap());
-    store.set_group("finance", &[]).unwrap();
+    store.upsert(None, &edited).unwrap();
+    assert!(store.delete(None, "active-content").unwrap());
+    assert!(!store.delete(None, "active-content").unwrap());
+    // Importing a pack without groups keeps the groups set through the API.
+    store
+        .set_group(None, "board", &["chair@example.com.au".into()])
+        .unwrap();
+    store.import(None, &store.load().unwrap()).unwrap();
     drop(store);
 
     // Reopening runs no migration twice and keeps the edits.
     let store = PolicyStore::open(&path).unwrap();
     let set = store.load().unwrap();
-    assert!(set.policies.iter().all(|p| p.id != "malware"));
+    assert!(set.policies.iter().all(|p| p.id != "active-content"));
     assert!(
         !set.policies
             .iter()
@@ -439,21 +601,80 @@ fn pack_round_trips_through_toml_and_the_store() {
             .unwrap()
             .enabled
     );
-    assert!(set.groups.is_empty());
+    assert!(set.groups.contains_key("board"));
     let mut bad = edited;
     bad.actions = vec![Action::Reject { code: 250 }];
-    assert!(store.upsert(&bad).is_err());
+    assert!(store.upsert(None, &bad).is_err());
 }
 
 #[test]
-fn load_seeds_an_empty_database_from_the_pack() {
+fn store_namespaces_keep_tenants_apart() {
+    let mut store = PolicyStore::open_in_memory().unwrap();
+    let platform = policy(
+        "malware-extra",
+        Scope::Global,
+        1,
+        vec![Action::Quarantine("q".into())],
+    );
+    store.upsert(None, &platform).unwrap();
+    // Tenant B reuses the id: it gets its own row, the platform's is untouched.
+    let mut mine = policy("malware-extra", Scope::Tenant, 1, vec![Action::Deliver]);
+    mine.tenant_id = None;
+    store.upsert(Some("b"), &mine).unwrap();
+    assert_eq!(store.get(None, "malware-extra").unwrap().unwrap(), platform);
+    assert_eq!(
+        store
+            .get(Some("b"), "malware-extra")
+            .unwrap()
+            .unwrap()
+            .tenant_id
+            .as_deref(),
+        Some("b")
+    );
+    assert!(!store.delete(Some("a"), "malware-extra").unwrap());
+    // A tenant cannot write global scope, another tenant's policy or a floor override.
+    let global = policy("g", Scope::Global, 1, vec![]);
+    assert!(store.upsert(Some("b"), &global).is_err());
+    let mut foreign = policy("f", Scope::Tenant, 1, vec![]);
+    foreign.tenant_id = Some("a".into());
+    assert!(store.upsert(Some("b"), &foreign).is_err());
+    let mut lift = policy("l", Scope::Tenant, 1, vec![]);
+    lift.tenant_id = None;
+    lift.override_floor = true;
+    assert!(store.upsert(Some("b"), &lift).is_err());
+    // Groups are per namespace.
+    store
+        .set_group(Some("a"), "finance", &["x@a.test".into()])
+        .unwrap();
+    store
+        .set_group(Some("b"), "finance", &["y@b.test".into()])
+        .unwrap();
+    let set = store.load().unwrap();
+    assert!(set.in_group(Some("a"), "finance", "x@a.test"));
+    assert!(!set.in_group(Some("b"), "finance", "x@a.test"));
+    assert!(!set.in_group(None, "finance", "x@a.test"));
+    assert!(store.export_toml(Some("b")).unwrap().contains("y@b.test"));
+    assert!(!store.export_toml(Some("b")).unwrap().contains("x@a.test"));
+}
+
+#[test]
+fn load_seeds_the_database_once() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = currawong_core::config::PolicyConfig {
         pack: None,
         database: Some(dir.path().join("policy.db")),
+        forward_domains: Vec::new(),
     };
     let set = currawong_policy::load(&cfg).unwrap();
     assert_eq!(set.policies.len(), default_pack().policies.len());
+    let store = PolicyStore::open(cfg.database.as_ref().unwrap()).unwrap();
+    for policy in store.list(None).unwrap() {
+        store.delete(None, &policy.id).unwrap();
+    }
+    drop(store);
+    // An admin who removed every policy keeps an empty set.
+    assert!(currawong_policy::load(&cfg).unwrap().policies.is_empty());
+
     let pack_path = dir.path().join("pack.toml");
     std::fs::write(
         &pack_path,
@@ -462,7 +683,7 @@ fn load_seeds_an_empty_database_from_the_pack() {
     .unwrap();
     let file_only = currawong_core::config::PolicyConfig {
         pack: Some(pack_path),
-        database: None,
+        ..Default::default()
     };
     assert_eq!(
         currawong_policy::load(&file_only).unwrap().policies.len(),

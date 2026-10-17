@@ -1,6 +1,6 @@
-use currawong_core::Direction;
+use currawong_core::{Direction, Verdict};
 use currawong_policy::{
-    evaluate_signals, Action, Condition, Message, Policy, PolicySet, Scope, Signals,
+    evaluate, evaluate_signals, Action, Condition, Context, Policy, PolicySet, Scope, Signals,
 };
 use proptest::prelude::*;
 
@@ -10,6 +10,7 @@ const ADDRESSES: [&str; 4] = [
     "c@other.test",
     "ceo@example.com.au",
 ];
+const TENANTS: [&str; 2] = ["t1", "t2"];
 const FLAGS: [&str; 4] = ["malware", "defer", "active_content", "fail_closed"];
 
 fn scope() -> impl Strategy<Value = Scope> {
@@ -47,17 +48,17 @@ fn action() -> impl Strategy<Value = Action> {
             value: "1".into()
         }),
         Just(Action::Bcc("audit@example.com.au".into())),
-        Just(Action::RequireTls),
     ]
 }
 
+/// Tenant-authored and platform policies, never a floor override.
 fn policies() -> impl Strategy<Value = Vec<Policy>> {
     prop::collection::vec(
         (
             scope(),
+            0..TENANTS.len(),
             -5i64..5,
-            any::<bool>(),
-            any::<bool>(),
+            any::<(bool, bool, bool)>(),
             prop::collection::vec(condition(), 0..3),
             prop::collection::vec(action(), 0..3),
         ),
@@ -68,15 +69,22 @@ fn policies() -> impl Strategy<Value = Vec<Policy>> {
             .into_iter()
             .enumerate()
             .map(
-                |(i, (scope, priority, enabled, dry_run, conditions, actions))| Policy {
-                    id: format!("p{i}"),
-                    tenant_id: (scope != Scope::Global).then(|| "t1".to_string()),
-                    scope,
-                    priority,
-                    enabled,
-                    dry_run,
-                    conditions,
-                    actions,
+                |(
+                    i,
+                    (scope, tenant, priority, (enabled, dry_run, mandatory), conditions, actions),
+                )| {
+                    Policy {
+                        id: format!("p{i}"),
+                        tenant_id: (scope != Scope::Global).then(|| TENANTS[tenant].to_string()),
+                        scope,
+                        priority,
+                        enabled,
+                        dry_run,
+                        mandatory,
+                        override_floor: false,
+                        conditions,
+                        actions,
+                    }
                 },
             )
             .collect()
@@ -100,16 +108,36 @@ fn signals() -> impl Strategy<Value = Signals> {
         })
 }
 
-fn recipients() -> impl Strategy<Value = Vec<String>> {
-    prop::collection::vec(
-        (0..ADDRESSES.len()).prop_map(|i| ADDRESSES[i].to_string()),
-        1..5,
-    )
+/// Recipient address, tenant and direction, as the pipeline resolves them.
+fn recipients() -> impl Strategy<Value = Vec<(usize, usize, bool)>> {
+    prop::collection::vec((0..ADDRESSES.len(), 0..TENANTS.len(), any::<bool>()), 1..5)
+}
+
+fn contexts(rcpts: &[(usize, usize, bool)]) -> Vec<Context<'static>> {
+    rcpts
+        .iter()
+        .map(|&(addr, tenant, outbound)| Context {
+            tenant_id: Some(TENANTS[tenant]),
+            direction: if outbound {
+                Direction::Outbound
+            } else {
+                Direction::Inbound
+            },
+            sender: "x@sender.test",
+            sender_identity: Some("ceo@example.com.au"),
+            recipient: ADDRESSES[addr],
+        })
+        .collect()
 }
 
 fn set(policies: Vec<Policy>) -> PolicySet {
     PolicySet {
         groups: [("finance".into(), vec!["b@example.com.au".into()])].into(),
+        tenant_groups: [(
+            "t1".into(),
+            [("finance".into(), vec!["a@example.com.au".into()])].into(),
+        )]
+        .into(),
         policies,
     }
 }
@@ -118,17 +146,42 @@ proptest! {
     #[test]
     fn exactly_one_verdict_per_recipient(policies in policies(), signals in signals(), rcpts in recipients()) {
         let set = set(policies);
-        let msg = Message { tenant_id: Some("t1"), direction: Direction::Inbound, sender: "x@sender.test", recipients: &rcpts };
-        let decision = evaluate_signals(&signals, &msg, &set);
-        prop_assert_eq!(decision.decisions.len(), rcpts.len());
-        for (d, r) in decision.decisions.iter().zip(&rcpts) {
-            prop_assert_eq!(&d.recipient, r);
-            // At most one terminal action took effect.
+        let ctxs = contexts(&rcpts);
+        let decision = evaluate_signals(&signals, &ctxs, &set);
+        prop_assert_eq!(decision.decisions.len(), ctxs.len());
+        // Every recipient lands in exactly one split group.
+        let groups = decision.split();
+        let mut seen = vec![0usize; ctxs.len()];
+        for group in &groups {
+            for d in group {
+                let i = decision.decisions.iter().position(|x| std::ptr::eq(x, *d)).unwrap();
+                seen[i] += 1;
+                prop_assert_eq!(&d.verdict, &group[0].verdict);
+                prop_assert_eq!(&d.actions, &group[0].actions);
+            }
+        }
+        prop_assert!(seen.iter().all(|n| *n == 1), "{:?}", seen);
+        for (d, ctx) in decision.decisions.iter().zip(&ctxs) {
+            // Deciding the recipient alone gives the same answer.
+            prop_assert_eq!(d, &evaluate(&signals, ctx, &set));
+            prop_assert_eq!(&d.recipient, ctx.recipient);
             prop_assert!(d.actions.iter().filter(|a| a.is_terminal()).count() <= 1);
             prop_assert!(!d.explanation.is_empty());
         }
-        let grouped: usize = decision.split().iter().map(Vec::len).sum();
-        prop_assert_eq!(grouped, rcpts.len());
+    }
+
+    #[test]
+    fn no_tenant_or_platform_pack_can_release_malware_or_failed_scans(policies in policies(), signals in signals(), rcpts in recipients()) {
+        let set = set(policies);
+        let decision = evaluate_signals(&signals, &contexts(&rcpts), &set);
+        for d in &decision.decisions {
+            let flag = |name: &str| signals.flags.contains(name);
+            if flag("malware") || (flag("fail_closed") && !flag("defer")) {
+                prop_assert!(matches!(d.verdict, Verdict::Quarantine { .. }), "{:?}", d);
+            } else if flag("defer") {
+                prop_assert!(matches!(d.verdict, Verdict::Defer { .. }), "{:?}", d);
+            }
+        }
     }
 
     #[test]
@@ -137,9 +190,9 @@ proptest! {
         let mut with = policies;
         with.extend(extra.into_iter().map(|mut p| { p.id = format!("dry-{}", p.id); p.dry_run = true; p }));
         let with = set(with);
-        let msg = Message { tenant_id: Some("t1"), direction: Direction::Inbound, sender: "x@sender.test", recipients: &rcpts };
-        let a = evaluate_signals(&signals, &msg, &base);
-        let b = evaluate_signals(&signals, &msg, &with);
+        let ctxs = contexts(&rcpts);
+        let a = evaluate_signals(&signals, &ctxs, &base);
+        let b = evaluate_signals(&signals, &ctxs, &with);
         for (x, y) in a.decisions.iter().zip(&b.decisions) {
             prop_assert_eq!(&x.verdict, &y.verdict);
             prop_assert_eq!(&x.actions, &y.actions);
@@ -152,7 +205,7 @@ proptest! {
         let mut reversed = policies;
         reversed.reverse();
         let reversed = set(reversed);
-        let msg = Message { tenant_id: Some("t1"), direction: Direction::Inbound, sender: "x@sender.test", recipients: &rcpts };
-        prop_assert_eq!(evaluate_signals(&signals, &msg, &forward), evaluate_signals(&signals, &msg, &reversed));
+        let ctxs = contexts(&rcpts);
+        prop_assert_eq!(evaluate_signals(&signals, &ctxs, &forward), evaluate_signals(&signals, &ctxs, &reversed));
     }
 }

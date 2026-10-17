@@ -96,9 +96,9 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let policies = currawong_policy::load(&cfg.policy).map_err(|err| err.to_string())?;
-    tracing::info!(count = policies.policies.len(), "policies loaded");
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth).with_policies(policies);
+    let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    pipeline.reload_policies()?;
+    tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -114,6 +114,13 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         loop {
             if shutdown_loop.is_cancelled() {
                 break;
+            }
+            match pipeline.reload_policies() {
+                Ok(true) => tracing::info!("policies reloaded"),
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(%err, "policy reload failed, keeping the previous policies")
+                }
             }
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");

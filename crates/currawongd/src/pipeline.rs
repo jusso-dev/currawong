@@ -1,8 +1,12 @@
 //! Auth, parse, scan and the policy decision.
 use currawong_auth::AuthChecker;
-use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
+use currawong_core::{
+    config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
-use currawong_policy::{default_pack, evaluate_message, Message, MessageDecision, PolicySet};
+use currawong_policy::{
+    canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
+};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool,
@@ -38,6 +42,16 @@ impl Pipeline {
     pub fn with_policies(mut self, policies: PolicySet) -> Self {
         self.policies = policies;
         self
+    }
+
+    /// Load the configured policies again. Returns whether they changed.
+    pub fn reload_policies(&mut self) -> Result<bool, String> {
+        let set = currawong_policy::load(&self.cfg.policy).map_err(|err| err.to_string())?;
+        if set == self.policies {
+            return Ok(false);
+        }
+        self.policies = set;
+        Ok(true)
     }
 
     /// One verdict for the whole message. See `assess` for per-recipient decisions.
@@ -128,14 +142,70 @@ impl Pipeline {
         (report, decision)
     }
 
+    /// Tenant and direction per recipient: a message can reach several tenants,
+    /// and submitted mail to a local mailbox is decided for that mailbox.
     fn decide(&self, env: &Envelope, report: &ScanReport) -> MessageDecision {
-        let msg = Message {
-            tenant_id: env.tenant_id.as_deref(),
-            direction: env.direction,
-            sender: &env.mail_from,
-            recipients: &env.rcpt_to,
+        let tenants = &self.cfg.relay.tenants;
+        let tenant_of = |domain: &str| {
+            tenants
+                .iter()
+                .find(|t| t.domains.iter().any(|d| canonical_domain(d) == domain))
+                .map(|t| t.id.as_str())
         };
-        evaluate_message(report, &msg, &self.policies)
+        let is_local = |domain: &str| {
+            tenant_of(domain).is_some()
+                || self
+                    .cfg
+                    .domains
+                    .accept
+                    .iter()
+                    .any(|d| canonical_domain(d) == domain)
+        };
+        let sender_tenant = env
+            .tenant_id
+            .as_deref()
+            .or_else(|| tenant_of(&domain_of(&env.mail_from)));
+        let empty = [String::new()];
+        let rcpts = if env.rcpt_to.is_empty() {
+            &empty[..]
+        } else {
+            &env.rcpt_to
+        };
+        let contexts: Vec<Context> = rcpts
+            .iter()
+            .map(|rcpt| {
+                let domain = domain_of(rcpt);
+                let direction = match env.direction {
+                    Direction::Outbound if !is_local(&domain) => Direction::Outbound,
+                    _ => Direction::Inbound,
+                };
+                Context {
+                    tenant_id: match direction {
+                        Direction::Inbound => tenant_of(&domain),
+                        Direction::Outbound => sender_tenant,
+                    },
+                    direction,
+                    sender: &env.mail_from,
+                    // The SMTP session does not record the login on the envelope yet,
+                    // so outbound user and group scopes do not match.
+                    sender_identity: None,
+                    recipient: rcpt,
+                }
+            })
+            .collect();
+        let mut decision = evaluate_message(report, &contexts, &self.policies);
+        if !tenants.is_empty() {
+            for d in decision
+                .decisions
+                .iter_mut()
+                .filter(|d| d.tenant_id.is_none())
+            {
+                tracing::warn!(id = %env.id, recipient = %d.recipient, "no tenant for recipient");
+                d.explanation
+                    .push("no tenant for this recipient: only platform policies applied".into());
+            }
+        }
+        decision
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {
@@ -205,6 +275,13 @@ pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
     } else {
         None
     }
+}
+
+fn domain_of(address: &str) -> String {
+    address
+        .rsplit_once('@')
+        .map(|(_, d)| canonical_domain(d))
+        .unwrap_or_default()
 }
 
 pub fn auth_header(auth: &AuthResults) -> String {

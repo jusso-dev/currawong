@@ -1,38 +1,26 @@
 # Currawong default policy pack. Built into the binary and used when
 # `[policy]` names no pack and no database.
 #
+# Before any pack runs, a built-in floor quarantines malware, defers mail a
+# required scanner could not see and quarantines mail whose scan failed. Packs
+# cannot remove it; only a platform global policy with `override_floor = true`
+# lifts it for the mail it matches.
+#
 # Evaluation: most specific scope first (user, group, domain, tenant, global),
 # then lower `priority` first. The first matching policy with a terminal action
-# (deliver, quarantine, reject, discard, defer) sets the verdict. Header, banner,
-# redirect, bcc, encrypt and require_tls actions accumulate. `dry_run = true`
-# explains a match without acting on it. Unmatched mail is delivered.
+# (deliver, quarantine, reject, discard, defer) sets the verdict. Header,
+# redirect and bcc actions accumulate; `mandatory = true` policies add theirs
+# even after the verdict is set. `dry_run = true` explains a match without
+# acting on it. Unmatched mail is delivered.
 #
 # Spam scores are not produced yet; the spam policies take effect once the
 # spam stage reports a `spam` score.
-
-[[policy]]
-id = "malware"
-priority = 10
-conditions = [{ flag = "malware" }]
-actions = [{ quarantine = "malware" }]
-
-[[policy]]
-id = "scan-deferred"
-priority = 20
-conditions = [{ flag = "defer" }]
-actions = ["defer"]
 
 [[policy]]
 id = "active-content"
 priority = 30
 conditions = [{ flag = "active_content" }]
 actions = [{ quarantine = "active-content" }]
-
-[[policy]]
-id = "scan-failed"
-priority = 40
-conditions = [{ flag = "fail_closed" }]
-actions = [{ quarantine = "scan-failed" }]
 
 [[policy]]
 id = "dmarc-reject"

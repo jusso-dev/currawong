@@ -279,6 +279,8 @@ pub struct PolicyConfig {
     pub pack: Option<PathBuf>,
     /// SQLite policy store. When set, policies are read from it.
     pub database: Option<PathBuf>,
+    /// Domains outside the tenant's own that redirect and bcc may send to.
+    pub forward_domains: Vec<String>,
 }
 
 impl Default for LogConfig {

@@ -163,6 +163,7 @@ impl Action {
 #[serde(deny_unknown_fields)]
 pub struct Policy {
     pub id: String,
+    /// Owner. `None` is a platform policy; `Some` is a tenant's, applied only to that tenant's mail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
     #[serde(default)]
@@ -175,6 +176,13 @@ pub struct Policy {
     /// Matches are explained but never change the verdict or actions.
     #[serde(default)]
     pub dry_run: bool,
+    /// Non-terminal actions apply even after a more specific policy set the verdict.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub mandatory: bool,
+    /// Platform global policies only: when this matches, the built-in floor
+    /// (malware, scan deferred, scan failed) does not apply.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub override_floor: bool,
     #[serde(default)]
     pub conditions: Vec<Condition>,
     #[serde(default)]
@@ -189,6 +197,28 @@ fn default_true() -> bool {
     true
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// Headers a policy may not add: forging them would mislead authentication,
+/// tracing or the recipient.
+const PROTECTED_HEADERS: &[&str] = &[
+    "authentication-results",
+    "received",
+    "return-path",
+    "dkim-signature",
+    "from",
+    "sender",
+    "reply-to",
+    "to",
+    "cc",
+    "bcc",
+    "subject",
+    "date",
+    "message-id",
+];
+
 impl Policy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         let bad = |msg: String| Err(PolicyError::Invalid(format!("{}: {msg}", self.id)));
@@ -202,28 +232,55 @@ impl Policy {
             }
             _ => {}
         }
+        if self.override_floor && (self.tenant_id.is_some() || self.scope != Scope::Global) {
+            return bad("only platform global policies may override the floor".into());
+        }
         if self.scope.value().is_some_and(|v| v.trim().is_empty()) {
             return bad("scope value is empty".into());
         }
         for condition in &self.conditions {
-            if let Condition::Auth { method, .. } = condition {
-                if !["spf", "dkim", "dmarc", "arc", "dmarc_policy"].contains(&method.as_str()) {
+            match condition {
+                Condition::Auth { method, .. }
+                    if !["spf", "dkim", "dmarc", "arc", "dmarc_policy"]
+                        .contains(&method.as_str()) =>
+                {
                     return bad(format!("unknown auth method {method}"));
                 }
+                Condition::Score {
+                    name,
+                    at_least,
+                    below,
+                } => {
+                    if [*at_least, *below].iter().flatten().any(|v| !v.is_finite()) {
+                        return bad(format!("score {name} bound is not a finite number"));
+                    }
+                    if let (Some(min), Some(max)) = (at_least, below) {
+                        if max <= min {
+                            return bad(format!("score {name} range is empty"));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
         for action in &self.actions {
             match action {
                 Action::AddHeader { name, value } => {
-                    let name_ok =
-                        !name.is_empty() && name.bytes().all(|b| b.is_ascii_graphic() && b != b':');
-                    if !name_ok || value.contains(['\r', '\n']) {
-                        return bad(format!("bad header {name}"));
+                    let lower = name.to_ascii_lowercase();
+                    let name_ok = !name.is_empty()
+                        && name.bytes().all(|b| b.is_ascii_graphic() && b != b':')
+                        && !PROTECTED_HEADERS.contains(&lower.as_str())
+                        && !lower.starts_with("arc-");
+                    let value_ok = value.chars().all(|c| c == '\t' || !c.is_control());
+                    if !name_ok || !value_ok || name.len() + 2 + value.len() > 998 {
+                        return bad(format!("header {name} is not allowed"));
                     }
                 }
                 Action::Redirect(addr) | Action::Bcc(addr) => {
                     let ok = addr.contains('@')
-                        && !addr.contains(|c: char| c.is_whitespace() || "<>,".contains(c));
+                        && !addr.contains(|c: char| {
+                            c.is_whitespace() || c.is_control() || "<>,".contains(c)
+                        });
                     if !ok {
                         return bad(format!("bad address {addr}"));
                     }
@@ -231,7 +288,11 @@ impl Policy {
                 Action::Reject { code } if !(500..600).contains(code) => {
                     return bad(format!("reject code {code} must be 5xx"));
                 }
-                Action::Banner(text) if text.is_empty() => return bad("empty banner".into()),
+                // Refused rather than silently ignored: delivery cannot carry these out yet,
+                // and accepting them would deliver mail the policy meant to protect.
+                Action::Banner(_) | Action::Encrypt | Action::RequireTls => {
+                    return bad("banner, encrypt and require_tls are not supported yet".into());
+                }
                 _ => {}
             }
         }
@@ -243,8 +304,12 @@ impl Policy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct PolicySet {
+    /// Platform groups, used by platform policies.
     #[serde(default)]
     pub groups: BTreeMap<String, Vec<String>>,
+    /// Per-tenant groups, used by that tenant's policies.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tenant_groups: BTreeMap<String, BTreeMap<String, Vec<String>>>,
     #[serde(default, rename = "policy")]
     pub policies: Vec<Policy>,
 }
@@ -264,7 +329,7 @@ impl PolicySet {
         let mut seen = std::collections::BTreeSet::new();
         for policy in &self.policies {
             policy.validate()?;
-            if !seen.insert(&policy.id) {
+            if !seen.insert((&policy.tenant_id, &policy.id)) {
                 return Err(PolicyError::Invalid(format!(
                     "duplicate policy id {}",
                     policy.id
@@ -274,9 +339,32 @@ impl PolicySet {
         Ok(())
     }
 
-    pub fn in_group(&self, group: &str, address: &str) -> bool {
-        self.groups
-            .get(group)
-            .is_some_and(|members| members.iter().any(|m| m.eq_ignore_ascii_case(address)))
+    /// Membership in the owner's namespace: platform groups for platform policies,
+    /// the tenant's own groups for tenant policies.
+    pub fn in_group(&self, owner: Option<&str>, group: &str, address: &str) -> bool {
+        let groups = match owner {
+            None => Some(&self.groups),
+            Some(tenant) => self.tenant_groups.get(tenant),
+        };
+        let address = canonical_address(address);
+        groups
+            .and_then(|groups| groups.get(group))
+            .is_some_and(|members| members.iter().any(|m| canonical_address(m) == address))
     }
+}
+
+/// Lower case, no `+tag` in the local part, no trailing dot on the domain.
+pub fn canonical_address(address: &str) -> String {
+    let address = address.trim().to_ascii_lowercase();
+    match address.rsplit_once('@') {
+        Some((local, domain)) => {
+            let local = local.split_once('+').map_or(local, |(base, _)| base);
+            format!("{local}@{}", domain.trim_end_matches('.'))
+        }
+        None => address,
+    }
+}
+
+pub fn canonical_domain(domain: &str) -> String {
+    domain.trim().trim_end_matches('.').to_ascii_lowercase()
 }
