@@ -143,14 +143,24 @@ pub struct ScannerConfig {
     pub treat_macros_as_active: bool,
     pub treat_executables_as_active: bool,
     pub extract: ExtractLimits,
+    /// Linux: refuse to run a worker without Landlock. Turning this off is
+    /// logged as a warning on every worker start.
+    pub require_landlock: bool,
+    /// When the daemon runs as root, workers run as this uid and gid
+    /// (required in that case).
+    pub worker_uid: Option<u32>,
+    pub worker_gid: Option<u32>,
+    /// A message deferred by the scanner this many times is quarantined.
+    pub max_scan_deferrals: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ClamdConfig {
-    /// `unix:/path` or `tcp:127.0.0.1:3310`. Empty disables the engine.
+    /// `unix:/path` or `tcp:127.0.0.1:3310`. Empty disables the engine only
+    /// when `required` is false.
     pub address: String,
-    /// When the address is set, an unreachable engine fails closed.
+    /// An unreachable or unconfigured required engine fails closed (defer).
     pub required: bool,
 }
 
@@ -622,6 +632,10 @@ impl Default for ScannerConfig {
             treat_macros_as_active: true,
             treat_executables_as_active: true,
             extract: ExtractLimits::default(),
+            require_landlock: true,
+            worker_uid: None,
+            worker_gid: None,
+            max_scan_deferrals: 288,
         }
     }
 }
@@ -869,6 +883,23 @@ fn default_blocked_extensions() -> Vec<String> {
 }
 
 impl Config {
+    /// `--check-config` only: a required clamd needs an address. Kept out of
+    /// [`Config::validate`] so library defaults stay valid in tests.
+    pub fn check_clamd(&self) -> Result<(), ConfigError> {
+        if self.scanner.enabled
+            && self.scanner.clamd.required
+            && self.scanner.clamd.address.is_empty()
+        {
+            return Err(ConfigError::Invalid(
+                "scanner.clamd.address is empty and scanner.clamd.required is true: \
+                 set the clamd address (unix:/path or tcp:ip:port), or set \
+                 scanner.clamd.required = false to run without ClamAV"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Load TOML, then apply `CURRAWONG_` environment variables.
     /// Nested keys use `__`, for example `CURRAWONG_LIMITS__MAX_RECIPIENTS`.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -962,6 +993,11 @@ impl Config {
         }
         if !self.scanner.clamd.address.is_empty() {
             parse_clamd_address(&self.scanner.clamd.address)?;
+        }
+        if self.scanner.worker_uid.is_some() != self.scanner.worker_gid.is_some() {
+            return Err(ConfigError::Invalid(
+                "scanner.worker_uid and scanner.worker_gid must be set together".into(),
+            ));
         }
         // Every destination for message content, including clamd, must pass
         // the residency guard before the daemon starts.

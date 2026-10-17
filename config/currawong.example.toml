@@ -65,10 +65,22 @@ cert = "/etc/currawong/cert.pem"
 key = "/etc/currawong/key.pem"
 
 # scanner.enabled: isolated parser workers and the malware engines.
-# scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
-# scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310. Empty disables ClamAV.
+# scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp
+#   and Landlock.
+# scanner.require_landlock: Linux workers refuse to start without Landlock.
+#   false runs them unconfined on old kernels, with a warning on every start.
+# scanner.worker_uid / worker_gid: required when currawongd runs as root;
+#   workers then run as this user.
+# scanner.max_scan_deferrals: a message the scanner keeps deferring (no
+#   worker, clamd down) is quarantined after this many tries (5 minutes apart).
+#   worker_cpu_secs is per job. worker_binary (optional) is the path to
+#   currawong-parser-worker; by default it sits next to currawongd, and the
+#   daemon refuses to start without it.
+# scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310 (deploy/docker-compose.yml).
 #   clamd gets whole messages, so in au mode TCP must be loopback or an allowed CIDR.
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
+#   Required with an empty address defers all mail and fails /readyz. Set
+#   required = false to run without ClamAV.
 # scanner.yara.rules_dir: *.yar and *.yara files (subdirectories included),
 # matched against the raw message and every part inside the parser worker.
 # Changes are picked up within a few seconds without a restart; a broken
@@ -81,7 +93,8 @@ key = "/etc/currawong/key.pem"
 # scanner.extra_signature_dirs: on-premises supplemental signatures. Configure
 # clamd to load these as well (OfficialDatabaseOnly no). Mail stays on the box.
 # scanner.extra_database_paths: extra .cvd/.cld/.ndb files for the same purpose.
-# scanner.blocked_extensions: active content even when ClamAV is clean.
+# scanner.blocked_extensions: active content even when ClamAV is clean. Applies
+#   to attachments and to files inside archives.
 # scanner.treat_macros_as_active / treat_executables_as_active: file-type policy.
 # scanner.extract.*: archive limits (depth, uncompressed bytes, files, ratio).
 [scanner]
@@ -91,6 +104,8 @@ max_jobs_per_worker = 500
 worker_memory_mib = 512
 worker_cpu_secs = 30
 job_timeout_secs = 30
+require_landlock = true
+max_scan_deferrals = 288
 blocked_extensions = [
   "exe", "scr", "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "lnk", "iso",
   "one", "bat", "cmd", "com", "msi", "dll", "ps1", "jar", "cpl", "msc", "reg",
@@ -102,7 +117,7 @@ extra_signature_dirs = []
 extra_database_paths = []
 
 [scanner.clamd]
-address = ""
+address = "tcp:127.0.0.1:3310"
 required = true
 
 [scanner.yara]

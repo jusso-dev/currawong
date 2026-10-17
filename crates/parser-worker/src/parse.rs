@@ -1,14 +1,23 @@
 //! MIME parse. A message that cannot be parsed returns an error, it does not panic.
-use crate::archive::{self, passwords_from_message};
+use crate::archive::{self, passwords_from_message, Budget};
 use crate::filetype::{self, FileKind};
 use crate::ipc::{ParseRequest, ParseResponse};
-use crate::office;
 use crate::yara::{RulesCache, YaraScan};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
+use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders, PartType};
+use std::borrow::Cow;
 use std::fs;
+use std::path::Path;
 use yara_x::Rules;
+
+/// URLs reported per message. Keeps the response frame bounded.
+const MAX_URLS: usize = 512;
+/// mail-parser recurses per nested message and multipart; past these the
+/// message is refused before it is parsed (a deep stack would overflow).
+const MAX_NESTED_MESSAGES: usize = 32;
+const MAX_MULTIPARTS: usize = 512;
 
 pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseResponse {
     let raw = match fs::read(&req.raw_path) {
@@ -23,7 +32,14 @@ pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseRespons
         None => None,
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_message(&req.id, &raw, &req.limits, rules, true)
+        parse_full(
+            &req.id,
+            &raw,
+            &req.limits,
+            req.out_dir.as_deref(),
+            rules,
+            true,
+        )
     })) {
         Ok(response) => response,
         Err(_) => ParseResponse::failed(&req.id, "parser panicked"),
@@ -33,7 +49,7 @@ pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseRespons
 /// In-process parse. PDF and Office text extraction only runs in the
 /// worker (`parse_request`), so documents here mark DLP text incomplete.
 pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseResponse {
-    parse_bytes_with(id, raw, limits, None)
+    parse_with(id, raw, limits, None)
 }
 
 /// In-process parse with YARA rules matched against the raw message, every
@@ -44,136 +60,232 @@ pub fn parse_bytes_with(
     limits: &ExtractLimits,
     rules: Option<&Rules>,
 ) -> ParseResponse {
-    parse_message(id, raw, limits, rules, false)
+    parse_full(id, raw, limits, None, rules, false)
+}
+
+/// Parses `raw`. Limits apply to the whole message, not to each attachment.
+/// With `out_dir`, decoded parts are written there for the AV engines.
+pub fn parse_with(
+    id: &str,
+    raw: &[u8],
+    limits: &ExtractLimits,
+    out_dir: Option<&Path>,
+) -> ParseResponse {
+    parse_full(id, raw, limits, out_dir, None, false)
 }
 
 /// `documents` is true only in the worker: PDF and Office text extraction
 /// for DLP never runs in the supervisor.
-fn parse_message(
+pub fn parse_full(
     id: &str,
     raw: &[u8],
     limits: &ExtractLimits,
+    out_dir: Option<&Path>,
     rules: Option<&Rules>,
     documents: bool,
 ) -> ParseResponse {
+    if let Some(reason) = nesting_limit(raw) {
+        return ParseResponse::failed(id, reason);
+    }
     let Some(message) = MessageParser::default().with_mime_headers().parse(raw) else {
         return ParseResponse::failed(id, "message has no headers");
     };
+    let mut text = String::new();
+    collect_text(&message, &mut text, limits.max_depth);
     let mut yara = rules.map(YaraScan::new);
     if let Some(yara) = yara.as_mut() {
         yara.scan("message", raw);
     }
-    let mut parts = Vec::new();
-    let mut urls = Vec::new();
-    let mut text = String::new();
-    for part in message
-        .attachments()
-        .chain(message.text_bodies())
-        .chain(message.html_bodies())
-    {
-        let filename = part.attachment_name().map(|name| name.to_string());
-        let content_type = part
-            .content_type()
-            .map(|ct| ct.c_type.to_string())
-            .unwrap_or_else(|| "application/octet-stream".into());
-        let bytes = part.contents();
-        if let Some(yara) = yara.as_mut() {
-            yara.scan(filename.as_deref().unwrap_or(&content_type), bytes);
-        }
-        collect_text(&part.body, &mut text);
-        urls.extend(crate::fuzz::urls_in(bytes).into_iter().take(64));
-        let kind = filetype::detect(bytes);
-        let mut flags = filetype::flags_for(bytes, filename.as_deref(), &kind);
-        if office::ooxml_macro(&[filename.clone().unwrap_or_default()]) {
-            flags.push(PartFlag::HasMacro);
-        }
-        parts.push(make_part(content_type, filename.clone(), bytes, flags));
-        if is_container(&kind) || bytes.starts_with(b"PK") {
-            let extracted =
-                archive::extract_with(bytes, filename.as_deref(), limits, &[], yara.as_mut());
-            parts.extend(extracted.parts);
-        }
+    let mut walk = Walk {
+        budget: Budget::new(limits, out_dir).with_yara(yara.as_mut()),
+        passwords: passwords_from_message(&text),
+        parts: Vec::new(),
+        urls: Vec::new(),
+    };
+    walk.message(&message);
+    if walk.parts.is_empty() {
+        let part = walk
+            .budget
+            .part(None, Some("message/rfc822".into()), raw, Vec::new());
+        walk.parts.push(part);
     }
-    if parts.is_empty() {
-        let kind = FileKind {
-            label: "message/rfc822".into(),
-            executable: false,
-        };
-        parts.push(make_part(kind.label, None, raw, Vec::new()));
+    let Walk {
+        budget,
+        parts,
+        mut urls,
+        ..
+    } = walk;
+    if let Some(err) = budget.store_failed {
+        return ParseResponse::failed(id, err);
     }
-    let passwords = passwords_from_message(&text);
-    if !passwords.is_empty() {
-        let mut extra = Vec::new();
-        for part in &parts {
-            if part.flags.contains(&PartFlag::Encrypted) {
-                extra.push(part.filename.clone());
-            }
-        }
-        let _ = extra;
-    }
-    urls.extend(crate::fuzz::urls_in(raw).into_iter().take(32));
-    urls.sort();
-    urls.dedup();
     let (yara, error) = match yara {
         Some(scan) => (scan.matches, scan.error),
         None => (Vec::new(), None),
     };
+    urls.extend(crate::fuzz::urls_in(raw).into_iter().take(32));
+    urls.sort();
+    urls.dedup();
+    urls.truncate(MAX_URLS);
     ParseResponse {
         id: id.to_string(),
         parts,
         urls,
         error,
+        warnings: Vec::new(),
         yara,
         dlp: crate::text::message_text(&message, documents),
     }
 }
 
-fn make_part(
-    content_type: String,
-    filename: Option<String>,
-    bytes: &[u8],
-    mut flags: Vec<PartFlag>,
-) -> PartInfo {
-    let kind = filetype::detect(bytes);
-    for flag in filetype::flags_for(bytes, filename.as_deref(), &kind) {
-        if !flags.contains(&flag) {
-            flags.push(flag);
+struct Walk<'a, 'r> {
+    budget: Budget<'a, 'r>,
+    passwords: Vec<String>,
+    parts: Vec<PartInfo>,
+    urls: Vec<String>,
+}
+
+impl Walk<'_, '_> {
+    /// Every leaf part once, descending into attached messages.
+    fn message(&mut self, message: &Message<'_>) {
+        for part in &message.parts {
+            if self.budget.hit {
+                return;
+            }
+            if let PartType::Multipart(_) = part.body {
+                continue;
+            }
+            if !self.budget.admit() {
+                self.limit_part();
+                return;
+            }
+            let filename = part.attachment_name().map(str::to_string);
+            let content_type = part.content_type().map(|ct| match &ct.c_subtype {
+                Some(sub) => format!("{}/{}", ct.c_type, sub).to_ascii_lowercase(),
+                None => ct.c_type.to_ascii_lowercase(),
+            });
+            let bytes = &*part_bytes(message, part);
+            if let PartType::Message(inner) = &part.body {
+                let entry = self
+                    .budget
+                    .part(filename.as_deref(), content_type, bytes, Vec::new());
+                self.parts.push(entry);
+                if !self.budget.enter() {
+                    self.limit_part();
+                    return;
+                }
+                self.message(inner);
+                self.budget.leave();
+                continue;
+            }
+            if self.urls.len() < MAX_URLS {
+                self.urls
+                    .extend(crate::fuzz::urls_in(bytes).into_iter().take(64));
+            }
+            let mut flags = archive::inspect(
+                bytes,
+                filename.as_deref(),
+                &self.passwords,
+                &mut self.budget,
+                &mut self.parts,
+            );
+            let kind = filetype::detect(bytes);
+            if declared_type_mismatch(content_type.as_deref(), &kind)
+                && !flags.contains(&PartFlag::ExtMismatch)
+            {
+                flags.push(PartFlag::ExtMismatch);
+            }
+            let entry = self
+                .budget
+                .part(filename.as_deref(), content_type, bytes, flags);
+            self.parts.push(entry);
         }
     }
-    if bytes.starts_with(b"PK")
-        && office::ooxml_macro_bytes(bytes)
-        && !flags.contains(&PartFlag::HasMacro)
-    {
-        flags.push(PartFlag::HasMacro);
-    }
-    PartInfo {
-        content_type: if content_type.is_empty() {
-            kind.label
-        } else {
-            content_type
-        },
-        filename,
-        size: bytes.len() as u64,
-        sha256: filetype::sha256(bytes),
-        flags,
-        path: None,
+
+    /// Records that parts were left uninspected.
+    fn limit_part(&mut self) {
+        let part = self.budget.part(
+            None,
+            Some("application/octet-stream".into()),
+            b"",
+            vec![PartFlag::LimitExceeded],
+        );
+        self.parts.push(part);
     }
 }
 
-fn is_container(kind: &FileKind) -> bool {
-    matches!(
-        kind.label.as_str(),
-        "application/zip"
-            | "application/gzip"
-            | "application/x-tar"
-            | "application/x-iso9660-image"
-            | "application/x-7z-compressed"
-    )
+/// A cheap count before mail-parser sees the message.
+pub fn nesting_limit(raw: &[u8]) -> Option<String> {
+    let count = |needle: &[u8]| {
+        raw.windows(needle.len())
+            .filter(|window| window.eq_ignore_ascii_case(needle))
+            .count()
+    };
+    let messages = count(b"message/rfc822") + count(b"message/global");
+    if messages > MAX_NESTED_MESSAGES {
+        return Some(format!(
+            "nesting limit: {messages} attached messages (limit {MAX_NESTED_MESSAGES})"
+        ));
+    }
+    let multiparts = count(b"multipart/");
+    if multiparts > MAX_MULTIPARTS {
+        return Some(format!(
+            "nesting limit: {multiparts} multipart sections (limit {MAX_MULTIPARTS})"
+        ));
+    }
+    None
 }
 
-fn collect_text(body: &PartType, out: &mut String) {
-    match body {
-        PartType::Text(text) | PartType::Html(text) if out.len() < 16_000 => out.push_str(text),
-        _ => {}
+/// The bytes the AV engines should see. Text parts are decoded from their
+/// transfer encoding only, not converted to UTF-8, which could lose bytes.
+fn part_bytes<'a>(message: &'a Message<'a>, part: &'a MessagePart<'a>) -> Cow<'a, [u8]> {
+    if !matches!(part.body, PartType::Text(_) | PartType::Html(_)) {
+        return Cow::Borrowed(part.contents());
+    }
+    let raw = message
+        .raw_message
+        .get(part.offset_body as usize..part.offset_end as usize);
+    let decoded = raw.and_then(|raw| match part.encoding {
+        Encoding::Base64 => base64_decode(raw),
+        Encoding::QuotedPrintable => quoted_printable_decode(raw),
+        Encoding::None => Some(raw.to_vec()),
+    });
+    decoded.map_or(Cow::Borrowed(part.contents()), Cow::Owned)
+}
+
+/// Executable content declared as something else (a PE sent as
+/// `application/pdf` with no file name, for example).
+fn declared_type_mismatch(declared: Option<&str>, kind: &FileKind) -> bool {
+    let Some(declared) = declared else {
+        return false;
+    };
+    kind.executable
+        && !matches!(
+            declared,
+            "application/octet-stream"
+                | "application/x-msdownload"
+                | "application/x-msdos-program"
+                | "application/x-dosexec"
+                | "application/x-executable"
+                | "application/x-sharedlib"
+                | "application/x-elf"
+                | "application/x-mach-binary"
+                | "application/x-ms-shortcut"
+                | "application/vnd.microsoft.portable-executable"
+        )
+}
+
+/// Body text for candidate archive passwords, from this message and any
+/// attached ones.
+fn collect_text(message: &Message<'_>, out: &mut String, depth: u32) {
+    for part in &message.parts {
+        if out.len() >= 16_000 {
+            return;
+        }
+        match &part.body {
+            PartType::Text(text) | PartType::Html(text) => out.push_str(text),
+            PartType::Message(inner) if depth > 0 => collect_text(inner, out, depth - 1),
+            _ => {}
+        }
+        out.push('\n');
     }
 }
