@@ -38,6 +38,7 @@ pub struct Config {
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
     pub policy: PolicyConfig,
+    pub dlp: DlpProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -346,6 +347,18 @@ impl Default for DmarcReportConfig {
     }
 }
 
+/// `[dlp]`: Australian identifier detection on outbound mail, and inbound
+/// mail when `scan_inbound` is set. What happens to a message with findings
+/// is set by policy (`dlp.<kind>` counts and the `dlp.incomplete` flag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DlpProfile {
+    pub enabled: bool,
+    pub scan_inbound: bool,
+    /// Matches below this confidence (0 to 100) are not counted.
+    pub min_confidence: u8,
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -534,6 +547,16 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for DlpProfile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_inbound: false,
+            min_confidence: 50,
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -578,6 +601,7 @@ impl Default for Config {
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
             policy: PolicyConfig::default(),
+            dlp: DlpProfile::default(),
         }
     }
 }

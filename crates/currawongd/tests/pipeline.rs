@@ -137,6 +137,109 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
     );
 }
 
+/// Captures formatted log lines so the test can check what was logged.
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The ATO's published sample `123456782`, then checksum-valid values
+/// derived at run time by counting its leading digits down. Only the
+/// published sample is committed.
+fn sample_tfns() -> Vec<String> {
+    let mut out = vec!["123456782".to_string()];
+    let mut prefix = 12_345_678u32;
+    while out.len() < 5 {
+        prefix -= 1;
+        if let Some(t) = (0..10)
+            .map(|d| format!("{prefix}{d}"))
+            .find(|t| currawong_dlp::detectors::tfn::validate(t))
+        {
+            out.push(t);
+        }
+    }
+    out
+}
+
+fn tfn_message(tfns: &[String]) -> Vec<u8> {
+    let lines: Vec<String> = tfns.iter().map(|t| format!("TFN: {t}")).collect();
+    format!(
+        "From: payroll@example.test\r\nTo: agent@external.test\r\nSubject: staff\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\n{}\r\n",
+        lines.join("\r\n")
+    )
+    .into_bytes()
+}
+
+#[tokio::test]
+async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
+    let logs = LogBuffer::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let mut cfg = Config::default();
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let mut env = envelope("payroll@example.test");
+    env.direction = Direction::Outbound;
+    env.rcpt_to = vec!["agent@external.test".into()];
+
+    let tfns = sample_tfns();
+    let (held, verdict) = pipeline.evaluate(&env, &tfn_message(&tfns), None).await;
+    let Verdict::Quarantine { reason } = verdict else {
+        panic!("{verdict:?}");
+    };
+    // The default pack's outbound TFN policy.
+    assert_eq!(reason, "dlp-tfn");
+    let dlp = held.dlp.as_ref().unwrap();
+    assert_eq!(dlp.counts.get(&currawong_core::DlpKind::Tfn), Some(&5));
+
+    // Four is under the default threshold. Inbound is not scanned by default.
+    let (_, verdict) = pipeline
+        .evaluate(&env, &tfn_message(&tfns[..4]), None)
+        .await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    // Five checksum-valid numbers that are only invoice references.
+    let invoices: Vec<String> = tfns.iter().map(|t| format!("Invoice {t}")).collect();
+    let raw = format!(
+        "From: payroll@example.test\r\nTo: agent@external.test\r\nSubject: invoices\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\n{}\r\n",
+        invoices.join("\r\n")
+    );
+    let (report, verdict) = pipeline.evaluate(&env, raw.as_bytes(), None).await;
+    assert!(report.dlp.as_ref().unwrap().counts.is_empty(), "{report:?}");
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    let mut inbound = env.clone();
+    inbound.direction = Direction::Inbound;
+    let (report, verdict) = pipeline.evaluate(&inbound, &tfn_message(&tfns), None).await;
+    assert!(report.dlp.is_none());
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+
+    let logged = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("dlp findings"), "{logged}");
+    let event = serde_json::to_string(&held).unwrap();
+    for tfn in &tfns {
+        for haystack in [&logged, &event, &reason] {
+            assert!(!haystack.contains(tfn), "{tfn} leaked: {haystack}");
+            assert!(!haystack.contains(&tfn[3..]), "{tfn} leaked: {haystack}");
+        }
+    }
+    assert!(event.contains("123 *** ***"), "{event}");
+}
+
 #[tokio::test]
 async fn verdicts_feed_reputation_and_dmarc_pass_skips_greylisting() {
     use currawong_smtp::{

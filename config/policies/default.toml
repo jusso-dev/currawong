@@ -31,6 +31,41 @@ conditions = [
 ]
 actions = [{ quarantine = "spoofing" }]
 
+# Australian identifiers in outbound mail (`[dlp]` in the main config). Counts
+# are distinct identifiers at or above `dlp.min_confidence`. ABNs and ACNs are
+# on public registers, so they are counted (`dlp.abn`, `dlp.acn`) but not held.
+# `dlp.incomplete` means some text could not be scanned (too large, a document
+# that failed to parse, or documents outside the parser worker).
+[[policy]]
+id = "dlp-tfn"
+priority = 40
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.tfn", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-medicare"
+priority = 41
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.medicare", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-card"
+priority = 42
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.card", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-driver-licence"
+priority = 43
+conditions = [{ direction = "outbound" }, { count = { name = "dlp.driver_licence", at_least = 5 } }]
+actions = [{ quarantine = "dlp" }]
+
+[[policy]]
+id = "dlp-incomplete"
+priority = 44
+conditions = [{ direction = "outbound" }, { flag = "dlp.incomplete" }]
+actions = [{ quarantine = "dlp" }]
+
 [[policy]]
 id = "spam-quarantine"
 priority = 60

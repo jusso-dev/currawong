@@ -23,24 +23,38 @@ pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseRespons
         None => None,
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_bytes_with(&req.id, &raw, &req.limits, rules)
+        parse_message(&req.id, &raw, &req.limits, rules, true)
     })) {
         Ok(response) => response,
         Err(_) => ParseResponse::failed(&req.id, "parser panicked"),
     }
 }
 
+/// In-process parse. PDF and Office text extraction only runs in the
+/// worker (`parse_request`), so documents here mark DLP text incomplete.
 pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseResponse {
     parse_bytes_with(id, raw, limits, None)
 }
 
-/// Parse, and match YARA rules against the raw message, every MIME part and
-/// every archive member.
+/// In-process parse with YARA rules matched against the raw message, every
+/// MIME part and every archive member. Documents mark DLP text incomplete.
 pub fn parse_bytes_with(
     id: &str,
     raw: &[u8],
     limits: &ExtractLimits,
     rules: Option<&Rules>,
+) -> ParseResponse {
+    parse_message(id, raw, limits, rules, false)
+}
+
+/// `documents` is true only in the worker: PDF and Office text extraction
+/// for DLP never runs in the supervisor.
+fn parse_message(
+    id: &str,
+    raw: &[u8],
+    limits: &ExtractLimits,
+    rules: Option<&Rules>,
+    documents: bool,
 ) -> ParseResponse {
     let Some(message) = MessageParser::default().with_mime_headers().parse(raw) else {
         return ParseResponse::failed(id, "message has no headers");
@@ -110,6 +124,7 @@ pub fn parse_bytes_with(
         urls,
         error,
         yara,
+        dlp: crate::text::message_text(&message, documents),
     }
 }
 

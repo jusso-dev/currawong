@@ -1,11 +1,11 @@
-//! Auth, parse, scan and the policy decision.
+//! Auth, parse, scan, DLP and the policy decision.
 use currawong_auth::{
     strip_forged, AuthChecker, DmarcEventStore, KeyStore, StoredKey, GATEWAY_TENANT,
 };
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
-use currawong_parser::{parse::parse_bytes_with, ParseResponse};
+use currawong_parser::{parse::parse_bytes_with, text::DlpText, ParseResponse};
 use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
 };
@@ -300,6 +300,8 @@ impl Pipeline {
         }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
+            // No worker: decoded text bodies only; documents mark it incomplete.
+            self.scan_dlp(env, &currawong_parser::text::body_text(raw), &mut report);
             let decision = self.decide(env, &report);
             self.feedback(env, &report, &decision.verdict());
             return (report, decision);
@@ -310,6 +312,7 @@ impl Pipeline {
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
         report.yara = parsed.yara.clone();
+        self.scan_dlp(env, &parsed.dlp, &mut report);
         let parser_failed = parsed.error.is_some();
         if let Some(err) = parsed.error {
             report.notes.push(err);
@@ -448,6 +451,20 @@ impl Pipeline {
             }
         }
         decision
+    }
+
+    /// Outbound mail, and inbound when configured. Logs counts only.
+    fn scan_dlp(&self, env: &Envelope, text: &DlpText, report: &mut ScanReport) {
+        let profile = &self.cfg.dlp;
+        if !profile.enabled || (env.direction == Direction::Inbound && !profile.scan_inbound) {
+            return;
+        }
+        let mut dlp = currawong_dlp::scan(&text.text, profile);
+        dlp.incomplete |= text.incomplete;
+        if !dlp.counts.is_empty() || dlp.incomplete {
+            tracing::info!(id = %env.id, counts = ?dlp.counts, incomplete = dlp.incomplete, "dlp findings");
+        }
+        report.dlp = Some(dlp);
     }
 
     fn fold_part_flags(&self, report: &mut ScanReport) {

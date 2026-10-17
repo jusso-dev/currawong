@@ -1,6 +1,7 @@
 //! Scan report shared by the pipeline, policy engine and SIEM export.
 use crate::MessageId;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthMethodResult {
@@ -105,6 +106,54 @@ pub struct ScanReport {
     /// modified inbound mail is ARC sealed.
     #[serde(default)]
     pub modified: bool,
+    /// Australian identifier findings. `None` when DLP did not run.
+    #[serde(default)]
+    pub dlp: Option<DlpReport>,
+}
+
+/// Identifier kinds found by `currawong-dlp`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DlpKind {
+    Tfn,
+    Medicare,
+    Abn,
+    Acn,
+    DriverLicence,
+    Card,
+}
+
+impl DlpKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tfn => "tfn",
+            Self::Medicare => "medicare",
+            Self::Abn => "abn",
+            Self::Acn => "acn",
+            Self::DriverLicence => "driver_licence",
+            Self::Card => "card",
+        }
+    }
+}
+
+/// A redacted sample such as `123 *** ***`. The full value is never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DlpSample {
+    pub kind: DlpKind,
+    pub redacted: String,
+    pub confidence: u8,
+}
+
+/// Counts and redacted samples only, so the report is safe to log and export.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DlpReport {
+    /// Distinct identifiers per kind at or above the profile's confidence.
+    pub counts: BTreeMap<DlpKind, u32>,
+    pub samples: Vec<DlpSample>,
+    /// Some text was not scanned (size limit, or a document that could not
+    /// be extracted). The default policy pack holds the message.
+    #[serde(default)]
+    pub incomplete: bool,
 }
 
 impl ScanReport {
@@ -121,6 +170,7 @@ impl ScanReport {
             fail_closed: false,
             defer: false,
             notes: Vec::new(),
+            dlp: None,
             modified: false,
         }
     }
