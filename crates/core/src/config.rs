@@ -252,8 +252,45 @@ pub struct DomainRoute {
 pub struct DeliveryConfig {
     pub poll_secs: u64,
     pub max_age_days: u64,
-    /// Hook for a later MTA-STS policy. M1 does not enforce DANE or MTA-STS.
+    /// Require STARTTLS with a WebPKI-valid certificate on every hop that has
+    /// no DANE or MTA-STS policy, including `domains.routes` next hops.
     pub require_tls: bool,
+    /// Messages delivered at once in one pass.
+    pub max_concurrent: usize,
+    /// Sessions open at once to one recipient domain.
+    pub max_per_destination: usize,
+    /// Allow MX answers that point at loopback, private or other non-public
+    /// addresses. Off by default so DNS cannot aim delivery inward.
+    pub allow_private_mx: bool,
+    /// DANE (RFC 7672) for MX delivery. Validates DNSSEC locally, so the
+    /// system resolver must pass DNSSEC records through.
+    pub dane: bool,
+    /// MTA-STS (RFC 8461) for MX delivery.
+    pub mta_sts: bool,
+    /// SQLite file for the MTA-STS policy cache and TLS-RPT results.
+    pub tls_database: PathBuf,
+    pub tls_rpt: TlsRptConfig,
+}
+
+/// Daily TLS-RPT (RFC 8460) reports to domains that publish `_smtp._tls`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsRptConfig {
+    pub enabled: bool,
+    /// `organization-name` in reports.
+    pub organisation: String,
+    /// `contact-info` in reports. Empty means `postmaster@<gateway.hostname>`.
+    pub contact: String,
+}
+
+impl Default for TlsRptConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            organisation: "Currawong".into(),
+            contact: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -666,6 +703,13 @@ impl Default for DeliveryConfig {
             poll_secs: 30,
             max_age_days: 5,
             require_tls: false,
+            max_concurrent: 16,
+            max_per_destination: 4,
+            allow_private_mx: false,
+            dane: true,
+            mta_sts: true,
+            tls_database: PathBuf::from("/var/lib/currawong/tls.sqlite"),
+            tls_rpt: TlsRptConfig::default(),
         }
     }
 }

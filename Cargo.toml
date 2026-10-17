@@ -54,6 +54,9 @@ mail-auth = "0.13"
 mail-send = { version = "0.5", default-features = false, features = ["ring", "tls12"] }
 mail-builder = "0.4"
 hickory-resolver = "0.26"
+rustls-webpki = { version = "0.103", default-features = false, features = ["std"] }
+webpki-roots = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 infer = "0.19"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 flate2 = "1"
@@ -77,9 +80,8 @@ strsim = "0.11"
 psl = "2"
 idna = "1"
 regex = "1"
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 hmac = "0.12"
-webpki-roots = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"

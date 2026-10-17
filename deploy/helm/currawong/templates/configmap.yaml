@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-currawong
+  labels:
+    app.kubernetes.io/name: currawong
+    app.kubernetes.io/instance: {{ .Release.Name }}
+data:
+  currawong.toml: |
+{{ .Values.config | indent 4 }}

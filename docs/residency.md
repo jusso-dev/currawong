@@ -35,6 +35,10 @@ The default CIDRs are loopback plus every RFC 1918 range (`10.0.0.0/8`, `172.16.
 
 Webhooks (#42), Graph (#41), the sandbox (#28) and the LLM classifier (#32) implement `HttpTransport` and use these clients. Raw TCP peers call `check_socket`.
 
+## Recipient-designated hosts
+
+Traffic to hosts that the recipient's DNS chooses is outside the residency guard by design: SMTP delivery to the MX, MTA-STS policy fetches, TLS-RPT uploads and DMARC aggregate reports. It carries no stored customer content beyond what delivery itself sends, and the destination is not ours to choose. SSRF protection still applies: those names must resolve to public addresses (unless `delivery.allow_private_mx` is set), and policy fetches and report uploads use only `https` on port 443 with a plain host name, no address literal and no user information.
+
 ## Overrides and `mode = "off"`
 
 An override is an exact URL plus a `reason` and an `approved_by`. Both must be non-empty or startup fails. The first use of each override is logged at warn level and recorded once in the audit log, so repeated use does not grow memory. Every configured override is listed in the report, used or not.

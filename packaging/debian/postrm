@@ -1,0 +1,14 @@
+#!/bin/sh
+# On purge, remove state, the spool and the generated certificate. The
+# currawong user is left in place, as Debian policy recommends.
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "purge" ]; then
+    rm -rf /var/lib/currawong /var/spool/currawong
+    rm -f /etc/currawong/cert.pem /etc/currawong/key.pem
+    rmdir /etc/currawong 2>/dev/null || true
+fi
+
+exit 0

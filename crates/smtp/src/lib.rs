@@ -13,6 +13,7 @@ pub mod server;
 pub mod session;
 pub mod stream;
 pub mod tls;
+pub mod tlsrpt;
 
 pub use currawong_core::Error;
 pub use server::SmtpServer;

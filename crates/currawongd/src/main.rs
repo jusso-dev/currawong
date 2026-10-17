@@ -182,20 +182,28 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         let txt = AuthChecker::new(&cfg.auth.authserv_id)?;
         tokio::spawn(BimiWorker::default().run(txt, quarantine.clone(), queue));
     }
-    let deliverer = Deliverer::new(
+    // DANE needs DNSSEC-validated answers for MX, address and TLSA lookups.
+    let delivery_dns = if cfg.delivery.dane {
+        HickoryDns::validating()
+    } else {
+        HickoryDns::system()
+    };
+    let deliverer = Arc::new(Deliverer::new(
         Arc::clone(&spool),
         Arc::clone(&cfg),
-        Arc::new(HickoryDns::system().map_err(|err| err.to_string())?),
-    );
+        Arc::new(delivery_dns.map_err(|err| err.to_string())?),
+    ));
+    let poll = Duration::from_secs(cfg.delivery.poll_secs.max(1));
+    // Classification, delivery and TLS-RPT each run on their own loop, so a
+    // slow or failing one cannot hold up the others.
+    let pipeline = Arc::new(tokio::sync::Mutex::new((pipeline, quarantine)));
     let spool_loop = Arc::clone(&spool);
-    let shutdown_loop = shutdown.clone();
-    let poll_secs = cfg.delivery.poll_secs.max(1);
-    tokio::spawn(async move {
-        let mut pipeline = pipeline;
-        loop {
-            if shutdown_loop.is_cancelled() {
-                break;
-            }
+    every("pipeline", poll, shutdown.clone(), move || {
+        let pipeline = Arc::clone(&pipeline);
+        let spool = Arc::clone(&spool_loop);
+        async move {
+            let mut guard = pipeline.lock().await;
+            let (pipeline, quarantine) = &mut *guard;
             match pipeline.reload_policies().await {
                 Ok(true) => {
                     tracing::info!("policies reloaded");
@@ -217,18 +225,24 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
                     tracing::error!(%err, "policy reload failed, keeping the previous policies")
                 }
             }
-            if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
-                tracing::error!(%err, "pipeline pass failed");
-            }
-            if let Err(err) = deliver_ready(&deliverer).await {
-                tracing::error!(%err, "delivery pass failed");
-            }
-            tokio::select! {
-                _ = shutdown_loop.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(poll_secs)) => {}
-            }
+            classify_pending(&spool, pipeline, quarantine).await
         }
     });
+    let delivery = Arc::clone(&deliverer);
+    every("delivery", poll, shutdown.clone(), move || {
+        let deliverer = Arc::clone(&delivery);
+        async move { deliverer.poll_due().await }
+    });
+    let reports = Arc::clone(&deliverer);
+    every(
+        "TLS-RPT",
+        Duration::from_secs(600),
+        shutdown.clone(),
+        move || {
+            let deliverer = Arc::clone(&reports);
+            async move { deliverer.send_tls_reports().await.map(|_| ()) }
+        },
+    );
     let tls_reload = tls.clone();
     let cert = cfg.tls.cert.clone();
     let key = cfg.tls.key.clone();
@@ -304,22 +318,26 @@ fn spawn_dmarc_reports(
     Ok(())
 }
 
-async fn deliver_ready(deliverer: &Deliverer<HickoryDns>) -> Result<(), String> {
-    use currawong_spool::SpoolState;
-    use currawongd::ready_to_deliver;
-    for state in [SpoolState::Incoming, SpoolState::Deferred] {
-        for env in deliverer
-            .spool
-            .list(state)
-            .await
-            .map_err(|err| err.to_string())?
-        {
-            if ready_to_deliver(&env) {
-                let _ = deliverer.deliver(&env.id).await;
+/// Run `pass` every `period` until shutdown. Each pass is its own task, so
+/// an error or a panic is logged and the next pass still runs.
+fn every<F, Fut>(name: &'static str, period: Duration, shutdown: CancellationToken, pass: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), String>> + Send + 'static,
+{
+    tokio::spawn(async move {
+        while !shutdown.is_cancelled() {
+            match tokio::spawn(pass()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => tracing::error!(%err, "{name} pass failed"),
+                Err(err) => tracing::error!(%err, "{name} pass panicked"),
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(period) => {}
             }
         }
-    }
-    Ok(())
+    });
 }
 
 async fn wait_for_signals(

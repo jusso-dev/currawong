@@ -4,7 +4,7 @@ Currawong is an open source email security gateway written in Rust, built for Au
 
 It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint or Mimecast, but memory safe, self-hostable and aware of Australian rules such as PSPF protective markings and Australian identifiers like TFNs and Medicare numbers.
 
-> Status: M1 relay. The gateway accepts mail for configured domains, spools it, checks SPF, DKIM, DMARC and ARC, DKIM signs outbound tenant mail and ARC seals delivered mail once keys exist (`currawongd dkim generate`), parses and unpacks attachments (zip, 7z, tar, gzip, ISO and attached messages) in sandboxed worker processes, scans the message and every extracted part with ClamAV (clamd is required by default), and quarantines malware, active content (renamed executables, macros, OLE objects, encrypted archives), anything that could not be inspected, and DMARC `p=reject`. Official ClamAV signatures are the baseline, not a complete detector: add on-premises supplemental signatures and keep the file-type checks on. See [docs/adr/0005-malware-engines.md](docs/adr/0005-malware-engines.md). YARA rules in `scanner.yara.rules_dir` (yara-x) are matched against the message, every part and every archive member inside the parser worker, reload without a restart, and appear on the scan report for policy; starter rules are in [rules/yara/](rules/yara/). Outbound mail is scanned for TFN, Medicare, ABN, ACN, driver's licence and card numbers with checksum validation, and the default policy pack holds it for review at five distinct TFNs, Medicare, card or licence numbers (logs carry redacted samples only). Spam, phishing and BEC blocking are not in this milestone. Checks that need a live clamd, a live MX or a second signature set are listed in [docs/VALIDATION.md](docs/VALIDATION.md).
+> Status: M1 relay. The gateway accepts mail for configured domains, spools it, checks SPF, DKIM, DMARC and ARC, DKIM signs outbound tenant mail and ARC seals delivered mail once keys exist (`currawongd dkim generate`), parses and unpacks attachments (zip, 7z, tar, gzip, ISO and attached messages) in sandboxed worker processes, scans the message and every extracted part with ClamAV (clamd is required by default), and quarantines malware, active content (renamed executables, macros, OLE objects, encrypted archives), anything that could not be inspected, and DMARC `p=reject`. Official ClamAV signatures are the baseline, not a complete detector: add on-premises supplemental signatures and keep the file-type checks on. See [docs/adr/0005-malware-engines.md](docs/adr/0005-malware-engines.md). YARA rules in `scanner.yara.rules_dir` (yara-x) are matched against the message, every part and every archive member inside the parser worker, reload without a restart, and appear on the scan report for policy; starter rules are in [rules/yara/](rules/yara/). Outbound mail is scanned for TFN, Medicare, ABN, ACN, driver's licence and card numbers with checksum validation, and the default policy pack holds it for review at five distinct TFNs, Medicare, card or licence numbers (logs carry redacted samples only). Outbound delivery enforces DANE and MTA-STS, uses verified opportunistic STARTTLS otherwise, and sends daily TLS-RPT reports; see [docs/outbound-tls.md](docs/outbound-tls.md). Spam, phishing and BEC blocking are not in this milestone. Checks that need a live clamd, a live MX or a second signature set are listed in [docs/VALIDATION.md](docs/VALIDATION.md).
 
 ## Why
 
@@ -59,6 +59,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/admin` | axum admin API and UI |
 | `crates/integrations` | Event export: syslog (RFC 5424, CEF), signed webhooks and Wedgetail. See [docs/events.md](docs/events.md) |
 | `crates/currawongd` | The daemon binary |
+| `crates/setup-tui` | `currawong-setup`, the first-run wizard |
 
 ## Roadmap
 
@@ -74,7 +75,9 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-CI config lives in `docs/ci/ci.yml` until it is moved into `.github/workflows/`.
+Packaging for the container image, Debian package, appliance image and Helm chart is described in [docs/packaging.md](docs/packaging.md). It is not yet verified end to end; see [docs/VALIDATION.md](docs/VALIDATION.md).
+
+CI config lives in `docs/ci/ci.yml` (checks) and `docs/ci/release.yml` (packaging) until it is moved into `.github/workflows/`.
 
 ## Licence
 
