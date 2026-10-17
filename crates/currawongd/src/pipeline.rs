@@ -1,11 +1,12 @@
 //! Auth, parse, scan and the M1 policy decision.
 use currawong_auth::AuthChecker;
 use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
-use currawong_parser::{parse::parse_bytes, ParseResponse};
+use currawong_parser::{parse::parse_bytes_with, ParseResponse};
 use currawong_policy::decide;
+use currawong_scan::engines::yara::{self, CompiledRules, PollWatcher};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
-    Scanner, WorkerPool,
+    Scanner, WorkerPool, YaraEngine,
 };
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
@@ -14,6 +15,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    pub yara: Option<Arc<YaraEngine>>,
+    _yara_watch: Option<PollWatcher>,
 }
 
 impl Pipeline {
@@ -26,7 +29,21 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        let yara = yara_engine(&cfg);
+        let _yara_watch = yara.as_ref().and_then(|engine| match engine.watch() {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                tracing::error!(%err, "yara hot reload disabled");
+                None
+            }
+        });
+        Self {
+            cfg,
+            auth,
+            pool,
+            yara,
+            _yara_watch,
+        }
     }
 
     pub async fn evaluate(
@@ -42,9 +59,12 @@ impl Pipeline {
             let verdict = decide(&report);
             return (report, verdict);
         }
-        let parsed = self.parse(env, raw, body_path).await;
+        let rules = self.yara.as_ref().map(|engine| engine.current());
+        let parsed = self.parse(env, raw, body_path, rules.as_deref()).await;
+        drop(rules);
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
+        report.yara = parsed.yara.clone();
         let parser_failed = parsed.error.is_some();
         if let Some(err) = parsed.error {
             report.notes.push(err);
@@ -63,6 +83,9 @@ impl Pipeline {
             })
             .await;
         outputs.push(finding("filetype", &result));
+        if self.yara.is_some() {
+            outputs.push(finding("yara", &yara::result_for(&report.yara)));
+        }
         if !self.cfg.scanner.clamd.address.is_empty() {
             match ClamdAddress::parse(&self.cfg.scanner.clamd.address) {
                 Ok(address) => {
@@ -138,17 +161,28 @@ impl Pipeline {
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
+        rules: Option<&CompiledRules>,
     ) -> ParseResponse {
         if let (Some(pool), Some(path)) = (self.pool.as_mut(), body_path) {
             return match pool
-                .scan_file(env.id.as_str(), path, &self.cfg.scanner.extract)
+                .scan_file_with_rules(
+                    env.id.as_str(),
+                    path,
+                    &self.cfg.scanner.extract,
+                    rules.map(CompiledRules::path),
+                )
                 .await
             {
                 ScanOutcome::Parsed(response) => response,
                 ScanOutcome::Failed { reason } => ParseResponse::failed(env.id.as_str(), reason),
             };
         }
-        parse_bytes(env.id.as_str(), raw, &self.cfg.scanner.extract)
+        parse_bytes_with(
+            env.id.as_str(),
+            raw,
+            &self.cfg.scanner.extract,
+            rules.map(|compiled| &compiled.rules),
+        )
     }
 }
 
@@ -157,6 +191,20 @@ fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {
         name: name.into(),
         result: result.clone(),
         required: false,
+    }
+}
+
+fn yara_engine(cfg: &Config) -> Option<Arc<YaraEngine>> {
+    let dir = &cfg.scanner.yara.rules_dir;
+    if !cfg.scanner.enabled || dir.as_os_str().is_empty() {
+        return None;
+    }
+    match YaraEngine::new(dir) {
+        Ok(engine) => Some(Arc::new(engine)),
+        Err(err) => {
+            tracing::error!(%err, "yara engine disabled");
+            None
+        }
     }
 }
 

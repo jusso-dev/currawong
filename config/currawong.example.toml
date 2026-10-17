@@ -62,6 +62,12 @@ key = "/etc/currawong/key.pem"
 # scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
 # scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310. Empty disables ClamAV.
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
+# scanner.yara.rules_dir: *.yar and *.yara files, matched against the raw
+# message and every part inside the parser worker. Changes are picked up
+# without a restart; a broken file is logged and the previous rules stay
+# active. Tags `malware` and `suspicious` quarantine; other matches are
+# recorded on the report for policy. Starter rules ship in rules/yara/.
+# Empty disables YARA.
 # scanner.extra_signature_dirs: on-premises supplemental signatures. Configure
 # clamd to load these as well (OfficialDatabaseOnly no). Mail stays on the box.
 # scanner.extra_database_paths: extra .cvd/.cld/.ndb files for the same purpose.
@@ -88,6 +94,9 @@ extra_database_paths = []
 [scanner.clamd]
 address = ""
 required = true
+
+[scanner.yara]
+rules_dir = ""
 
 [scanner.extract]
 max_depth = 5

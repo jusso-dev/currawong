@@ -123,6 +123,7 @@ pub struct ScannerConfig {
     pub job_timeout_secs: u64,
     pub worker_binary: Option<PathBuf>,
     pub clamd: ClamdConfig,
+    pub yara: YaraConfig,
     /// Directories of supplemental on-premises signatures (the SaneSecurity
     /// approach). Currawong does not upload mail. Point `clamd` at these
     /// paths as well; they are recorded and checked locally.
@@ -141,6 +142,14 @@ pub struct ClamdConfig {
     pub address: String,
     /// When the address is set, an unreachable engine fails closed.
     pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct YaraConfig {
+    /// Directory of `*.yar` and `*.yara` files, recompiled when it changes.
+    /// Empty disables the engine.
+    pub rules_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -311,6 +320,7 @@ impl Default for ScannerConfig {
             job_timeout_secs: 30,
             worker_binary: None,
             clamd: ClamdConfig::default(),
+            yara: YaraConfig::default(),
             extra_signature_dirs: Vec::new(),
             extra_database_paths: Vec::new(),
             blocked_extensions: default_blocked_extensions(),

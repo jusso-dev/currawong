@@ -1,6 +1,6 @@
 //! Isolated parser worker. Reads length-prefixed JSON requests on stdin.
 use bytes::Bytes;
-use currawong_parser::{parse_request, ParseRequest, ParseResponse};
+use currawong_parser::{parse_request, yara::RulesCache, ParseRequest, ParseResponse};
 use futures::StreamExt;
 use std::io;
 use tokio::io::{AsyncWriteExt, BufWriter};
@@ -15,6 +15,7 @@ async fn main() {
     install_sandbox();
     let stdin = tokio::io::stdin();
     let mut reader = FramedRead::new(stdin, LengthDelimitedCodec::new());
+    let mut rules = RulesCache::default();
     while let Some(frame) = reader.next().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -24,7 +25,7 @@ async fn main() {
             }
         };
         let response = match serde_json::from_slice::<ParseRequest>(&frame) {
-            Ok(request) => parse_request(&request),
+            Ok(request) => parse_request(&request, &mut rules),
             Err(err) => ParseResponse::failed("request", err.to_string()),
         };
         if write_one(&response).await.is_err() {

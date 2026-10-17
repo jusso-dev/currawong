@@ -7,7 +7,9 @@ pub mod secret;
 pub mod telemetry;
 
 pub use config::{Config, ConfigError};
-pub use report::{AuthMethodResult, AuthResults, EngineFinding, PartFlag, PartInfo, ScanReport};
+pub use report::{
+    AuthMethodResult, AuthResults, EngineFinding, PartFlag, PartInfo, ScanReport, YaraMatch,
+};
 pub use residency::{ResidencyError, ResidencyGuard, SignedReport};
 pub use secret::Secret;
 

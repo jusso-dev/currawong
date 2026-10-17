@@ -21,6 +21,9 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
         currawong_core::content::ObjectStoreClient::new(&guard, endpoint)
             .map_err(|err| err.to_string())?;
     }
+    if !cfg.scanner.yara.rules_dir.as_os_str().is_empty() {
+        currawong_scan::engines::yara::compile_dir(&cfg.scanner.yara.rules_dir)?;
+    }
     Ok(cfg)
 }
 

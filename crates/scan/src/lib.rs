@@ -13,6 +13,7 @@ pub mod url_rewrite;
 
 pub use clamav::{ClamdAddress, ClamdClient};
 pub use combine::{combine, EngineOutput};
+pub use engines::yara::YaraEngine;
 pub use engines::{Engine, EngineResult, ScanItem, Scanner};
 pub use filetype::FileTypeScanner;
 pub use pool::{ScanOutcome, WorkerPool};

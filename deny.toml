@@ -8,6 +8,17 @@ ignore = [
     # Key generation only, on the appliance. The rsa crate is not used to
     # decrypt network traffic. Signing uses mail-auth's aws-lc backend.
     "RUSTSEC-2023-0071",
+    # wasmtime 45, pinned by yara-x 1.21 (the latest). yara-x builds wasmtime
+    # with only `cranelift` and `runtime`: no component model, async, WASI or
+    # GC. It runs only wasm it generated from operator rules, never wasm from
+    # mail, in one engine. Drop these when yara-x moves to wasmtime >= 49.0.3.
+    "RUSTSEC-2026-0222", # type indices mixed between engines
+    "RUSTSEC-2026-0269", # WASI filesystem
+    "RUSTSEC-2026-0316", # component model
+    "RUSTSEC-2026-0327", # component model async
+    "RUSTSEC-2026-0359", # hostile wasm with recursive types
+    "RUSTSEC-2026-0362", # async entrypoints
+    "RUSTSEC-2026-0363", # component model handle tables
 ]
 
 [licenses]
@@ -23,6 +34,10 @@ allow = [
     "MPL-2.0",
     "Zlib",
     "CDLA-Permissive-2.0",
+    # wasmtime and cranelift, through yara-x.
+    "Apache-2.0 WITH LLVM-exception",
+    # notify, for YARA rule hot reload.
+    "CC0-1.0",
 ]
 confidence-threshold = 0.8
 

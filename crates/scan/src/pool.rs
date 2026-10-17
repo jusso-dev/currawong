@@ -56,10 +56,22 @@ impl WorkerPool {
         path: &Path,
         limits: &ExtractLimits,
     ) -> ScanOutcome {
+        self.scan_file_with_rules(id, path, limits, None).await
+    }
+
+    /// `yara_rules` is a serialised rule set from [`crate::YaraEngine`].
+    pub async fn scan_file_with_rules(
+        &mut self,
+        id: &str,
+        path: &Path,
+        limits: &ExtractLimits,
+        yara_rules: Option<&Path>,
+    ) -> ScanOutcome {
         let request = ParseRequest {
             id: id.to_string(),
             raw_path: path.to_path_buf(),
             limits: limits.clone(),
+            yara_rules: yara_rules.map(Path::to_path_buf),
         };
         let bytes = match serde_json::to_vec(&request) {
             Ok(bytes) => bytes,
