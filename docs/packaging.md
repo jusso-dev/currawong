@@ -1,6 +1,6 @@
 # Packaging
 
-Currawong ships as a container image, a Debian 12 package, an appliance disk image and a Helm chart. `docs/ci/release.yml` builds and checks all four. What has and has not been run is in `docs/VALIDATION.md`.
+Currawong ships as a container image, a Debian 12 package, an appliance disk image and a Helm chart. `.github/workflows/release.yml` builds and checks all four. What has and has not been run is in `docs/VALIDATION.md`.
 
 Every form runs the same two binaries: `currawongd` and `currawong-parser-worker`, installed side by side in `/usr/bin` because the daemon looks for the worker next to its own executable. Config lives in `/etc/currawong/currawong.toml`, the spool in `/var/spool/currawong`, and SQLite state (greylist, relay credentials, residency reports) in `/var/lib/currawong`.
 

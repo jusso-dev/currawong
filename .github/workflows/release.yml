@@ -1,5 +1,4 @@
 # Packaging and release: container image, Debian package, appliance image, Helm chart.
-# Move to .github/workflows/release.yml once a token with workflow scope is available.
 # The container, deb-install and appliance jobs each check one #46 acceptance
 # criterion and fail with an ::error:: line when it is not met.
 name: release

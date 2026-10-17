@@ -553,8 +553,16 @@ impl Pipeline {
         let raw = raw[..raw.len().min(MAX_RAW_BYTES + 1)].to_vec();
         let sender = env.mail_from.clone();
         let urls = report.urls.clone();
+        let bec =
+            (env.direction == Direction::Inbound).then(|| currawong_classify::bec::BecContext {
+                dmarc_failed: report
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.dmarc.result.eq_ignore_ascii_case("fail")),
+                ..Default::default()
+            });
         match tokio::task::spawn_blocking(move || {
-            classifier.classify(&tenant, &raw, &sender, &urls)
+            classifier.classify_with(&tenant, &raw, &sender, &urls, bec)
         })
         .await
         {
@@ -565,6 +573,7 @@ impl Pipeline {
                 }
                 report.spam = result.spam;
                 report.lookalikes = result.lookalikes;
+                report.bec = result.bec;
                 report.flags.extend(result.flags);
                 report.notes.extend(result.notes);
             }
@@ -621,6 +630,46 @@ impl Pipeline {
             &self.cfg.scanner.extract,
             rules.map(|compiled| &compiled.rules),
         )
+    }
+}
+
+impl Pipeline {
+    /// The From address to remember for BEC first-time sender checks:
+    /// inbound mail whose SPF or DMARC passed, so a forged From cannot
+    /// pre-seed the history.
+    pub fn history_sender(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &ScanReport,
+    ) -> Option<String> {
+        if env.direction != Direction::Inbound || self.classifier.is_none() {
+            return None;
+        }
+        let auth = report.auth.as_ref()?;
+        let passed = auth.spf.result.eq_ignore_ascii_case("pass")
+            || auth.dmarc.result.eq_ignore_ascii_case("pass");
+        if !passed {
+            return None;
+        }
+        currawong_classify::message::from_address(raw)
+    }
+
+    /// Inbound mail handed to delivery: later mail from the same From
+    /// address is no longer a first-time sender.
+    pub async fn record_delivery(&self, env: &Envelope, sender: &str, recipients: Vec<String>) {
+        if env.direction != Direction::Inbound || recipients.is_empty() {
+            return;
+        }
+        let Some(classifier) = self.classifier.clone() else {
+            return;
+        };
+        let tenant = tenant_context(&self.cfg, env);
+        let sender = sender.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            classifier.record_delivery(&tenant, &sender, &recipients)
+        })
+        .await;
     }
 }
 

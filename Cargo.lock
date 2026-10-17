@@ -1237,6 +1237,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-security",
  "url",
 ]
 

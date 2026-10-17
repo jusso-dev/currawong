@@ -22,7 +22,9 @@
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).
 //! - scores: `spam` (the classify total: Bayes points plus rule scores) and
-//!   `lookalike` (the strongest finding, 0 to 1). Reserved: `bec`.
+//!   `lookalike` (the strongest finding, 0 to 1); `bec` (0 to 1, inbound only)
+//!   with flags `bec.<reason>` such as `bec.display_name_spoof` and
+//!   `bec.payment_change`.
 use currawong_core::{AuthResults, PartFlag, ScanReport};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -59,6 +61,12 @@ impl Signals {
         }
         if let Some(spam) = &report.spam {
             signals.score("spam", spam.total);
+        }
+        if let Some(bec) = &report.bec {
+            signals.score("bec", bec.score);
+            for reason in &bec.reasons {
+                signals.flag(&format!("bec.{}", reason.as_str()));
+            }
         }
         if let Some(strongest) = report.lookalikes.iter().map(|f| f.score).reduce(f64::max) {
             signals.flag("lookalike");
