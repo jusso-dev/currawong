@@ -32,11 +32,17 @@ base64 = { workspace = true }
 time = { workspace = true }
 mail-send = { workspace = true }
 mail-builder = { workspace = true }
-hickory-resolver = { workspace = true, features = ["tokio", "system-config"] }
+hickory-resolver = { workspace = true, features = ["tokio", "system-config", "dnssec-aws-lc-rs"] }
+mail-auth = { workspace = true }
+rustls-webpki = { workspace = true }
+webpki-roots = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
 pin-project-lite = { workspace = true }
 rand = { workspace = true }
 metrics = { workspace = true }
 libc = { workspace = true }
+ulid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
