@@ -120,27 +120,36 @@ HTTP exporters require `https`, ignore proxy environment variables and always ve
 
 ## Configuration
 
-`ExportConfig` deserialises this TOML:
+The `[events]` section of the main configuration (`crates/core/src/config.rs`, commented example in `config/currawong.example.toml`):
 
 ```toml
+[events]
 queue_capacity = 1024
 batch_size = 100
-overflow_dir = "/var/lib/currawong/events"
 overflow_max_files = 100000
+# overflow_dir defaults to <spool.dir>/events
 
-[syslog]
+[events.syslog]
 address = "siem.corp.example:6514"
 tls = true
 # ca_file = "/etc/currawong/siem-ca.pem"
 payload = "cef"            # or "json"
 
-[webhook]
+[events.webhook]
 url = "https://10.20.0.5/currawong"
 secret_file = "/etc/currawong/webhook.key"
 
-[wedgetail]
+[events.wedgetail]
 url = "https://wedgetail.corp.example/api/ingest/ocsf"
 token_file = "/etc/currawong/wedgetail.token"
 ```
 
-The daemon does not read this section yet. See "Not run, and why" in `docs/VALIDATION.md`.
+`currawongd --check-config` checks the shape of each sink (host and port for syslog, `https` for the webhook and Wedgetail) and runs every destination through the residency guard. A foreign SIEM fails the check. At start-up the daemon builds the sinks and installs the event bus. On shutdown it keeps sending for up to 10 seconds, then writes what is still queued, including a batch whose send it abandons, to the overflow for the next start.
+
+## Emitters
+
+| Event | Emitted by |
+| --- | --- |
+| `message_verdict` | The scheduler, after each verdict is applied (deliver, quarantine hold, reject, discard, defer). Split messages emit one per recipient group |
+| `admin_action` | `policy.reload` when the policy files or database change. Actor is `policy-store` until the admin API exists |
+| `quarantine_release`, `url_click`, `verdict_changed`, other admin actions | Not yet: release, click-time protection and the admin API are not built. TODO hooks are in `crates/quarantine`, `crates/scan/src/url_rewrite.rs` and `crates/admin` |

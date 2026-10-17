@@ -2,7 +2,6 @@
 use super::{cef, tls, Event, ExportError, Exporter};
 use currawong_core::ResidencyGuard;
 use rustls::pki_types::ServerName;
-use serde::{Deserialize, Serialize};
 use std::{path::Path, sync::Arc, time::Duration};
 use time::{macros::format_description, UtcOffset};
 use tokio::{
@@ -18,13 +17,8 @@ const FACILITY: u8 = 16;
 const APP_NAME: &str = "currawong";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Payload {
-    #[default]
-    Cef,
-    Json,
-}
+/// The MSG part: the CEF line (default) or the JSON event.
+pub use currawong_core::config::EventPayload as Payload;
 
 type Conn = Box<dyn AsyncWrite + Unpin + Send>;
 

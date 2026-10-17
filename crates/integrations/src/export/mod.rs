@@ -15,12 +15,12 @@ pub mod wedgetail;
 mod testutil;
 
 pub use bus::{BusOptions, EventBus};
+pub use currawong_core::config::EventsConfig;
 pub use event::{Event, EventKind, SCHEMA};
 
 use currawong_core::{ResidencyError, ResidencyGuard, Secret};
-use serde::{Deserialize, Serialize};
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -41,72 +41,6 @@ pub trait Exporter: Send + Sync {
     async fn send(&self, batch: &[Event]) -> Result<(), ExportError>;
 }
 
-/// `[events]` settings. Exporters are off unless configured.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct ExportConfig {
-    /// Events held in memory per exporter before overflowing to disk.
-    pub queue_capacity: usize,
-    pub batch_size: usize,
-    pub overflow_dir: PathBuf,
-    /// Events held on disk per exporter before new events are dropped.
-    pub overflow_max_files: usize,
-    pub syslog: Option<SyslogConfig>,
-    pub webhook: Option<WebhookConfig>,
-    pub wedgetail: Option<WedgetailConfig>,
-}
-
-impl Default for ExportConfig {
-    fn default() -> Self {
-        Self {
-            queue_capacity: 1024,
-            batch_size: 100,
-            overflow_dir: PathBuf::from("/var/lib/currawong/events"),
-            overflow_max_files: 100_000,
-            syslog: None,
-            webhook: None,
-            wedgetail: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SyslogConfig {
-    /// `host:port`, for example `siem.corp.example:6514`.
-    pub address: String,
-    #[serde(default = "default_true")]
-    pub tls: bool,
-    /// PEM bundle for a private CA. Public roots are always trusted.
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-    #[serde(default)]
-    pub payload: syslog::Payload,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebhookConfig {
-    pub url: String,
-    /// File holding the HMAC key (at least 16 bytes, trailing newline ignored).
-    pub secret_file: PathBuf,
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WedgetailConfig {
-    pub url: String,
-    pub token_file: PathBuf,
-    #[serde(default)]
-    pub ca_file: Option<PathBuf>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
 fn read_secret(path: &Path) -> Result<Secret<String>, ExportError> {
     let text = std::fs::read_to_string(path)
         .map_err(|err| ExportError::Config(format!("{}: {err}", path.display())))?;
@@ -114,12 +48,13 @@ fn read_secret(path: &Path) -> Result<Secret<String>, ExportError> {
 }
 
 impl EventBus {
-    /// Build the configured exporters and start their workers.
-    /// `hostname` is the gateway name written into syslog headers.
+    /// Build the configured exporters and start their workers. `hostname` is
+    /// the gateway name written into syslog headers.
     pub fn from_config(
-        cfg: &ExportConfig,
+        cfg: &EventsConfig,
         guard: Arc<ResidencyGuard>,
         hostname: &str,
+        overflow_dir: &Path,
     ) -> Result<Self, ExportError> {
         let mut exporters: Vec<Arc<dyn Exporter>> = Vec::new();
         if let Some(s) = &cfg.syslog {
@@ -152,7 +87,7 @@ impl EventBus {
         let opts = BusOptions {
             queue_capacity: cfg.queue_capacity,
             batch_size: cfg.batch_size,
-            overflow_dir: cfg.overflow_dir.clone(),
+            overflow_dir: overflow_dir.to_path_buf(),
             overflow_max_files: cfg.overflow_max_files,
             retry_initial: Duration::from_secs(1),
             retry_max: Duration::from_secs(60),
@@ -176,6 +111,15 @@ pub fn emit(event: Event) {
     }
 }
 
+/// On shutdown: stop sending and move queued events to the overflow, which is
+/// sent on the next start. See [`EventBus::flush`].
+pub async fn flush(timeout: Duration) -> bool {
+    match BUS.get() {
+        Some(bus) => bus.flush(timeout).await,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,15 +132,14 @@ mod tests {
         let secret_file = dir.path().join("hook.key");
         std::fs::write(&secret_file, "0123456789abcdef-secret\n").unwrap();
         let toml_text = format!(
-            "queue_capacity = 8\noverflow_dir = {:?}\n[webhook]\nurl = {:?}\nsecret_file = {:?}\nca_file = {:?}\n",
-            dir.path().join("overflow"),
+            "queue_capacity = 8\n[webhook]\nurl = {:?}\nsecret_file = {:?}\nca_file = {:?}\n",
             server.url("/events"),
             secret_file,
             server.ca_file,
         );
-        let cfg: ExportConfig = toml::from_str(&toml_text).unwrap();
+        let cfg: EventsConfig = toml::from_str(&toml_text).unwrap();
         let guard = Arc::new(ResidencyGuard::from_config(&ResidencyConfig::default()).unwrap());
-        let bus = EventBus::from_config(&cfg, guard, "gw1").unwrap();
+        let bus = EventBus::from_config(&cfg, guard, "gw1", &dir.path().join("overflow")).unwrap();
         install(bus).ok().expect("first install");
         emit(event::tests::samples().remove(0));
         for _ in 0..500 {
@@ -218,7 +161,7 @@ mod tests {
 
     #[test]
     fn export_config_defaults_have_no_exporters() {
-        let cfg: ExportConfig = toml::from_str("").unwrap();
+        let cfg: EventsConfig = toml::from_str("").unwrap();
         assert!(cfg.syslog.is_none() && cfg.webhook.is_none() && cfg.wedgetail.is_none());
         assert_eq!(cfg.queue_capacity, 1024);
     }

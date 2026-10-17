@@ -17,7 +17,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 #[derive(Debug, Clone)]
 pub struct BusOptions {
@@ -31,6 +31,8 @@ pub struct BusOptions {
 
 pub struct EventBus {
     sinks: Vec<Sink>,
+    /// Set by `flush`: workers stop sending and write queued events to the overflow.
+    closing: watch::Sender<bool>,
 }
 
 struct Sink {
@@ -38,12 +40,15 @@ struct Sink {
     tx: mpsc::Sender<Event>,
     overflow: Arc<Overflow>,
     dropped: Arc<AtomicU64>,
+    /// Events in the queue or in a batch being sent.
+    pending: Arc<AtomicUsize>,
 }
 
 impl EventBus {
     /// Start one worker per exporter. Must be called inside a Tokio runtime.
     pub fn start(exporters: Vec<Arc<dyn Exporter>>, opts: &BusOptions) -> std::io::Result<Self> {
         let mut sinks = Vec::new();
+        let (closing, closing_rx) = watch::channel(false);
         for exporter in exporters {
             let name = exporter.name();
             let overflow = Arc::new(Overflow::open(
@@ -52,11 +57,14 @@ impl EventBus {
             )?);
             let (tx, rx) = mpsc::channel(opts.queue_capacity.max(1));
             let dropped = Arc::new(AtomicU64::new(0));
+            let pending = Arc::new(AtomicUsize::new(0));
             tokio::spawn(run(
                 exporter,
                 rx,
                 overflow.clone(),
                 dropped.clone(),
+                pending.clone(),
+                closing_rx.clone(),
                 opts.clone(),
             ));
             sinks.push(Sink {
@@ -64,23 +72,65 @@ impl EventBus {
                 tx,
                 overflow,
                 dropped,
+                pending,
             });
         }
-        Ok(Self { sinks })
+        Ok(Self { sinks, closing })
     }
 
     pub fn emit(&self, event: Event) {
         for sink in &self.sinks {
+            sink.pending.fetch_add(1, Ordering::Relaxed);
             match sink.tx.try_send(event.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(event)) => {
+                    sink.pending.fetch_sub(1, Ordering::Relaxed);
                     if !sink.overflow.push(&event) {
                         sink.drop_one();
                     }
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => sink.drop_one(),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    sink.pending.fetch_sub(1, Ordering::Relaxed);
+                    sink.drop_one();
+                }
             }
         }
+    }
+
+    /// For shutdown: keep sending for up to `timeout`, then stop and move what
+    /// is still queued to the overflow, which is sent on the next start.
+    /// True when nothing was left only in memory.
+    pub async fn flush(&self, timeout: Duration) -> bool {
+        if self.drained_within(timeout).await {
+            return true;
+        }
+        self.closing.send_replace(true);
+        let drained = self.drained_within(Duration::from_secs(2)).await;
+        if !drained {
+            tracing::warn!(
+                events = self.pending(),
+                "event flush timed out, events still in flight are lost"
+            );
+        }
+        drained
+    }
+
+    fn pending(&self) -> usize {
+        self.sinks
+            .iter()
+            .map(|sink| sink.pending.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    async fn drained_within(&self, timeout: Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.pending() > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
     }
 
     /// Events dropped so far by the named exporter.
@@ -114,14 +164,20 @@ async fn run(
     mut rx: mpsc::Receiver<Event>,
     overflow: Arc<Overflow>,
     dropped: Arc<AtomicU64>,
+    pending: Arc<AtomicUsize>,
+    mut closing: watch::Receiver<bool>,
     opts: BusOptions,
 ) {
     let batch_size = opts.batch_size.max(1);
     let mut backoff = opts.retry_initial;
     loop {
-        // Older events on disk go first.
-        let (files, mut batch): (Vec<PathBuf>, Vec<Event>) =
-            overflow.load(batch_size).into_iter().unzip();
+        let closing_now = is_closing(&closing);
+        // Older events on disk go first. They stay there while closing.
+        let (files, mut batch): (Vec<PathBuf>, Vec<Event>) = if closing_now {
+            (Vec::new(), Vec::new())
+        } else {
+            overflow.load(batch_size).into_iter().unzip()
+        };
         if batch.is_empty() {
             match rx.recv().await {
                 Some(event) => batch.push(event),
@@ -134,25 +190,52 @@ async fn run(
                 }
             }
         }
-        match exporter.send(&batch).await {
+        let queued = if files.is_empty() { batch.len() } else { 0 };
+        if is_closing(&closing) && files.is_empty() {
+            spill(&overflow, &batch, &dropped, exporter.name());
+            pending.fetch_sub(queued, Ordering::Relaxed);
+            continue;
+        }
+        // Closing abandons a send in flight. The batch is kept on disk, so the
+        // SIEM may see it twice, which at-least-once delivery allows.
+        let sent = tokio::select! {
+            sent = exporter.send(&batch) => sent,
+            _ = closing.wait_for(|closing| *closing) => {
+                Err(super::ExportError::Transport("shutting down".into()))
+            }
+        };
+        match sent {
             Ok(()) => {
                 overflow.remove(&files);
+                pending.fetch_sub(queued, Ordering::Relaxed);
                 backoff = opts.retry_initial;
             }
             Err(err) => {
                 tracing::warn!(sink = exporter.name(), %err, events = batch.len(), "event export failed");
                 if files.is_empty() {
-                    for event in &batch {
-                        if !overflow.push(event) {
-                            dropped.fetch_add(1, Ordering::Relaxed);
-                            metrics::counter!("currawong_events_dropped_total", "sink" => exporter.name())
-                                .increment(1);
-                        }
-                    }
+                    spill(&overflow, &batch, &dropped, exporter.name());
                 }
-                tokio::time::sleep(backoff).await;
+                pending.fetch_sub(queued, Ordering::Relaxed);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff) => {}
+                    _ = closing.wait_for(|closing| *closing) => {}
+                }
                 backoff = (backoff * 2).min(opts.retry_max);
             }
+        }
+    }
+}
+
+/// Closing was requested, or the bus is gone.
+fn is_closing(closing: &watch::Receiver<bool>) -> bool {
+    *closing.borrow() || closing.has_changed().is_err()
+}
+
+fn spill(overflow: &Overflow, batch: &[Event], dropped: &AtomicU64, sink: &'static str) {
+    for event in batch {
+        if !overflow.push(event) {
+            dropped.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!("currawong_events_dropped_total", "sink" => sink).increment(1);
         }
     }
 }
@@ -381,6 +464,36 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn export_bus_flush_moves_queued_events_to_disk_for_the_next_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let stuck = SlowSink::new(false, 0);
+        let bus = EventBus::start(vec![stuck.clone()], &opts(dir.path(), 16, 100)).unwrap();
+        for n in 0..8 {
+            bus.emit(event(n));
+        }
+        // The batch stuck in a send and the events still queued all go to disk.
+        assert!(bus.flush(Duration::from_millis(100)).await);
+        assert_eq!(bus.overflowed("slow"), 8);
+        assert_eq!(stuck.seen(), 0);
+        drop(bus);
+
+        let sink = SlowSink::new(true, 0);
+        let _restarted = EventBus::start(vec![sink.clone()], &opts(dir.path(), 16, 100)).unwrap();
+        wait_for(|| sink.seen() == 8).await;
+
+        // A healthy sink is simply drained.
+        let dir = tempfile::tempdir().unwrap();
+        let sink = SlowSink::new(true, 0);
+        let bus = EventBus::start(vec![sink.clone()], &opts(dir.path(), 16, 100)).unwrap();
+        for n in 0..8 {
+            bus.emit(event(n));
+        }
+        assert!(bus.flush(Duration::from_secs(5)).await);
+        assert_eq!(sink.seen(), 8);
+        assert_eq!(bus.overflowed("slow"), 0);
     }
 
     #[test]

@@ -70,6 +70,16 @@ pub struct EngineFinding {
     pub detail: String,
 }
 
+/// A YARA rule that matched the raw message, a MIME part or an archive member.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct YaraMatch {
+    pub rule: String,
+    pub namespace: String,
+    pub tags: Vec<String>,
+    /// File name, content type, or `message` for the raw message.
+    pub part: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     pub message_id: MessageId,
@@ -77,6 +87,9 @@ pub struct ScanReport {
     pub parts: Vec<PartInfo>,
     pub urls: Vec<String>,
     pub engines: Vec<EngineFinding>,
+    /// Every YARA rule match, for policy to act on by rule name or tag.
+    #[serde(default)]
+    pub yara: Vec<YaraMatch>,
     pub malware: bool,
     pub active_content: bool,
     /// Parser crash, limit or a hard scanner error. Policy quarantines.
@@ -94,6 +107,7 @@ impl ScanReport {
             parts: Vec::new(),
             urls: Vec::new(),
             engines: Vec::new(),
+            yara: Vec::new(),
             malware: false,
             active_content: false,
             fail_closed: false,

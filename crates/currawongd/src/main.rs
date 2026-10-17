@@ -34,6 +34,12 @@ async fn main() {
         }
     };
     if args.check_config {
+        if let Ok(Some(summary)) = currawongd::yara_summary(&cfg) {
+            println!("yara: {summary}");
+            for warning in &summary.warnings {
+                println!("yara warning: {warning}");
+            }
+        }
         println!("configuration ok");
         return;
     }
@@ -45,7 +51,8 @@ async fn main() {
 }
 
 async fn run(cfg: currawong_core::Config) -> Result<(), String> {
-    let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
+    let guard =
+        Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?);
     guard
         .enforce_startup(&cfg.residency.content_endpoints)
         .map_err(|err| err.to_string())?;
@@ -62,6 +69,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             .await
             .map_err(|err| err.to_string())?;
     }
+    currawongd::start_events(&cfg, Arc::clone(&guard))?;
     let cfg = Arc::new(cfg);
     let spool = Arc::new(
         Spool::open(&cfg.spool.dir)
@@ -96,7 +104,9 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    pipeline.reload_policies().await?;
+    tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -112,6 +122,27 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         loop {
             if shutdown_loop.is_cancelled() {
                 break;
+            }
+            match pipeline.reload_policies().await {
+                Ok(true) => {
+                    tracing::info!("policies reloaded");
+                    // No admin API yet: the policy files or database changed.
+                    // TODO: emit the admin user once the admin API exists.
+                    currawong_integrations::export::emit(
+                        currawong_integrations::export::Event::new(
+                            None,
+                            currawong_integrations::export::EventKind::AdminAction {
+                                actor: "policy-store".into(),
+                                action: "policy.reload".into(),
+                                target: format!("{} policies", pipeline.policies.policies.len()),
+                            },
+                        ),
+                    );
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::error!(%err, "policy reload failed, keeping the previous policies")
+                }
             }
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");
@@ -148,6 +179,8 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         });
     }
     while set.join_next().await.is_some() {}
+    // Events not sent by now stay in the overflow and go out on the next start.
+    currawong_integrations::export::flush(Duration::from_secs(10)).await;
     Ok(())
 }
 
