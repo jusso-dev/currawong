@@ -1,0 +1,1 @@
+CEF:0|Currawong|Currawong Gateway|0.0.1|message_verdict|Message verdict|7|rt=1792195200000 externalId=01JA0000000000000000000001 cs1Label=tenant cs1=tenant-a cs2Label=messageId cs2=01JA00000000000000000000M1 act=quarantine suser=billing@example.net duser=ap@example.com.au,cfo@example.com.au deviceDirection=0 reason=malware\=Eicar|Test\\Sig a\=b\nnext

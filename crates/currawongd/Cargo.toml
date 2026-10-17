@@ -15,6 +15,7 @@ currawong-parser-worker = { path = "../parser-worker" }
 currawong-policy = { path = "../policy" }
 currawong-quarantine = { path = "../quarantine" }
 currawong-dlp = { path = "../dlp" }
+currawong-integrations = { path = "../integrations" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

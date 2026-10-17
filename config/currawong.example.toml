@@ -304,3 +304,29 @@ forward_domains = []
 enabled = true
 scan_inbound = false
 min_confidence = 50
+
+# events: export to SIEMs (schema in docs/events.md). Every sink is off until configured.
+# Each sink has its own bounded queue; overflow goes to disk (default <spool.dir>/events),
+# then events are dropped and counted. Every destination must pass the residency rules.
+[events]
+queue_capacity = 1024
+batch_size = 100
+overflow_max_files = 100000
+# overflow_dir = "/var/lib/currawong/events"
+
+# RFC 5424 over TLS (or tls = false for plain TCP). payload = "cef" or "json".
+# [events.syslog]
+# address = "siem.corp.example:6514"
+# tls = true
+# ca_file = "/etc/currawong/siem-ca.pem"
+# payload = "cef"
+
+# HMAC-SHA256 signed webhook. The key file holds at least 16 bytes.
+# [events.webhook]
+# url = "https://10.20.0.5/currawong"
+# secret_file = "/etc/currawong/webhook.key"
+
+# Wedgetail: OCSF over HTTPS with a bearer token.
+# [events.wedgetail]
+# url = "https://wedgetail.corp.example/api/ingest/ocsf"
+# token_file = "/etc/currawong/wedgetail.token"
