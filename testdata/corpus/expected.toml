@@ -1,25 +1,42 @@
-# Honest M1 verdicts. Spam, phish, BEC and DLP are not blocking decisions yet.
+# Verdicts the gateway gives today, through SMTP and the scan pipeline with
+# the default policy pack. `reason` is the quarantine reason, matched as a
+# substring. Entries marked TODO change when the named stage lands; update
+# the verdict in the same change so this file stays honest.
 
 [clean]
 file = "clean.eml"
 verdict = "deliver"
 
+# TODO(#33): spam scoring. The default pack quarantines spam >= 8.0 and
+# tags 5.0 to 8.0 once the spam stage reports a `spam` score.
 [spam]
 file = "spam.eml"
 verdict = "deliver"
 
+# TODO(#29, #27, #30): URL, HTML smuggling and lookalike checks.
 [phish]
 file = "phish.eml"
 verdict = "deliver"
 
+# TODO(#31, #32): BEC heuristics and the LLM classifier.
 [bec]
 file = "bec.eml"
 verdict = "deliver"
 
+# TODO(#34, #36): the TFN sample and PSPF marking go to DLP review once the
+# DLP stage reports `dlp.<kind>` counts and markings to the policy engine.
 [dlp]
 file = "dlp.eml"
 verdict = "deliver"
 
+# The `active-content` policy acts on this today.
+[macro]
+file = "macro.eml"
+verdict = "quarantine"
+reason = "active-content"
+
+# The built-in malware floor acts on this today (fake clamd in the test).
 [eicar]
 file = "generated-at-test-time"
 verdict = "quarantine"
+reason = "malware"

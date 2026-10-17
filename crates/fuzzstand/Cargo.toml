@@ -3,10 +3,16 @@ name = "currawong-fuzzstand"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "cargo test stand-in for the cargo-fuzz targets. Does not need libfuzzer."
+description = "Fuzz entry points for fuzz/ and their cargo test stand-in. Does not need libfuzzer."
 
 [dependencies]
+currawong-core = { path = "../core" }
 currawong-smtp = { path = "../smtp" }
 currawong-parser-worker = { path = "../parser-worker" }
 currawong-scan = { path = "../scan" }
 currawong-dlp = { path = "../dlp" }
+currawong-auth = { path = "../auth" }
+currawong-spool = { path = "../spool" }
+bytes = { workspace = true }
+serde_json = { workspace = true }
+tokio-util = { workspace = true }
