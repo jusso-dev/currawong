@@ -6,6 +6,7 @@ use time::OffsetDateTime;
 
 use crate::pipeline::{auth_header, Pipeline};
 
+/// One bad message is logged and skipped; it does not block the rest.
 pub async fn classify_pending(
     spool: &Spool,
     pipeline: &mut Pipeline,
@@ -19,7 +20,10 @@ pub async fn classify_pending(
         if env.pipeline == "deliver" || env.pipeline == "quarantine" {
             continue;
         }
-        classify_one(spool, pipeline, quarantine, env).await?;
+        let id = env.id.clone();
+        if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
+            tracing::error!(%id, %err, "pipeline failed for message");
+        }
     }
     let deferred = spool
         .list(SpoolState::Deferred)
@@ -36,7 +40,10 @@ pub async fn classify_pending(
         }
         let mut env = env;
         env.state = SpoolState::Deferred;
-        classify_one(spool, pipeline, quarantine, env).await?;
+        let id = env.id.clone();
+        if let Err(err) = classify_one(spool, pipeline, quarantine, env).await {
+            tracing::error!(%id, %err, "pipeline failed for message");
+        }
     }
     Ok(())
 }

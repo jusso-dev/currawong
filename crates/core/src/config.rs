@@ -202,6 +202,11 @@ pub struct DeliveryConfig {
     pub max_age_days: u64,
     /// Hook for a later MTA-STS policy. M1 does not enforce DANE or MTA-STS.
     pub require_tls: bool,
+    /// Messages delivered at once in one pass.
+    pub max_concurrent: usize,
+    /// Allow MX answers that point at loopback, private or other non-public
+    /// addresses. Off by default so DNS cannot aim delivery inward.
+    pub allow_private_mx: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -388,6 +393,8 @@ impl Default for DeliveryConfig {
             poll_secs: 30,
             max_age_days: 5,
             require_tls: false,
+            max_concurrent: 16,
+            allow_private_mx: false,
         }
     }
 }

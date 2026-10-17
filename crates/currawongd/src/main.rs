@@ -116,7 +116,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");
             }
-            if let Err(err) = deliver_ready(&deliverer).await {
+            if let Err(err) = deliverer.poll_due().await {
                 tracing::error!(%err, "delivery pass failed");
             }
             tokio::select! {
@@ -148,24 +148,6 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         });
     }
     while set.join_next().await.is_some() {}
-    Ok(())
-}
-
-async fn deliver_ready(deliverer: &Deliverer<HickoryDns>) -> Result<(), String> {
-    use currawong_spool::SpoolState;
-    use currawongd::ready_to_deliver;
-    for state in [SpoolState::Incoming, SpoolState::Deferred] {
-        for env in deliverer
-            .spool
-            .list(state)
-            .await
-            .map_err(|err| err.to_string())?
-        {
-            if ready_to_deliver(&env) {
-                let _ = deliverer.deliver(&env.id).await;
-            }
-        }
-    }
     Ok(())
 }
 

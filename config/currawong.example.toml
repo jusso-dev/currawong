@@ -138,10 +138,15 @@ next_hop = "127.0.0.1:2526"
 # delivery.poll_secs: how often deferred mail is retried.
 # delivery.max_age_days: then a DSN, never to the null sender.
 # delivery.require_tls: hook only. MTA-STS and DANE are not enforced in M1.
+# delivery.max_concurrent: messages delivered at once in one pass.
+# delivery.allow_private_mx: accept MX answers that point at loopback or
+# private addresses. Leave off unless the next hops are internal by design.
 [delivery]
 poll_secs = 30
 max_age_days = 5
 require_tls = false
+max_concurrent = 16
+allow_private_mx = false
 
 # checks.*_enabled: each pre-DATA check can be turned off.
 # checks.allow_cidrs: skip DNSBL, greylisting and reputation.

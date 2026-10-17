@@ -107,6 +107,42 @@ async fn pending_mail_is_not_marked_deliver_before_the_pipeline() {
     assert!(listed.iter().all(ready_to_deliver), "{listed:?}");
 }
 
+#[tokio::test]
+async fn one_unreadable_message_does_not_block_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    let spool = Arc::new(Spool::open(&cfg.spool.dir).await.unwrap());
+    for id in [
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+    ] {
+        let mut env = envelope("user@example.test");
+        env.id = currawong_core::MessageId(id.into());
+        spool
+            .accept(env, Cursor::new(text_message()))
+            .await
+            .unwrap();
+        // The body vanishes, so reading it fails for this message.
+        let eml = spool.root().join("incoming").join(format!("{id}.eml"));
+        std::fs::remove_file(eml).unwrap();
+    }
+    let good = envelope("user@example.test");
+    spool
+        .accept(good.clone(), Cursor::new(text_message()))
+        .await
+        .unwrap();
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let quarantine = QuarantineStore::open(dir.path().join("held")).unwrap();
+    classify_pending(&spool, &mut pipeline, &quarantine)
+        .await
+        .unwrap();
+    assert!(ready_to_deliver(&spool.load(&good.id).await.unwrap()));
+}
+
 #[test]
 fn example_config_checks_and_foreign_bucket_fails() {
     let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
