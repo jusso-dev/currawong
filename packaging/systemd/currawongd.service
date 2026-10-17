@@ -10,7 +10,8 @@ User=currawong
 Group=currawong
 ExecStartPre=/usr/bin/currawongd --config /etc/currawong/currawong.toml --check-config
 ExecStart=/usr/bin/currawongd --config /etc/currawong/currawong.toml
-# SIGHUP reloads the TLS certificate and key.
+# SIGHUP reloads the TLS certificate and key (the tls.acme cache when ACME
+# is on). Listeners stay open; a pair that does not load is ignored.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s

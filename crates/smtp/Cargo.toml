@@ -43,9 +43,12 @@ rand = { workspace = true }
 metrics = { workspace = true }
 libc = { workspace = true }
 ulid = { workspace = true }
+instant-acme = { workspace = true }
+x509-parser = { workspace = true }
+http = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-rcgen = { workspace = true }
+rcgen = { workspace = true, features = ["x509-parser"] }
 tokio = { workspace = true, features = ["test-util"] }
 currawong-core = { path = "../core" }
