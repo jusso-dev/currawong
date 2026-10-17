@@ -34,6 +34,12 @@ async fn main() {
         }
     };
     if args.check_config {
+        if let Ok(Some(summary)) = currawongd::yara_summary(&cfg) {
+            println!("yara: {summary}");
+            for warning in &summary.warnings {
+                println!("yara warning: {warning}");
+            }
+        }
         println!("configuration ok");
         return;
     }

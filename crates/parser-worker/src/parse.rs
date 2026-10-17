@@ -3,18 +3,27 @@ use crate::archive::{self, passwords_from_message};
 use crate::filetype::{self, FileKind};
 use crate::ipc::{ParseRequest, ParseResponse};
 use crate::office;
+use crate::yara::{RulesCache, YaraScan};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use mail_parser::{MessageParser, MimeHeaders, PartType};
 use std::fs;
+use yara_x::Rules;
 
-pub fn parse_request(req: &ParseRequest) -> ParseResponse {
+pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseResponse {
     let raw = match fs::read(&req.raw_path) {
         Ok(raw) => raw,
         Err(err) => return ParseResponse::failed(&req.id, format!("read input: {err}")),
     };
+    let rules = match req.yara_generation {
+        Some(generation) => match cache.get(generation) {
+            Ok(rules) => Some(rules),
+            Err(err) => return ParseResponse::failed(&req.id, err),
+        },
+        None => None,
+    };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_bytes(&req.id, &raw, &req.limits)
+        parse_bytes_with(&req.id, &raw, &req.limits, rules)
     })) {
         Ok(response) => response,
         Err(_) => ParseResponse::failed(&req.id, "parser panicked"),
@@ -22,9 +31,24 @@ pub fn parse_request(req: &ParseRequest) -> ParseResponse {
 }
 
 pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseResponse {
+    parse_bytes_with(id, raw, limits, None)
+}
+
+/// Parse, and match YARA rules against the raw message, every MIME part and
+/// every archive member.
+pub fn parse_bytes_with(
+    id: &str,
+    raw: &[u8],
+    limits: &ExtractLimits,
+    rules: Option<&Rules>,
+) -> ParseResponse {
     let Some(message) = MessageParser::default().with_mime_headers().parse(raw) else {
         return ParseResponse::failed(id, "message has no headers");
     };
+    let mut yara = rules.map(YaraScan::new);
+    if let Some(yara) = yara.as_mut() {
+        yara.scan("message", raw);
+    }
     let mut parts = Vec::new();
     let mut urls = Vec::new();
     let mut text = String::new();
@@ -39,6 +63,9 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
             .map(|ct| ct.c_type.to_string())
             .unwrap_or_else(|| "application/octet-stream".into());
         let bytes = part.contents();
+        if let Some(yara) = yara.as_mut() {
+            yara.scan(filename.as_deref().unwrap_or(&content_type), bytes);
+        }
         collect_text(&part.body, &mut text);
         urls.extend(crate::fuzz::urls_in(bytes).into_iter().take(64));
         let kind = filetype::detect(bytes);
@@ -48,7 +75,8 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
         }
         parts.push(make_part(content_type, filename.clone(), bytes, flags));
         if is_container(&kind) || bytes.starts_with(b"PK") {
-            let extracted = archive::extract(bytes, filename.as_deref(), limits, &[]);
+            let extracted =
+                archive::extract_with(bytes, filename.as_deref(), limits, &[], yara.as_mut());
             parts.extend(extracted.parts);
         }
     }
@@ -72,11 +100,16 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
     urls.extend(crate::fuzz::urls_in(raw).into_iter().take(32));
     urls.sort();
     urls.dedup();
+    let (yara, error) = match yara {
+        Some(scan) => (scan.matches, scan.error),
+        None => (Vec::new(), None),
+    };
     ParseResponse {
         id: id.to_string(),
         parts,
         urls,
-        error: None,
+        error,
+        yara,
     }
 }
 
