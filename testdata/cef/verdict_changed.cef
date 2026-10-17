@@ -1,0 +1,1 @@
+CEF:0|Currawong|Currawong Gateway|0.0.1|verdict_changed|Verdict changed|5|rt=1792195440000 externalId=01JA0000000000000000000005 cs1Label=tenant cs1=tenant-a cs2Label=messageId cs2=01JA00000000000000000000M1 act=deliver suser=admin@example.com.au cs4Label=previousVerdict cs4=quarantine
