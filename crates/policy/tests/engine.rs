@@ -1000,6 +1000,14 @@ fn pspf_government_pack_blocks_protected_outside_government() {
         verdict(&marked(Protected), "officer@gov.au"),
         Verdict::Deliver
     );
+    assert_eq!(
+        verdict(&marked(Protected), "Officer@Finance.GOV.AU."),
+        Verdict::Deliver
+    );
+    assert_eq!(
+        verdict(&marked(Protected), "x@gov.au.evil.test"),
+        blocked("pspf-protected-external")
+    );
     // A lookalike suffix is not a subdomain of gov.au.
     assert_eq!(
         verdict(&marked(Protected), "x@notgov.au"),
@@ -1017,6 +1025,14 @@ fn pspf_government_pack_blocks_protected_outside_government() {
         verdict(&marked(OfficialSensitive), "someone@gmail.com"),
         Verdict::Deliver
     );
+    // Unmarked outbound mail from a government tenant is held.
+    let mut unmarked = report();
+    unmarked.marking = Some(currawong_core::MarkingReport::default());
+    assert_eq!(
+        verdict(&unmarked, "someone@gmail.com"),
+        quarantine("pspf-required")
+    );
+    // No marking inspection at all (report.marking None) is left to other policies.
     assert_eq!(verdict(&report(), "someone@gmail.com"), Verdict::Deliver);
     // Inbound PROTECTED mail is not blocked by the outbound rules.
     let inbound = evaluate(
@@ -1068,11 +1084,13 @@ fn pspf_marking_conditions_and_not_are_validated() {
 #[test]
 fn pspf_default_marking_policy_marks_unmarked_outbound_mail_when_enabled() {
     let mut pack = government_pack();
-    pack.policies
-        .iter_mut()
-        .find(|p| p.id == "pspf-default-marking")
-        .unwrap()
-        .enabled = true;
+    for policy in pack.policies.iter_mut() {
+        match policy.id.as_str() {
+            "pspf-default-marking" => policy.enabled = true,
+            "pspf-required" => policy.enabled = false,
+            _ => {}
+        }
+    }
     let mut unmarked = report();
     unmarked.marking = Some(currawong_core::MarkingReport::default());
     let outbound = Context {

@@ -9,8 +9,9 @@
 #
 # Markings come from the X-Protective-Marking header (preferred) or the
 # [SEC=...] subject marking. Signals: `marking` / `marking_at_least`
-# conditions on the classification, and flags `pspf.invalid`,
-# `pspf.mismatch` and `pspf.missing`.
+# conditions on the classification (the highest level found in the header
+# or any subject marking), and flags `pspf.invalid`, `pspf.mismatch`,
+# `pspf.missing`, `pspf.caveat.<caveat>` and `pspf.access.<marker>`.
 #
 # PROTECTED may only go to government domains. Add more allowed domains as
 # extra `not` conditions, for example `{ not = { recipient = "*@partner.example" } }`.
@@ -45,8 +46,16 @@ priority = 8
 conditions = [{ direction = "outbound" }, { flag = "pspf.mismatch" }]
 actions = [{ quarantine = "pspf" }]
 
-# Optional: mark unmarked outbound mail OFFICIAL. Enable it if every
-# unmarked message from this gateway is OFFICIAL by policy.
+# Government tenants must mark outbound mail. Unmarked mail is held.
+# To stamp OFFICIAL on unmarked mail instead, disable this policy and enable
+# pspf-default-marking below.
+[[policy]]
+id = "pspf-required"
+priority = 9
+conditions = [{ direction = "outbound" }, { flag = "pspf.missing" }]
+actions = [{ quarantine = "pspf" }]
+
+# Alternative to pspf-required: mark unmarked outbound mail OFFICIAL.
 [[policy]]
 id = "pspf-default-marking"
 priority = 90

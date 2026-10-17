@@ -10,7 +10,9 @@
 //!   `dlp.incomplete` when some text could not be scanned for identifiers;
 //!   `pspf.invalid` (a protective marking that breaks the standard),
 //!   `pspf.mismatch` (header and subject markings disagree) and
-//!   `pspf.missing` (no protective marking at all).
+//!   `pspf.missing` (no protective marking at all), `pspf.caveat` and
+//!   `pspf.caveat.<caveat>` (for example `pspf.caveat.sh:cabinet`), and
+//!   `pspf.access.<marker>` (for example `pspf.access.legal-privilege`).
 //! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
 //!   for the `marking` and `marking_at_least` conditions.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
@@ -68,6 +70,13 @@ impl Signals {
                 if set {
                     signals.flag(name);
                 }
+            }
+            for caveat in &marking.caveats {
+                signals.flag("pspf.caveat");
+                signals.flag(&format!("pspf.caveat.{}", caveat.to_ascii_lowercase()));
+            }
+            for access in &marking.access {
+                signals.flag(&format!("pspf.access.{}", access.to_ascii_lowercase()));
             }
         }
         if !report.yara.is_empty() {

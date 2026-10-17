@@ -132,56 +132,133 @@ pub fn parse_subject(subject: &str) -> Option<Result<ProtectiveMarking, PspfErro
     Some(parsed)
 }
 
-/// Read both markings from a raw message and compare them.
+/// Every `[SEC=...]` marking in a subject, in order.
+pub fn parse_subject_all(subject: &str) -> Vec<Result<ProtectiveMarking, PspfError>> {
+    let mut found = Vec::new();
+    let mut rest = subject;
+    while let Some(marking) = parse_subject(rest) {
+        found.push(marking);
+        let upper = rest.to_ascii_uppercase();
+        match upper.rfind("[SEC=") {
+            Some(at) => rest = &rest[..at],
+            None => break,
+        }
+    }
+    found.reverse();
+    found
+}
+
+/// The `SEC=` level in a marking that failed to parse, so a broken marking
+/// still counts at the level it claims.
+fn salvage_sec(value: &str) -> Option<Classification> {
+    let upper = value.to_ascii_uppercase();
+    let at = upper.find("SEC=")? + 4;
+    let tail = &value[at..];
+    let end = tail.find([',', ']']).unwrap_or(tail.len());
+    Classification::parse(&tail[..end])
+}
+
+/// Read both markings from a raw message and compare them. The effective
+/// classification is the highest level found anywhere, so a lower marking
+/// elsewhere can never lower enforcement.
 pub fn inspect(raw: &[u8]) -> MarkingReport {
-    let head = &raw[..header_end(raw).min(MAX_HEADER_BYTES)];
     let mut report = MarkingReport::default();
+    let end = header_end(raw);
+    if end.is_none() && raw.len() > MAX_HEADER_BYTES {
+        report.invalid = true;
+        report
+            .errors
+            .push("header section too large to inspect".into());
+        return report;
+    }
+    let head = &raw[..end.unwrap_or(raw.len())];
     let Some(message) = MessageParser::new().parse_headers(head) else {
         return report;
     };
+    let mut levels: Vec<Classification> = Vec::new();
     let headers: Vec<String> = message
         .headers_raw()
         .filter(|(name, _)| name.eq_ignore_ascii_case("X-Protective-Marking"))
         .map(|(_, value)| unfold(value))
         .collect();
     let mut header_marking = None;
-    match headers.as_slice() {
-        [] => {}
-        [value] => match parse_header(value) {
-            Ok(marking) => header_marking = Some(marking),
+    for value in &headers {
+        match parse_header(value) {
+            Ok(marking) => {
+                levels.push(marking.sec);
+                header_marking.get_or_insert(marking);
+            }
             Err(e) => {
                 report.invalid = true;
                 report.errors.push(format!("header: {e}"));
+                levels.extend(salvage_sec(value));
             }
-        },
-        _ => {
-            report.invalid = true;
-            report
-                .errors
-                .push("header: more than one X-Protective-Marking".into());
         }
     }
-    let mut subject_marking = None;
-    if let Some(found) = message.subject().and_then(parse_subject) {
-        match found {
-            Ok(marking) => subject_marking = Some(marking),
-            Err(e) => {
-                report.invalid = true;
-                report.errors.push(format!("subject: {e}"));
+    if headers.len() > 1 {
+        report.invalid = true;
+        report
+            .errors
+            .push("header: more than one X-Protective-Marking".into());
+    }
+    // Every Subject header, raw, plus the decoded one, so encoded words and
+    // a second Subject header are both seen.
+    let mut subjects: Vec<String> = message
+        .headers_raw()
+        .filter(|(name, _)| name.eq_ignore_ascii_case("Subject"))
+        .map(|(_, value)| unfold(value))
+        .collect();
+    if subjects.len() > 1 {
+        report.invalid = true;
+        report.errors.push("more than one Subject header".into());
+    }
+    let mut subject_marking: Option<ProtectiveMarking> = None;
+    subjects.extend(message.subject().map(str::to_string));
+    for subject in &subjects {
+        for found in parse_subject_all(subject) {
+            match found {
+                Ok(marking) => {
+                    levels.push(marking.sec);
+                    if let Some(first) = &subject_marking {
+                        if first.sec != marking.sec || first.access != marking.access {
+                            report.mismatch = true;
+                        }
+                    }
+                    // Keep the highest subject marking.
+                    if subject_marking.as_ref().is_none_or(|m| marking.sec > m.sec) {
+                        subject_marking = Some(marking);
+                    }
+                }
+                Err(e) => {
+                    report.invalid = true;
+                    report.errors.push(format!("subject: {e}"));
+                    levels.extend(salvage_sec(subject));
+                }
             }
         }
     }
     report.header = header_marking.as_ref().map(|m| m.sec);
     report.subject = subject_marking.as_ref().map(|m| m.sec);
     if let (Some(h), Some(s)) = (&header_marking, &subject_marking) {
-        report.mismatch = h.sec != s.sec || h.access != s.access;
+        let mut hc = h.caveats.clone();
+        let mut sc = s.caveats.clone();
+        hc.sort();
+        sc.sort();
+        report.mismatch |= h.sec != s.sec || h.access != s.access || hc != sc;
     }
-    let effective = header_marking.or(subject_marking);
-    if let Some(marking) = effective {
-        report.classification = Some(marking.sec);
-        report.caveats = marking.caveats;
-        report.access = marking.access;
+    report.classification = levels.into_iter().max();
+    let mut caveats: Vec<String> = Vec::new();
+    let mut access: Vec<String> = Vec::new();
+    for marking in header_marking.iter().chain(subject_marking.iter()) {
+        caveats.extend(marking.caveats.iter().cloned());
+        access.extend(marking.access.iter().cloned());
     }
+    caveats.sort();
+    caveats.dedup();
+    access.sort();
+    access.dedup();
+    report.caveats = caveats;
+    report.access = access;
     report
 }
 
@@ -352,8 +429,9 @@ fn unfold(value: &str) -> String {
         .join(" ")
 }
 
-/// Offset just past the blank line ending the header section.
-fn header_end(raw: &[u8]) -> usize {
+/// Offset just past the blank line ending the header section, if it is
+/// within `MAX_HEADER_BYTES`.
+fn header_end(raw: &[u8]) -> Option<usize> {
     let limit = raw.len().min(MAX_HEADER_BYTES);
     raw[..limit]
         .windows(4)
@@ -365,7 +443,6 @@ fn header_end(raw: &[u8]) -> usize {
                 .position(|w| w == b"\n\n")
                 .map(|p| p + 2)
         })
-        .unwrap_or(limit)
 }
 
 #[cfg(test)]
@@ -456,12 +533,53 @@ Subject: Briefing [SEC=OFFICIAL]\r\n\r\nbody\r\n";
         let raw = b"X-Protective-Marking: SEC=PROTECTED\r\nSubject: hi\r\n\r\n";
         let report = inspect(raw);
         assert!(report.invalid);
-        assert_eq!(report.classification, None);
+        // A broken marking still counts at the level it claims.
+        assert_eq!(report.classification, Some(Classification::Protected));
         let raw = b"X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=OFFICIAL\r\n\
 X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=PROTECTED\r\nSubject: hi\r\n\r\n";
         assert!(inspect(raw).invalid);
         let unmarked = inspect(b"Subject: hello\r\n\r\nbody");
         assert_eq!(unmarked, MarkingReport::default());
+    }
+
+    #[test]
+    fn pspf_padding_cannot_hide_a_marking() {
+        let mut raw = Vec::new();
+        for i in 0..4000 {
+            raw.extend_from_slice(format!("X-Pad-{i}: {}\r\n", "x".repeat(70)).as_bytes());
+        }
+        raw.extend_from_slice(b"X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=PROTECTED\r\nSubject: hi\r\n\r\nbody");
+        let report = inspect(&raw);
+        assert!(report.invalid, "{report:?}");
+    }
+
+    #[test]
+    fn pspf_the_highest_marking_wins_and_conflicts_are_flagged() {
+        // Header OFFICIAL, subject PROTECTED: enforced as PROTECTED.
+        let raw = b"X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=OFFICIAL\r\nSubject: Brief [SEC=PROTECTED]\r\n\r\n";
+        let report = inspect(raw);
+        assert_eq!(report.classification, Some(Classification::Protected));
+        assert!(report.mismatch);
+        // Two subject markings: the higher counts and the conflict is flagged.
+        let raw = b"Subject: Brief [SEC=PROTECTED] and [SEC=OFFICIAL]\r\n\r\n";
+        let report = inspect(raw);
+        assert_eq!(report.classification, Some(Classification::Protected));
+        assert!(report.mismatch);
+        // A broken header still counts at the level it claims.
+        let raw = b"X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=SECRET, ORIGIN=bad\r\nSubject: x [SEC=OFFICIAL]\r\n\r\n";
+        let report = inspect(raw);
+        assert!(report.invalid);
+        assert_eq!(report.classification, Some(Classification::Secret));
+        // Duplicate Subject headers are invalid.
+        let raw = b"Subject: a [SEC=PROTECTED]\r\nSubject: b [SEC=OFFICIAL]\r\n\r\n";
+        let report = inspect(raw);
+        assert!(report.invalid);
+        assert_eq!(report.classification, Some(Classification::Protected));
+        // Caveats that differ between header and subject are a mismatch.
+        let raw = b"X-Protective-Marking: VER=2018.6, NS=gov.au, SEC=PROTECTED, CAVEAT=SH:CABINET\r\nSubject: x [SEC=PROTECTED]\r\n\r\n";
+        let report = inspect(raw);
+        assert!(report.mismatch);
+        assert_eq!(report.caveats, vec!["SH:CABINET"]);
     }
 
     #[test]

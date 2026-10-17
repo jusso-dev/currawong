@@ -455,8 +455,34 @@ async fn pspf_outbound_protected_to_gmail_is_blocked_under_the_government_pack()
     let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
     assert!(matches!(verdict, Verdict::Reject { .. }), "{verdict:?}");
 
-    // Unmarked mail is not touched by the default (disabled) marking policy.
+    // Government tenants must mark outbound mail: unmarked mail is held.
     let raw = marked_message(None, "Lunch", "someone@gmail.com");
     let (_, verdict) = pipeline.evaluate(&to_gmail, &raw, None).await;
-    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "pspf-required"),
+        "{verdict:?}"
+    );
+
+    // Mixed recipients are decided one by one: gov.au delivers, gmail is refused.
+    let mut mixed = send("officer@finance.gov.au");
+    mixed.rcpt_to.push("someone@gmail.com".into());
+    let raw = marked_message(
+        Some(protected),
+        "Brief [SEC=PROTECTED]",
+        "officer@finance.gov.au",
+    );
+    let (_, decision) = pipeline.assess(&mixed, &raw, None).await;
+    let verdicts: Vec<(String, bool)> = decision
+        .decisions
+        .iter()
+        .map(|d| (d.recipient.clone(), matches!(d.verdict, Verdict::Deliver)))
+        .collect();
+    assert!(
+        verdicts.contains(&("officer@finance.gov.au".into(), true)),
+        "{verdicts:?}"
+    );
+    assert!(
+        verdicts.contains(&("someone@gmail.com".into(), false)),
+        "{verdicts:?}"
+    );
 }
