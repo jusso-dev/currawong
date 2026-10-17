@@ -1,13 +1,11 @@
-//! Token-bucket limits per IP, per IPv4 /24 (or IPv6 /64) and per sender domain.
-use super::{CheckResult, ConnCtx, ConnectionCheck, MailCtx, RcptCtx};
+//! Token-bucket limits per IP, per IPv4 /24 (or IPv6 /64) and per sender
+//! domain from that network. MAIL FROM is unauthenticated, so the sender
+//! bucket is keyed on (network, domain): a forger can only exhaust its own.
+use super::{net_key, CheckResult, ConnCtx, ConnectionCheck, MailCtx, RcptCtx};
 use async_trait::async_trait;
 use currawong_core::config::ChecksConfig;
 use governor::{Quota, RateLimiter};
-use std::{
-    net::{IpAddr, Ipv6Addr},
-    num::NonZeroU32,
-    sync::Arc,
-};
+use std::{net::IpAddr, num::NonZeroU32, sync::Arc};
 
 type Limiter<K> = Arc<
     RateLimiter<
@@ -31,34 +29,26 @@ impl RateLimitCheck {
             per_sender: keyed(cfg.rate_per_minute_sender),
         }
     }
+
+    /// Forget keys whose buckets have refilled.
+    pub fn housekeeping(&self) {
+        self.per_ip.retain_recent();
+        self.per_ip.shrink_to_fit();
+        self.per_net.retain_recent();
+        self.per_net.shrink_to_fit();
+        self.per_sender.retain_recent();
+        self.per_sender.shrink_to_fit();
+    }
+
+    /// Keys currently held across all three limiters.
+    pub fn tracked_keys(&self) -> usize {
+        self.per_ip.len() + self.per_net.len() + self.per_sender.len()
+    }
 }
 
 fn keyed<K: Eq + std::hash::Hash + Clone + Send + Sync + 'static>(per_minute: u32) -> Limiter<K> {
     let quota = Quota::per_minute(NonZeroU32::new(per_minute.max(1)).expect("non-zero"));
     Arc::new(RateLimiter::keyed(quota))
-}
-
-fn net_key(ip: IpAddr) -> String {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
-        }
-        IpAddr::V6(v6) => {
-            let o = v6.octets();
-            let prefix = Ipv6Addr::new(
-                u16::from_be_bytes([o[0], o[1]]),
-                u16::from_be_bytes([o[2], o[3]]),
-                u16::from_be_bytes([o[4], o[5]]),
-                u16::from_be_bytes([o[6], o[7]]),
-                0,
-                0,
-                0,
-                0,
-            );
-            format!("{prefix}/64")
-        }
-    }
 }
 
 fn limited() -> CheckResult {
@@ -68,9 +58,8 @@ fn limited() -> CheckResult {
 #[async_trait]
 impl ConnectionCheck for RateLimitCheck {
     async fn on_connect(&self, ctx: &ConnCtx) -> CheckResult {
-        if self.per_ip.check_key(&ctx.ip).is_err()
-            || self.per_net.check_key(&net_key(ctx.ip)).is_err()
-        {
+        let ip = ctx.ip.to_canonical();
+        if self.per_ip.check_key(&ip).is_err() || self.per_net.check_key(&net_key(ip)).is_err() {
             return limited();
         }
         CheckResult::Pass
@@ -85,7 +74,8 @@ impl ConnectionCheck for RateLimitCheck {
         if domain.is_empty() {
             return CheckResult::Pass;
         }
-        if self.per_sender.check_key(&domain).is_err() {
+        let key = format!("{}|{domain}", net_key(ctx.ip));
+        if self.per_sender.check_key(&key).is_err() {
             return limited();
         }
         CheckResult::Pass

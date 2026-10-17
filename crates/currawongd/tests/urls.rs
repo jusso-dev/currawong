@@ -17,6 +17,7 @@ fn envelope(id: &str, direction: Direction) -> Envelope {
     Envelope {
         id: MessageId(id.into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: "user@example.test".into(),
         rcpt_to: vec!["dest@example.test".into()],
         received_at: OffsetDateTime::now_utc(),

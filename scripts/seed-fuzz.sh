@@ -3,23 +3,34 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 corpus="$root/fuzz/corpus"
-mkdir -p \
-  "$corpus/smtp_command" \
-  "$corpus/smtp_data" \
-  "$corpus/mime_parse" \
-  "$corpus/archive_extract" \
-  "$corpus/pspf_parse" \
-  "$corpus/url_rewrite" \
-  "$corpus/dlp_scan"
+for target in smtp_command smtp_data smtp_sasl mime_parse archive_extract \
+  office_detect pspf_parse url_rewrite dlp_scan auth_strip clamd_address \
+  parser_ipc spool_envelope; do
+  mkdir -p "$corpus/$target"
+done
 if [ -d "$root/testdata/corpus" ]; then
   cp "$root/testdata/corpus/"*.eml "$corpus/mime_parse/"
+  cp "$root/testdata/corpus/"*.eml "$corpus/smtp_data/"
+  cp "$root/testdata/corpus/"*.eml "$corpus/auth_strip/"
   cp "$root/testdata/corpus/dlp.eml" "$corpus/pspf_parse/"
   cp "$root/testdata/corpus/dlp.eml" "$corpus/dlp_scan/"
   cp "$root/testdata/corpus/phish.eml" "$corpus/url_rewrite/"
 fi
+if [ -d "$root/testdata/auth" ]; then
+  cp "$root/testdata/auth/"*.eml "$corpus/auth_strip/"
+fi
 if [ -d "$root/testdata/fixtures" ]; then
   cp "$root/testdata/fixtures/"* "$corpus/archive_extract/" 2>/dev/null || true
+  cp "$root/testdata/fixtures/"* "$corpus/office_detect/" 2>/dev/null || true
 fi
 printf 'EHLO example.test\r\n' > "$corpus/smtp_command/ehlo"
-printf 'Subject: hi\r\n\r\nhello\r\n.\r\n' > "$corpus/smtp_data/dot"
+printf 'MAIL FROM:<a@example.test> SIZE=1000\r\n' > "$corpus/smtp_command/mail"
+printf 'Subject: hi\r\n\r\n..hidden\r\nhello\r\n.\r\n' > "$corpus/smtp_data/dot"
+printf 'LOGIN\r\ndXNlcg==\r\ncGFzcw==\r\n' > "$corpus/smtp_sasl/login"
+printf 'PLAIN AHVzZXIAcGFzcw==\r\n' > "$corpus/smtp_sasl/plain"
+printf 'tcp:127.0.0.1:3310' > "$corpus/clamd_address/tcp"
+printf 'unix:/run/clamav/clamd.ctl' > "$corpus/clamd_address/unix"
+printf '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","rcpt_to":[]}' > "$corpus/spool_envelope/partial"
+printf '\000\000\000\076{"id":"a","raw_path":"/x","limits":{"max_depth":1,"max_uncompressed_bytes":1,"max_files":1,"max_ratio":1}}' \
+  > "$corpus/parser_ipc/request"
 echo "seeded $corpus"

@@ -1,0 +1,20 @@
+From: accounts@outside.test
+To: b@example.test
+Subject: updated remittance form
+Date: Wed, 14 Oct 2026 01:00:00 +0000
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="m1"
+
+--m1
+Content-Type: text/plain
+
+Please enable editing. Benign macro fixture from testdata/fixtures/note.docm.
+--m1
+Content-Type: application/vnd.ms-word.document.macroEnabled.12; name="note.docm"
+Content-Disposition: attachment; filename="note.docm"
+Content-Transfer-Encoding: base64
+
+UEsDBBQAAAAAABpzTl1D+ToqEgAAABIAAAATAAAAd29yZC92YmFQcm9qZWN0LmJpbmJlbmlnbi1w
+bGFjZWhvbGRlclBLAQIUAxQAAAAAABpzTl1D+ToqEgAAABIAAAATAAAAAAAAAAAAAACAAQAAAAB3
+b3JkL3ZiYVByb2plY3QuYmluUEsFBgAAAAABAAEAQQAAAEMAAAAAAA==
+--m1--

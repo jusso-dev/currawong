@@ -1,6 +1,6 @@
 //! Typed TOML configuration. Unknown keys fail closed so a typo cannot
 //! silently disable a control.
-use crate::secret::Secret;
+use crate::{residency::ResidencyGuard, secret::Secret};
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
@@ -37,8 +37,10 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
     pub url_rewrite: UrlRewriteConfig,
+    pub dlp: DlpProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,6 +67,12 @@ pub struct LimitsConfig {
     pub max_connections: usize,
     pub max_line_bytes: usize,
     pub max_connections_per_ip: usize,
+    /// Implicit TLS and STARTTLS handshakes that take longer are dropped.
+    pub tls_handshake_timeout_secs: u64,
+    /// Longest a whole DATA transfer may take, however steadily lines arrive.
+    pub data_timeout_secs: u64,
+    /// DATA is answered 452 4.3.1 when the spool file system has less free.
+    pub spool_min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,14 +193,25 @@ pub struct ResidencyConfig {
     pub allowed_cidrs: Vec<String>,
     pub content_endpoints: Vec<String>,
     pub overrides: Vec<ResidencyOverride>,
+    /// Required when `mode = "off"`. Startup refuses `off` without it.
+    pub off_approval: Option<ResidencyApproval>,
     pub signing_key_path: Option<PathBuf>,
     pub report_dir: PathBuf,
+    /// Signed reports older than this are deleted.
+    pub report_retention_days: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ResidencyOverride {
     pub url: String,
+    pub reason: String,
+    pub approved_by: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResidencyApproval {
     pub reason: String,
     pub approved_by: String,
 }
@@ -237,7 +256,7 @@ pub struct ChecksConfig {
     pub greylist_delay_secs: u64,
     pub greylist_database: PathBuf,
     pub dnsbl: Vec<DnsblZone>,
-    /// Connection checks skip DNSBL, greylisting and reputation for these CIDRs.
+    /// Connection checks (rate limits, DNSBL, greylisting, reputation) skip these CIDRs.
     /// Use this for published Microsoft and Google outbound ranges.
     pub allow_cidrs: Vec<String>,
     pub rate_per_minute_ip: u32,
@@ -381,6 +400,37 @@ impl Default for UrlRewriteConfig {
     }
 }
 
+/// `[dlp]`: Australian identifier detection on outbound mail, and inbound
+/// mail when `scan_inbound` is set. What happens to a message with findings
+/// is set by policy (`dlp.<kind>` counts and the `dlp.incomplete` flag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DlpProfile {
+    pub enabled: bool,
+    pub scan_inbound: bool,
+    /// Matches below this confidence (0 to 100) are not counted.
+    pub min_confidence: u8,
+}
+
+/// Spam scoring and lookalike domains. Scores go on the report; policy decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClassifyConfig {
+    pub enabled: bool,
+    /// SQLite file holding per-tenant Bayes token counts.
+    pub bayes_database: PathBuf,
+    /// Directory of `*.toml` spam rules. Unset uses the built-in rules.
+    pub spam_rules_dir: Option<PathBuf>,
+    /// Brand list, `Name: domain ...` per line. Unset uses the built-in Australian list.
+    pub brands_file: Option<PathBuf>,
+    /// More domains to protect in every tenant's mail. A tenant's own domains
+    /// are protected in its own mail.
+    pub protected_domains: Vec<String>,
+    /// Domains never flagged as lookalikes, such as partners or vendors whose
+    /// names resemble a tenant's.
+    pub allowed_domains: Vec<String>,
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -419,6 +469,9 @@ impl Default for LimitsConfig {
             max_connections: 1000,
             max_line_bytes: 1000,
             max_connections_per_ip: 20,
+            tls_handshake_timeout_secs: 30,
+            data_timeout_secs: 600,
+            spool_min_free_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -483,8 +536,10 @@ impl Default for ResidencyConfig {
             ],
             content_endpoints: Vec::new(),
             overrides: Vec::new(),
+            off_approval: None,
             signing_key_path: None,
             report_dir: PathBuf::from("/var/lib/currawong/residency"),
+            report_retention_days: 400,
         }
     }
 }
@@ -566,6 +621,29 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for DlpProfile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_inbound: false,
+            min_confidence: 50,
+        }
+    }
+}
+
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bayes_database: PathBuf::from("/var/lib/currawong/bayes.sqlite"),
+            spam_rules_dir: None,
+            brands_file: None,
+            protected_domains: Vec::new(),
+            allowed_domains: Vec::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -609,8 +687,10 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
             url_rewrite: UrlRewriteConfig::default(),
+            dlp: DlpProfile::default(),
         }
     }
 }
@@ -704,27 +784,61 @@ impl Config {
                 "max_recipients must be at least 1".into(),
             ));
         }
-        if needs_tls
-            && (self.tls.cert.is_none() || self.tls.key.is_none())
-            && self.tls.acme.is_none()
-        {
+        if self.tls.acme.is_some() {
             return Err(ConfigError::Invalid(
-                "STARTTLS or implicit TLS requires tls.cert and tls.key, or tls.acme".into(),
+                "tls.acme is not implemented yet: set tls.cert and tls.key".into(),
             ));
         }
-        if self.residency.mode != "au" && self.residency.mode != "off" {
+        if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
             return Err(ConfigError::Invalid(
-                "residency.mode must be \"au\" or \"off\"".into(),
+                "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
             ));
+        }
+        if self.limits.max_connections == 0 {
+            return Err(ConfigError::Invalid(
+                "limits.max_connections must be at least 1".into(),
+            ));
+        }
+        if self.limits.max_connections_per_ip == 0
+            || self.limits.max_connections_per_ip > self.limits.max_connections
+        {
+            return Err(ConfigError::Invalid(
+                "limits.max_connections_per_ip must be between 1 and limits.max_connections".into(),
+            ));
+        }
+        if self.limits.max_line_bytes < 1000 {
+            return Err(ConfigError::Invalid(
+                "limits.max_line_bytes must be at least 1000 (RFC 5321 text line)".into(),
+            ));
+        }
+        for (name, secs) in [
+            (
+                "limits.smtp_command_timeout_secs",
+                self.limits.smtp_command_timeout_secs,
+            ),
+            ("scanner.job_timeout_secs", self.scanner.job_timeout_secs),
+            ("delivery.poll_secs", self.delivery.poll_secs),
+        ] {
+            if secs == 0 {
+                return Err(ConfigError::Invalid(format!("{name} must be at least 1")));
+            }
         }
         if !self.scanner.clamd.address.is_empty() {
             parse_clamd_address(&self.scanner.clamd.address)?;
         }
+        // Every destination for message content, including clamd, must pass
+        // the residency guard before the daemon starts.
+        ResidencyGuard::from_config(&self.residency)
+            .and_then(|guard| guard.enforce_config(self))
+            .map_err(|err| ConfigError::Invalid(format!("residency: {err}")))?;
         if self.log.format != "json" && self.log.format != "pretty" {
             return Err(ConfigError::Invalid(
                 "log.format must be \"json\" or \"pretty\"".into(),
             ));
         }
+        tracing_subscriber::EnvFilter::try_new(&self.log.level).map_err(|err| {
+            ConfigError::Invalid(format!("log.level '{}': {err}", self.log.level))
+        })?;
         self.metrics.listen.parse::<SocketAddr>().map_err(|_| {
             ConfigError::Invalid(format!(
                 "metrics.listen '{}' is not a socket address",
@@ -810,7 +924,8 @@ pub fn parse_clamd_address(address: &str) -> Result<(), ConfigError> {
         }
         return Ok(());
     }
-    let tcp = address.strip_prefix("tcp:").unwrap_or(address);
+    // Same rule as the runtime parser: an explicit tcp: prefix and an IP.
+    let tcp = address.strip_prefix("tcp:").unwrap_or("");
     if tcp.parse::<SocketAddr>().is_err() {
         return Err(ConfigError::Invalid(format!(
             "clamd address '{address}' must be unix:/path or tcp:host:port"
@@ -824,7 +939,20 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
+    /// Every test that loads a config takes this lock, so a test that sets a
+    /// `CURRAWONG_` variable cannot leak it into another test's load.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn load(path: &Path) -> Result<Config, ConfigError> {
+        let _guard = env_lock();
+        Config::load(path)
+    }
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/currawong.example.toml")
@@ -846,7 +974,7 @@ mod tests {
 
     #[test]
     fn example_loads_and_validates() {
-        let cfg = Config::load(&example_path()).expect("example config");
+        let cfg = load(&example_path()).expect("example config");
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
@@ -855,7 +983,7 @@ mod tests {
     #[test]
     fn blank_tenant_id_is_refused() {
         for id in ["", " ", " t1"] {
-            let mut cfg = Config::load(&example_path()).unwrap();
+            let mut cfg = load(&example_path()).unwrap();
             cfg.relay.tenants.push(TenantConfig {
                 id: id.into(),
                 domains: vec!["example.test".into()],
@@ -874,7 +1002,7 @@ mod tests {
             "[spool]\ndir = \"/var/spool/currawong\"\nnot_a_real_key = 1\n",
         )
         .unwrap();
-        let err = Config::load(&path).unwrap_err();
+        let err = load(&path).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains("not_a_real_key"),
@@ -884,7 +1012,7 @@ mod tests {
 
     #[test]
     fn env_override_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("base.toml");
         std::fs::write(
@@ -903,6 +1031,89 @@ mod tests {
             }
         }
         assert_eq!(cfg.limits.max_recipients, 5);
+    }
+
+    #[test]
+    fn acme_is_refused_until_implemented() {
+        let mut cfg = Config::default();
+        cfg.tls.cert = None;
+        cfg.tls.key = None;
+        cfg.tls.acme = Some(AcmeConfig {
+            directory_url: "https://acme.example.test/directory".into(),
+            domains: vec!["mx.example.test".into()],
+            contact: "mailto:ops@example.test".into(),
+            cache_dir: PathBuf::from("/var/lib/currawong/acme"),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("tls.acme"), "{err}");
+    }
+
+    #[test]
+    fn foreign_clamd_fails_validation() {
+        let mut cfg = load(&example_path()).expect("load");
+        cfg.scanner.clamd.address = "tcp:8.8.8.8:3310".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("clamd") && err.contains("8.8.8.8"), "{err}");
+        cfg.scanner.clamd.address = "tcp:127.0.0.1:3310".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn clamd_address_needs_a_scheme_prefix() {
+        for bad in ["127.0.0.1:3310", "unix:", "tcp:localhost:3310"] {
+            assert!(parse_clamd_address(bad).is_err(), "{bad}");
+        }
+        parse_clamd_address("tcp:127.0.0.1:3310").unwrap();
+        parse_clamd_address("unix:/run/clamav/clamd.ctl").unwrap();
+    }
+
+    #[test]
+    fn foreign_content_endpoint_fails_validation() {
+        let mut cfg = Config::default();
+        cfg.residency.content_endpoints =
+            vec!["https://mail.s3.us-east-1.amazonaws.com/box".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("us-east-1"), "{err}");
+    }
+
+    #[test]
+    fn residency_off_needs_an_approval() {
+        let mut cfg = Config::default();
+        cfg.residency.mode = "off".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("off_approval"), "{err}");
+        cfg.residency.off_approval = Some(ResidencyApproval {
+            reason: "isolated lab".into(),
+            approved_by: "ciso".into(),
+        });
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn limits_timeouts_and_log_level_are_validated() {
+        type Case = (&'static str, fn(&mut Config));
+        let cases: Vec<Case> = vec![
+            ("max_connections", |c| c.limits.max_connections = 0),
+            ("max_connections_per_ip", |c| {
+                c.limits.max_connections_per_ip = 0
+            }),
+            ("max_connections_per_ip", |c| {
+                c.limits.max_connections_per_ip = c.limits.max_connections + 1
+            }),
+            ("max_line_bytes", |c| c.limits.max_line_bytes = 10),
+            ("smtp_command_timeout_secs", |c| {
+                c.limits.smtp_command_timeout_secs = 0
+            }),
+            ("job_timeout_secs", |c| c.scanner.job_timeout_secs = 0),
+            ("poll_secs", |c| c.delivery.poll_secs = 0),
+            ("log.level", |c| c.log.level = "currawong=loud".into()),
+        ];
+        for (needle, mutate) in cases {
+            let mut cfg = Config::default();
+            mutate(&mut cfg);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
     }
 
     #[test]

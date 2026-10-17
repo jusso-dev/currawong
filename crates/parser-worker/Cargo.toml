@@ -31,6 +31,8 @@ cfb = { workspace = true }
 rlimit = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+pdf-extract = { workspace = true }
+calamine = { workspace = true }
 yara-x = { workspace = true }
 base64 = { workspace = true }
 
@@ -42,3 +44,4 @@ libc = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 zip = { workspace = true }
+base64 = { workspace = true }

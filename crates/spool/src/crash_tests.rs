@@ -12,6 +12,7 @@ fn envelope() -> Envelope {
     Envelope {
         id: MessageId(ID.into()),
         tenant_id: Some("tenant-a".into()),
+        authenticated_as: None,
         mail_from: "sender@example.test".into(),
         rcpt_to: vec!["rcpt@example.test".into()],
         received_at: OffsetDateTime::UNIX_EPOCH,
@@ -422,4 +423,82 @@ async fn crash_at_every_step_of_repair() {
             "{damage:?} only had {crash_points} crash points"
         );
     }
+}
+
+/// Stream a body in two writes, then commit.
+async fn streamed(spool: Spool) -> Result<()> {
+    let mut pending = spool.begin(&MessageId(ID.into())).await?;
+    let (head, tail) = BODY.split_at(7);
+    pending.write(head).await?;
+    pending.write(tail).await?;
+    spool.commit(pending, envelope()).await.map(|_| ())
+}
+
+#[tokio::test]
+async fn crash_at_every_step_of_begin_and_commit() {
+    let mut crash_points = 0;
+    let mut kept = 0;
+    for steps in 0.. {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = spool_crashing_after(dir.path(), steps).await;
+        let hit = crashed(spool, streamed).await;
+        if !hit {
+            break;
+        }
+        crash_points += 1;
+        let incoming = files(&dir.path().join("incoming"));
+        let renamed = incoming.contains(&format!("{ID}.eml"));
+
+        let spool = Spool::open(dir.path()).await.unwrap();
+        let recovered = spool.recover().await.unwrap();
+        let present = STATES.into_iter().any(|state| {
+            files(&dir.path().join(state.dir_name()))
+                .iter()
+                .any(|n| n.starts_with(ID))
+        });
+        // A body still in `.eml.tmp` was never acknowledged and must vanish.
+        assert_eq!(present, renamed, "crash at step {steps}: {incoming:?}");
+        if present {
+            kept += 1;
+            assert_whole(&spool, &recovered, &envelope(), &[SpoolState::Incoming]).await;
+        } else {
+            assert!(recovered.is_empty());
+        }
+        assert_clean(dir.path());
+    }
+    assert!(crash_points >= 6, "only {crash_points} crash points");
+    assert!(
+        kept >= 1,
+        "a crash after the final rename must keep the message"
+    );
+}
+
+#[tokio::test]
+async fn dropped_or_failed_commit_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    let mut pending = spool.begin(&MessageId(ID.into())).await.unwrap();
+    pending.write(BODY).await.unwrap();
+    drop(pending);
+    assert!(files(&dir.path().join("incoming")).is_empty());
+
+    // The JSON cannot be written: commit fails after the body was synced.
+    let blocker = dir.path().join("incoming").join(format!("{ID}.json.tmp"));
+    std::fs::create_dir(&blocker).unwrap();
+    let mut pending = spool.begin(&MessageId(ID.into())).await.unwrap();
+    pending.write(BODY).await.unwrap();
+    assert!(spool.commit(pending, envelope()).await.is_err());
+    std::fs::remove_dir(&blocker).unwrap();
+    assert!(
+        files(&dir.path().join("incoming")).is_empty(),
+        "{:?}",
+        files(&dir.path().join("incoming"))
+    );
+
+    let before = spool.commit_syncs();
+    streamed(spool.clone()).await.unwrap();
+    assert!(
+        spool.commit_syncs() >= before + 3,
+        "body, JSON and directory are synced"
+    );
 }
