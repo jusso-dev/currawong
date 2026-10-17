@@ -1,0 +1,54 @@
+image:
+  repository: ghcr.io/jusso-dev/currawong
+  tag: ""  # defaults to the chart appVersion
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+# Secret of type kubernetes.io/tls with tls.crt and tls.key. Mounted as
+# /etc/currawong/cert.pem and key.pem. Required by the STARTTLS listeners.
+tlsSecretName: currawong-tls
+
+# Written to /etc/currawong/currawong.toml. Unset keys keep their defaults.
+# See config/currawong.example.toml. The image sets
+# CURRAWONG_METRICS__LISTEN=0.0.0.0:9090, which overrides metrics.listen, so
+# the kubelet probes can reach /healthz and /readyz.
+config: |
+  [gateway]
+  hostname = "currawong.example.test"
+
+  [auth]
+  authserv_id = "currawong.example.test"
+
+  [domains]
+  accept = ["example.test"]
+
+  [[domains.routes]]
+  domain = "example.test"
+  next_hop = "mail.example.test:25"
+
+  [scanner.clamd]
+  address = ""
+
+persistence:
+  storageClassName: ""
+  spoolSize: 20Gi
+  stateSize: 1Gi
+
+service:
+  # LoadBalancer with Local keeps the client IP, which DNSBL, greylisting
+  # and rate limits depend on.
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 2Gi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

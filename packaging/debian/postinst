@@ -1,0 +1,36 @@
+#!/bin/sh
+# Creates the currawong system user, the spool and state directories, and a
+# self-signed certificate so the STARTTLS listeners start. Replace the
+# certificate (or run currawong-setup) before taking real mail.
+set -e
+
+if [ "$1" = "configure" ]; then
+    if ! getent passwd currawong >/dev/null; then
+        adduser --system --group --quiet --home /var/lib/currawong \
+            --no-create-home --shell /usr/sbin/nologin currawong
+    fi
+    install -d -m 0750 -o currawong -g currawong /var/spool/currawong /var/lib/currawong
+    install -d -m 0750 -o root -g currawong /etc/currawong
+    if [ -f /etc/currawong/currawong.toml ]; then
+        chgrp currawong /etc/currawong/currawong.toml
+        chmod 0640 /etc/currawong/currawong.toml
+    fi
+    if [ ! -e /etc/currawong/cert.pem ] && [ ! -e /etc/currawong/key.pem ]; then
+        name="$(hostname -f 2>/dev/null || hostname)"
+        (
+            umask 0027
+            openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+                -nodes -days 825 -subj "/CN=${name}" \
+                -addext "subjectAltName=DNS:${name}" \
+                -keyout /etc/currawong/key.pem -out /etc/currawong/cert.pem \
+                >/dev/null 2>&1
+        )
+        chgrp currawong /etc/currawong/key.pem /etc/currawong/cert.pem
+        chmod 0640 /etc/currawong/key.pem /etc/currawong/cert.pem
+        echo "currawong: generated a self-signed certificate for ${name} in /etc/currawong"
+    fi
+fi
+
+#DEBHELPER#
+
+exit 0

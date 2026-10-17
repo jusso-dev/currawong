@@ -59,6 +59,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/admin` | axum admin API and UI |
 | `crates/integrations` | Event export: syslog (RFC 5424, CEF), signed webhooks and Wedgetail. See [docs/events.md](docs/events.md) |
 | `crates/currawongd` | The daemon binary |
+| `crates/setup-tui` | `currawong-setup`, the first-run wizard |
 
 ## Roadmap
 
@@ -74,7 +75,9 @@ cargo check --workspace
 cargo test --workspace
 ```
 
-CI config lives in `docs/ci/ci.yml` until it is moved into `.github/workflows/`.
+Packaging for the container image, Debian package, appliance image and Helm chart is described in [docs/packaging.md](docs/packaging.md). It is not yet verified end to end; see [docs/VALIDATION.md](docs/VALIDATION.md).
+
+CI config lives in `docs/ci/ci.yml` (checks) and `docs/ci/release.yml` (packaging) until it is moved into `.github/workflows/`.
 
 ## Licence
 
