@@ -74,6 +74,15 @@ key = "/etc/currawong/key.pem"
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
 #   Required with an empty address defers all mail and fails /readyz. Set
 #   required = false to run without ClamAV.
+# scanner.yara.rules_dir: *.yar and *.yara files (subdirectories included),
+# matched against the raw message and every part inside the parser worker.
+# Changes are picked up within a few seconds without a restart; a broken
+# file, a misspelt action tag or an emptied directory is logged and the
+# previous rules stay active. Tags `malware` and `suspicious` quarantine;
+# other matches are recorded on the report for policy. If the rules cannot
+# be loaded at all, mail fails closed. --check-config prints the rule and
+# tag counts. Starter rules ship in rules/yara/. Empty disables YARA.
+# scanner.yara.load_timeout_secs: time a worker may take to load the rules.
 # scanner.extra_signature_dirs: on-premises supplemental signatures. Configure
 # clamd to load these as well (OfficialDatabaseOnly no). Mail stays on the box.
 # scanner.extra_database_paths: extra .cvd/.cld/.ndb files for the same purpose.
@@ -103,6 +112,10 @@ extra_database_paths = []
 [scanner.clamd]
 address = "tcp:127.0.0.1:3310"
 required = true
+
+[scanner.yara]
+rules_dir = ""
+load_timeout_secs = 120
 
 [scanner.extract]
 max_depth = 5
@@ -189,7 +202,17 @@ domains = ["example.test"]
 trusted_cidrs = ["10.0.0.0/8"]
 
 # dkim.kek_path: 32-byte AES-GCM key file. Private keys are encrypted at rest.
-# dkim.sign_outbound / seal_arc: outbound signing and ARC when we modify mail.
+# It is created on first use; if it goes missing while keys exist, startup fails.
+# dkim.sign_outbound: sign outbound tenant mail with every active key for the From domain.
+#   A signing failure defers the message rather than sending it unsigned.
+# dkim.seal_arc: ARC seal inbound mail a stage modified, with the "_gateway" tenant's key
+#   for auth.authserv_id. Outbound mail never carries our Authentication-Results or ARC.
+# Keys: currawongd --config ... dkim generate --tenant <id> --domain <d> --selector <s> [--algorithm rsa|ed25519]
+#         (pending: publish the printed TXT record; it does not sign yet)
+#       currawongd --config ... dkim activate --tenant <id> --domain <d> --selector <s>
+#         (checks DNS serves the record, then signs; retires the previous key, keep it in DNS 7 days)
+#       currawongd --config ... dkim records --tenant <id> --domain <d>  (pending/active/retired)
+# Nothing is signed until the key database exists.
 [dkim]
 database = "/var/lib/currawong/dkim.sqlite"
 kek_path = "/etc/currawong/dkim.kek"
@@ -197,8 +220,31 @@ sign_outbound = true
 seal_arc = true
 
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
+# auth.bimi: look up BIMI logos (default._bimi.<domain>) for quarantined mail
+# that passes DMARC at p=quarantine or p=reject. VMC certificates are flagged,
+# not verified.
 [auth]
 authserv_id = "currawong.example.test"
+bimi = false
+
+# auth.dmarc_reports: daily DMARC aggregate (RUA) reports for each sending
+# domain, gzipped XML per RFC 9990, sent an hour after each UTC day ends. A rua
+# address outside the policy domain is only used when it publishes
+# <domain>._report._dmarc.<host>. Our own domains, IP literals and addresses
+# whose MX is internal are refused. The max_* caps bound what a hostile DMARC
+# record can make the gateway send. Failure (RUF) reports are never sent.
+[auth.dmarc_reports]
+enabled = false
+database = "/var/lib/currawong/dmarc.sqlite"
+org_name = "Example Pty Ltd"
+email = "dmarc-reports@currawong.example.test"
+max_rua_per_record = 5
+max_domains_per_day = 5000
+max_domains_per_org = 20
+max_events_per_domain_day = 100000
+max_rows_per_report = 1000
+max_report_bytes = 5242880
+retention_days = 7
 
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.

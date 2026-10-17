@@ -3,6 +3,7 @@
 //! by what is left of the budget and charged with the bytes actually read.
 use crate::filetype::{self, FileKind};
 use crate::office::{self, password_candidates};
+use crate::yara::YaraScan;
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use std::collections::HashMap;
@@ -23,7 +24,19 @@ pub fn extract(
     limits: &ExtractLimits,
     passwords: &[String],
 ) -> Extracted {
-    let mut budget = Budget::new(limits, None);
+    extract_with(bytes, filename, limits, passwords, None)
+}
+
+/// Same as [`extract`], and matches YARA rules against the blob and every
+/// member.
+pub fn extract_with(
+    bytes: &[u8],
+    filename: Option<&str>,
+    limits: &ExtractLimits,
+    passwords: &[String],
+    yara: Option<&mut YaraScan<'_>>,
+) -> Extracted {
+    let mut budget = Budget::new(limits, None).with_yara(yara);
     let mut parts = Vec::new();
     let flags = inspect(bytes, filename, passwords, &mut budget, &mut parts);
     let root = budget.part(filename, None, bytes, flags);
@@ -39,8 +52,9 @@ pub fn extract(
     }
 }
 
-/// Limits shared by every attachment of one message.
-pub struct Budget {
+/// Limits shared by every attachment of one message. With YARA rules, every
+/// part recorded through [`Budget::part`] is matched as well.
+pub struct Budget<'a, 'r> {
     depth: u32,
     files: u32,
     bytes: u64,
@@ -49,6 +63,7 @@ pub struct Budget {
     stored: HashMap<String, String>,
     pub hit: bool,
     pub store_failed: Option<String>,
+    yara: Option<&'a mut YaraScan<'r>>,
 }
 
 enum Stop {
@@ -56,7 +71,12 @@ enum Stop {
     Corrupt,
 }
 
-impl Budget {
+impl<'a, 'r> Budget<'a, 'r> {
+    pub fn with_yara(mut self, yara: Option<&'a mut YaraScan<'r>>) -> Self {
+        self.yara = yara;
+        self
+    }
+
     pub fn new(limits: &ExtractLimits, out_dir: Option<&Path>) -> Self {
         Self {
             depth: 0,
@@ -67,6 +87,7 @@ impl Budget {
             stored: HashMap::new(),
             hit: false,
             store_failed: None,
+            yara: None,
         }
     }
 
@@ -154,6 +175,10 @@ impl Budget {
         bytes: &[u8],
         flags: Vec<PartFlag>,
     ) -> PartInfo {
+        if let Some(yara) = self.yara.as_mut() {
+            let name = filename.or(content_type.as_deref()).unwrap_or("part");
+            yara.scan(name, bytes);
+        }
         let sha256 = filetype::sha256(bytes);
         let path = self.store(&sha256, bytes);
         PartInfo {

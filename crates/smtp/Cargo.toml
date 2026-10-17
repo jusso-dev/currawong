@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 currawong-core = { path = "../core" }
 currawong-spool = { path = "../spool" }
+currawong-auth = { path = "../auth" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

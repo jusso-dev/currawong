@@ -124,6 +124,7 @@ pub struct ScannerConfig {
     pub job_timeout_secs: u64,
     pub worker_binary: Option<PathBuf>,
     pub clamd: ClamdConfig,
+    pub yara: YaraConfig,
     /// Directories of supplemental on-premises signatures (the SaneSecurity
     /// approach). Currawong does not upload mail. Point `clamd` at these
     /// paths as well; they are recorded and checked locally.
@@ -152,6 +153,26 @@ pub struct ClamdConfig {
     pub address: String,
     /// An unreachable or unconfigured required engine fails closed (defer).
     pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct YaraConfig {
+    /// Directory of `*.yar` and `*.yara` files, recompiled when it changes.
+    /// Empty disables the engine.
+    pub rules_dir: PathBuf,
+    /// Time a parser worker may take to load a rules generation. Loading
+    /// recompiles the rules, so large sets need far longer than one job.
+    pub load_timeout_secs: u64,
+}
+
+impl Default for YaraConfig {
+    fn default() -> Self {
+        Self {
+            rules_dir: PathBuf::new(),
+            load_timeout_secs: 120,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +300,54 @@ pub struct DkimConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub authserv_id: String,
+    pub dmarc_reports: DmarcReportConfig,
+    /// Look up BIMI logos for quarantined mail that passes DMARC at enforcement.
+    pub bimi: bool,
+}
+
+/// Daily DMARC aggregate (RUA) reports. Failure (RUF) reports are never sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DmarcReportConfig {
+    pub enabled: bool,
+    /// SQLite file holding the `dmarc_events` table.
+    pub database: PathBuf,
+    pub org_name: String,
+    /// Report sender. Its domain is the report submitter.
+    pub email: String,
+    /// Only the first N `rua` addresses of a record are considered.
+    pub max_rua_per_record: usize,
+    /// Policy domains recorded per day across all organisations.
+    pub max_domains_per_day: usize,
+    /// Policy domains per organisational (registrable) domain per day, so
+    /// wildcard `_dmarc` subdomains cannot fill the daily cap.
+    pub max_domains_per_org: usize,
+    /// Events stored per policy domain per day.
+    pub max_events_per_domain_day: usize,
+    /// Rows per report. The rest are counted in the report's `error` field.
+    pub max_rows_per_report: usize,
+    /// Rendered report message size limit.
+    pub max_report_bytes: usize,
+    /// Unsent events older than this are dropped.
+    pub retention_days: u64,
+}
+
+impl Default for DmarcReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database: PathBuf::from("/var/lib/currawong/dmarc.sqlite"),
+            org_name: "Currawong".into(),
+            email: String::new(),
+            max_rua_per_record: 5,
+            max_domains_per_day: 5_000,
+            max_domains_per_org: 20,
+            max_events_per_domain_day: 100_000,
+            max_rows_per_report: 1_000,
+            max_report_bytes: 5 * 1024 * 1024,
+            retention_days: 7,
+        }
+    }
 }
 
 /// Policy engine. With neither set, the built-in default pack applies.
@@ -334,6 +403,7 @@ impl Default for ScannerConfig {
             job_timeout_secs: 30,
             worker_binary: None,
             clamd: ClamdConfig::default(),
+            yara: YaraConfig::default(),
             extra_signature_dirs: Vec::new(),
             extra_database_paths: Vec::new(),
             blocked_extensions: default_blocked_extensions(),
@@ -463,6 +533,8 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             authserv_id: "currawong.local".into(),
+            dmarc_reports: DmarcReportConfig::default(),
+            bimi: false,
         }
     }
 }
@@ -643,6 +715,34 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        let reports = &self.auth.dmarc_reports;
+        if reports.enabled && !reports.email.contains('@') {
+            return Err(ConfigError::Invalid(
+                "auth.dmarc_reports.email must be an address when reports are enabled".into(),
+            ));
+        }
+        if !(1..=60).contains(&reports.retention_days) {
+            return Err(ConfigError::Invalid(
+                "auth.dmarc_reports.retention_days must be between 1 and 60".into(),
+            ));
+        }
+        for (name, value) in [
+            ("max_rua_per_record", reports.max_rua_per_record),
+            ("max_domains_per_day", reports.max_domains_per_day),
+            ("max_domains_per_org", reports.max_domains_per_org),
+            (
+                "max_events_per_domain_day",
+                reports.max_events_per_domain_day,
+            ),
+            ("max_rows_per_report", reports.max_rows_per_report),
+            ("max_report_bytes", reports.max_report_bytes),
+        ] {
+            if value == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "auth.dmarc_reports.{name} must be at least 1"
+                )));
+            }
+        }
         // An empty tenant id would share the platform's policy namespace.
         if let Some(tenant) = self
             .relay
@@ -708,6 +808,20 @@ mod tests {
 
     fn example_path() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/currawong.example.toml")
+    }
+
+    #[test]
+    fn dmarc_report_limits_are_validated() {
+        let mut cfg = Config::load(&example_path()).expect("example config");
+        cfg.auth.dmarc_reports.retention_days = 0;
+        assert!(cfg.validate().is_err());
+        cfg.auth.dmarc_reports.retention_days = 61;
+        assert!(cfg.validate().is_err());
+        cfg.auth.dmarc_reports.retention_days = 60;
+        cfg.validate().expect("60 days is allowed");
+        cfg.auth.dmarc_reports.max_domains_per_org = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_domains_per_org"), "{err}");
     }
 
     #[test]

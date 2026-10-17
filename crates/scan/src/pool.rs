@@ -9,9 +9,10 @@
 //! message closed (quarantine). A worker that cannot be started at all
 //! (missing binary, sandbox unavailable, no disk) is an infrastructure
 //! fault: the message is deferred, not judged.
+use crate::engines::yara::CompiledRules;
 use currawong_core::config::ExtractLimits;
 use currawong_parser::ipc::{codec, READY_ID, STARTUP_ID};
-use currawong_parser::{ParseRequest, ParseResponse};
+use currawong_parser::{LoadRules, ParseRequest, ParseResponse};
 use futures::{SinkExt, StreamExt};
 use sha2::{Digest, Sha256};
 use std::{
@@ -55,6 +56,7 @@ pub struct WorkerPool {
     work_dir: PathBuf,
     landlock_required: bool,
     user: Option<(u32, u32)>,
+    load_timeout: Duration,
     slots: Vec<Mutex<Option<Worker>>>,
     next: AtomicUsize,
 }
@@ -64,6 +66,8 @@ struct Worker {
     stdin: FramedWrite<ChildStdin, LengthDelimitedCodec>,
     stdout: FramedRead<ChildStdout, LengthDelimitedCodec>,
     jobs: u64,
+    /// YARA rules generation this worker has loaded.
+    yara_generation: Option<u64>,
     /// Removed when the worker is dropped.
     dir: tempfile::TempDir,
 }
@@ -84,6 +88,7 @@ impl WorkerPool {
             work_dir: std::env::temp_dir(),
             landlock_required: true,
             user: None,
+            load_timeout: Duration::from_secs(120),
             slots: vec![Mutex::new(None)],
             next: AtomicUsize::new(0),
         }
@@ -123,8 +128,15 @@ impl WorkerPool {
         self.timeout
     }
 
+    /// Loading rules recompiles their wasm in the worker, so it gets its own
+    /// timeout and happens once per worker and rules generation.
+    pub fn with_rules_load_timeout(mut self, secs: u64) -> Self {
+        self.load_timeout = Duration::from_secs(secs.max(1));
+        self
+    }
+
     pub async fn scan_file(&self, id: &str, path: &Path, limits: &ExtractLimits) -> ScanOutcome {
-        self.scan_file_into(id, path, limits, None).await
+        self.scan_job(id, path, limits, None, None).await
     }
 
     /// Parses `path`. With `dest`, checked parts are moved there and
@@ -136,8 +148,31 @@ impl WorkerPool {
         limits: &ExtractLimits,
         dest: Option<&Path>,
     ) -> ScanOutcome {
+        self.scan_job(id, path, limits, dest, None).await
+    }
+
+    /// Scan with YARA rules from [`crate::YaraEngine`]. They are sent to the
+    /// worker first if it does not have this generation yet.
+    pub async fn scan_file_with_rules(
+        &self,
+        id: &str,
+        path: &Path,
+        limits: &ExtractLimits,
+        rules: Option<&CompiledRules>,
+    ) -> ScanOutcome {
+        self.scan_job(id, path, limits, None, rules).await
+    }
+
+    pub async fn scan_job(
+        &self,
+        id: &str,
+        path: &Path,
+        limits: &ExtractLimits,
+        dest: Option<&Path>,
+        rules: Option<&CompiledRules>,
+    ) -> ScanOutcome {
         let mut slot = self.acquire().await;
-        match self.run(&mut slot, id, path, limits, dest).await {
+        match self.run(&mut slot, id, path, limits, dest, rules).await {
             Ok(response) => match response.error {
                 Some(reason) => ScanOutcome::Failed { reason },
                 None => ScanOutcome::Parsed(response),
@@ -193,6 +228,7 @@ impl WorkerPool {
         path: &Path,
         limits: &ExtractLimits,
         dest: Option<&Path>,
+        rules: Option<&CompiledRules>,
     ) -> Result<ParseResponse, Fault> {
         if slot
             .as_mut()
@@ -207,6 +243,14 @@ impl WorkerPool {
         let worker = slot
             .as_mut()
             .ok_or_else(|| Fault::Unavailable("worker missing".into()))?;
+        if let Some(rules) = rules {
+            if worker.yara_generation != Some(rules.generation) {
+                timeout(self.load_timeout, load_rules(worker, rules))
+                    .await
+                    .map_err(|_| Fault::Failed("yara rules load timed out".into()))?
+                    .map_err(Fault::Failed)?;
+            }
+        }
         let input = worker.dir.path().join("in").join(INPUT_NAME);
         let out = worker.dir.path().join("out");
         self.stage(path, &input, &out).map_err(Fault::Unavailable)?;
@@ -216,6 +260,7 @@ impl WorkerPool {
             limits: limits.clone(),
             // Parts are written only when the caller wants them.
             out_dir: dest.map(|_| out.clone()),
+            yara_generation: rules.map(|rules| rules.generation),
         };
         let bytes = serde_json::to_vec(&request).map_err(|err| Fault::Failed(err.to_string()))?;
         worker.jobs += 1;
@@ -339,9 +384,16 @@ impl WorkerPool {
             .ok_or_else(|| unavailable("worker stdout".into()))?;
         let mut worker = Worker {
             child,
-            stdin: FramedWrite::new(stdin, codec()),
+            // Rules frames are far larger than requests.
+            stdin: FramedWrite::new(
+                stdin,
+                LengthDelimitedCodec::builder()
+                    .max_frame_length(LoadRules::MAX_FRAME_BYTES)
+                    .new_codec(),
+            ),
             stdout: FramedRead::new(stdout, codec()),
             jobs: 0,
+            yara_generation: None,
             dir,
         };
         // The worker sends `ready` once its sandbox is in place.
@@ -394,6 +446,36 @@ pub fn sweep(work_dir: &Path, prefixes: &[&str]) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Sends the serialised rules and waits for the worker to load them. Not
+/// counted as a job.
+async fn load_rules(worker: &mut Worker, rules: &CompiledRules) -> Result<(), String> {
+    let frame = serde_json::to_vec(&LoadRules {
+        generation: rules.generation,
+        yara_rules: rules.encoded.clone(),
+    })
+    .map_err(|err| err.to_string())?;
+    worker
+        .stdin
+        .send(bytes::Bytes::from(frame))
+        .await
+        .map_err(|err| format!("yara rules frame: {err}"))?;
+    let reply = worker
+        .stdout
+        .next()
+        .await
+        .ok_or("worker closed during yara rules load")?
+        .map_err(|err| err.to_string())?;
+    let reply: ParseResponse = serde_json::from_slice(&reply).map_err(|err| err.to_string())?;
+    if reply.id != LoadRules::REPLY_ID {
+        return Err(format!("yara rules load answered {:?}", reply.id));
+    }
+    if let Some(err) = reply.error {
+        return Err(format!("yara rules load: {err}"));
+    }
+    worker.yara_generation = Some(rules.generation);
+    Ok(())
 }
 
 async fn kill(slot: &mut Option<Worker>) {

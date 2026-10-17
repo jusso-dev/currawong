@@ -2,6 +2,7 @@
 use crate::archive::{self, passwords_from_message, Budget};
 use crate::filetype::{self, FileKind};
 use crate::ipc::{ParseRequest, ParseResponse};
+use crate::yara::{RulesCache, YaraScan};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
@@ -9,6 +10,7 @@ use mail_parser::{Encoding, Message, MessageParser, MessagePart, MimeHeaders, Pa
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
+use yara_x::Rules;
 
 /// URLs reported per message. Keeps the response frame bounded.
 const MAX_URLS: usize = 512;
@@ -17,13 +19,20 @@ const MAX_URLS: usize = 512;
 const MAX_NESTED_MESSAGES: usize = 32;
 const MAX_MULTIPARTS: usize = 512;
 
-pub fn parse_request(req: &ParseRequest) -> ParseResponse {
+pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseResponse {
     let raw = match fs::read(&req.raw_path) {
         Ok(raw) => raw,
         Err(err) => return ParseResponse::failed(&req.id, format!("read input: {err}")),
     };
+    let rules = match req.yara_generation {
+        Some(generation) => match cache.get(generation) {
+            Ok(rules) => Some(rules),
+            Err(err) => return ParseResponse::failed(&req.id, err),
+        },
+        None => None,
+    };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_with(&req.id, &raw, &req.limits, req.out_dir.as_deref())
+        parse_full(&req.id, &raw, &req.limits, req.out_dir.as_deref(), rules)
     })) {
         Ok(response) => response,
         Err(_) => ParseResponse::failed(&req.id, "parser panicked"),
@@ -34,6 +43,17 @@ pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseRespons
     parse_with(id, raw, limits, None)
 }
 
+/// Parse, and match YARA rules against the raw message, every MIME part and
+/// every archive member.
+pub fn parse_bytes_with(
+    id: &str,
+    raw: &[u8],
+    limits: &ExtractLimits,
+    rules: Option<&Rules>,
+) -> ParseResponse {
+    parse_full(id, raw, limits, None, rules)
+}
+
 /// Parses `raw`. Limits apply to the whole message, not to each attachment.
 /// With `out_dir`, decoded parts are written there for the AV engines.
 pub fn parse_with(
@@ -41,6 +61,16 @@ pub fn parse_with(
     raw: &[u8],
     limits: &ExtractLimits,
     out_dir: Option<&Path>,
+) -> ParseResponse {
+    parse_full(id, raw, limits, out_dir, None)
+}
+
+pub fn parse_full(
+    id: &str,
+    raw: &[u8],
+    limits: &ExtractLimits,
+    out_dir: Option<&Path>,
+    rules: Option<&Rules>,
 ) -> ParseResponse {
     if let Some(reason) = nesting_limit(raw) {
         return ParseResponse::failed(id, reason);
@@ -50,8 +80,12 @@ pub fn parse_with(
     };
     let mut text = String::new();
     collect_text(&message, &mut text, limits.max_depth);
+    let mut yara = rules.map(YaraScan::new);
+    if let Some(yara) = yara.as_mut() {
+        yara.scan("message", raw);
+    }
     let mut walk = Walk {
-        budget: Budget::new(limits, out_dir),
+        budget: Budget::new(limits, out_dir).with_yara(yara.as_mut()),
         passwords: passwords_from_message(&text),
         parts: Vec::new(),
         urls: Vec::new(),
@@ -63,31 +97,41 @@ pub fn parse_with(
             .part(None, Some("message/rfc822".into()), raw, Vec::new());
         walk.parts.push(part);
     }
-    if let Some(err) = walk.budget.store_failed {
+    let Walk {
+        budget,
+        parts,
+        mut urls,
+        ..
+    } = walk;
+    if let Some(err) = budget.store_failed {
         return ParseResponse::failed(id, err);
     }
-    let mut urls = walk.urls;
+    let (yara, error) = match yara {
+        Some(scan) => (scan.matches, scan.error),
+        None => (Vec::new(), None),
+    };
     urls.extend(crate::fuzz::urls_in(raw).into_iter().take(32));
     urls.sort();
     urls.dedup();
     urls.truncate(MAX_URLS);
     ParseResponse {
         id: id.to_string(),
-        parts: walk.parts,
+        parts,
         urls,
-        error: None,
+        error,
         warnings: Vec::new(),
+        yara,
     }
 }
 
-struct Walk {
-    budget: Budget,
+struct Walk<'a, 'r> {
+    budget: Budget<'a, 'r>,
     passwords: Vec<String>,
     parts: Vec<PartInfo>,
     urls: Vec<String>,
 }
 
-impl Walk {
+impl Walk<'_, '_> {
     /// Every leaf part once, descending into attached messages.
     fn message(&mut self, message: &Message<'_>) {
         for part in &message.parts {

@@ -9,7 +9,8 @@
 use bytes::Bytes;
 use currawong_parser::ipc::{codec, MAX_FRAME, READY_ID, STARTUP_ID};
 use currawong_parser::sandbox::{self, SandboxConfig, WorkerLimits};
-use currawong_parser::{parse_request, ParseRequest, ParseResponse};
+use currawong_parser::yara::RulesCache;
+use currawong_parser::{parse_request, LoadRules, ParseRequest, ParseResponse};
 use futures::{SinkExt, StreamExt};
 use std::io;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -63,7 +64,12 @@ async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
             }
         }
     }
-    let mut reader = FramedRead::new(tokio::io::stdin(), codec());
+    // Requests are small, but YARA rule frames can be large.
+    let request_codec = LengthDelimitedCodec::builder()
+        .max_frame_length(LoadRules::MAX_FRAME_BYTES)
+        .new_codec();
+    let mut reader = FramedRead::new(tokio::io::stdin(), request_codec);
+    let mut rules = RulesCache::default();
     while let Some(frame) = reader.next().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -74,9 +80,15 @@ async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
                 break;
             }
         };
+        if let Ok(load) = serde_json::from_slice::<LoadRules>(&frame) {
+            if send(&mut writer, &rules.load(&load)).await.is_err() {
+                break;
+            }
+            continue;
+        }
         let response = match serde_json::from_slice::<ParseRequest>(&frame) {
             Ok(request) => match sandbox::start_job(&limits) {
-                Ok(()) => parse_on_big_stack(request),
+                Ok(()) => parse_on_big_stack(request, &mut rules),
                 Err(err) => ParseResponse::failed(&request.id, format!("cpu limit: {err}")),
             },
             Err(err) => ParseResponse::failed("request", err.to_string()),
@@ -91,15 +103,17 @@ async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
 /// virtual memory, so it counts against the address-space limit.
 const PARSE_STACK: usize = 64 * 1024 * 1024;
 
-fn parse_on_big_stack(request: ParseRequest) -> ParseResponse {
+fn parse_on_big_stack(request: ParseRequest, rules: &mut RulesCache) -> ParseResponse {
     let id = request.id.clone();
-    std::thread::Builder::new()
-        .name("parse".into())
-        .stack_size(PARSE_STACK)
-        .spawn(move || parse_request(&request))
-        .map_err(|err| format!("parse thread: {err}"))
-        .and_then(|handle| handle.join().map_err(|_| "parser panicked".to_string()))
-        .unwrap_or_else(|reason| ParseResponse::failed(id, reason))
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("parse".into())
+            .stack_size(PARSE_STACK)
+            .spawn_scoped(scope, || parse_request(&request, rules))
+            .map_err(|err| format!("parse thread: {err}"))
+            .and_then(|handle| handle.join().map_err(|_| "parser panicked".to_string()))
+    })
+    .unwrap_or_else(|reason| ParseResponse::failed(id, reason))
 }
 
 /// A response too big for one frame becomes a failure for the same job.
