@@ -44,8 +44,11 @@ fn envelope(from: &str) -> Envelope {
     }
 }
 
+/// An activated key, as after `dkim activate`.
 fn key(selector: &str, algorithm: &str) -> StoredKey {
-    generate("local", "example.test", selector, algorithm).unwrap()
+    let mut key = generate("local", "example.test", selector, algorithm).unwrap();
+    key.active = true;
+    key
 }
 
 fn checker_with(keys: &[&StoredKey]) -> AuthChecker {
@@ -256,6 +259,49 @@ fn sign_missing_kek_is_not_silently_regenerated() {
     assert!(!kek.exists());
 }
 
+/// Re-review finding 9: blobs are bound to their row, legacy blobs are
+/// refused and the database is created 0600.
+#[test]
+fn sign_key_blobs_are_bound_to_their_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("keys.sqlite");
+    let store = KeyStore::open(&db, &dir.path().join("kek")).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&db).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    store.insert(&key("s1", "ed25519")).unwrap();
+    store.insert(&key("s2", "ed25519")).unwrap();
+    assert_eq!(
+        store
+            .publishable_keys("local", "example.test", 0)
+            .unwrap()
+            .len(),
+        2
+    );
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "UPDATE dkim_keys SET private_key_enc = (SELECT private_key_enc FROM dkim_keys WHERE selector = 's1') WHERE selector = 's2'",
+        [],
+    )
+    .unwrap();
+    let err = store
+        .publishable_keys("local", "example.test", 0)
+        .unwrap_err();
+    assert!(err.contains("another row"), "{err}");
+    conn.execute(
+        "UPDATE dkim_keys SET private_key_enc = substr(private_key_enc, 5) WHERE selector = 's2'",
+        [],
+    )
+    .unwrap();
+    let err = store
+        .publishable_keys("local", "example.test", 0)
+        .unwrap_err();
+    assert!(err.contains("legacy"), "{err}");
+}
+
 fn currawong_auth_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -275,8 +321,23 @@ async fn sign_rotation_keeps_old_selector_valid_for_seven_days() {
     before.extend_from_slice(&raw);
     assert!(String::from_utf8_lossy(&before).contains("s=2026a"));
 
+    // A new selector is pending until activated: it is published, not used.
     let now = currawong_auth_now();
-    store.rotate(&key("2026b", "ed25519"), now).unwrap();
+    let next = generate("local", "example.test", "2026b", "ed25519").unwrap();
+    assert_eq!(next.state(), "pending");
+    store.insert(&next).unwrap();
+    let pending = sign_outbound(&store, &raw, "local").unwrap();
+    assert!(
+        pending.contains("s=2026a") && !pending.contains("s=2026b"),
+        "{pending}"
+    );
+    assert!(store
+        .publishable_keys("local", "example.test", now)
+        .unwrap()
+        .iter()
+        .any(|item| item.selector == "2026b" && item.state() == "pending"));
+    store.activate(&next.id, now).unwrap();
+    // Activation clears the decrypted-key cache straight away.
     let after = sign_outbound(&store, &raw, "local").unwrap();
     assert!(
         after.contains("s=2026b") && !after.contains("s=2026a"),
@@ -370,4 +431,30 @@ async fn sign_arc_seal_verifies_and_chains() {
     hop2.extend_from_slice(&hop1);
     let third = next.check(&hop2, &envelope("user@example.test")).await;
     assert_eq!(third.arc.result, "pass", "{}", third.header);
+}
+
+/// Re-review finding 11: headers added in transit (a second Subject, a Cc
+/// or Reply-To that was absent at signing) break the signature.
+#[tokio::test]
+async fn sign_oversigned_headers_cannot_be_added_in_transit() {
+    let key = key("ed", "ed25519");
+    let signed = sign_message(&message(), &key).unwrap();
+    for added in [
+        "Subject: urgent: new bank details\r\n",
+        "Reply-To: attacker@evil.test\r\n",
+        "Cc: someone@evil.test\r\n",
+    ] {
+        let text = String::from_utf8(signed.clone()).unwrap();
+        let split = text.find("From: user@example.test").unwrap();
+        let tampered = format!("{}{added}{}", &text[..split], &text[split..]);
+        let results = checker_with(&[&key])
+            .check(tampered.as_bytes(), &envelope("user@example.test"))
+            .await;
+        assert_eq!(
+            dkim_results(&results),
+            vec!["fail"],
+            "{added}: {}",
+            results.header
+        );
+    }
 }

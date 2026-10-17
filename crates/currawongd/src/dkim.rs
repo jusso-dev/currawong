@@ -1,12 +1,18 @@
-//! `currawongd dkim ...`: generate and rotate keys, print the DNS records to
-//! publish. Stands in for the admin API until that crate exists.
+//! `currawongd dkim ...`: generate keys, print the DNS records to publish,
+//! and activate a key once DNS serves its record. Stands in for the admin
+//! API until that crate exists.
+//!
+//! Rotation is `generate` with a new selector, publish, then `activate`:
+//! activation retires the previous key of the same algorithm, whose record
+//! must stay in DNS for seven days.
 use clap::Subcommand;
-use currawong_auth::{generate, KeyStore, StoredKey};
+use currawong_auth::{generate, now_secs, AuthChecker, KeyStore, StoredKey};
 use currawong_core::config::Config;
 
 #[derive(Debug, Subcommand)]
 pub enum DkimCommand {
-    /// Create a key for a tenant domain and print its TXT record.
+    /// Create a pending key and print the TXT record to publish. It does
+    /// not sign until `activate`.
     Generate {
         #[arg(long)]
         tenant: String,
@@ -18,19 +24,17 @@ pub enum DkimCommand {
         #[arg(long, default_value = "rsa")]
         algorithm: String,
     },
-    /// Create a new selector and retire the active key of the same
-    /// algorithm. The old record must stay in DNS for seven days.
-    Rotate {
+    /// Check DNS serves the selector's record, then make the key active and
+    /// retire the previous active key of the same algorithm.
+    Activate {
         #[arg(long)]
         tenant: String,
         #[arg(long)]
         domain: String,
         #[arg(long)]
         selector: String,
-        #[arg(long, default_value = "rsa")]
-        algorithm: String,
     },
-    /// Print every record that should currently be published.
+    /// Print every record that should be in DNS now, with its state.
     Records {
         #[arg(long)]
         tenant: String,
@@ -39,10 +43,11 @@ pub enum DkimCommand {
     },
 }
 
-/// Runs the command and returns what to print.
-pub fn run(cfg: &Config, command: DkimCommand) -> Result<String, String> {
+/// Runs the command and returns what to print. `dns` is only used by
+/// `activate`.
+pub async fn run(cfg: &Config, command: DkimCommand, dns: &AuthChecker) -> Result<String, String> {
     let store = KeyStore::open(&cfg.dkim.database, &cfg.dkim.kek_path)?;
-    let now = now();
+    let now = now_secs();
     match command {
         DkimCommand::Generate {
             tenant,
@@ -52,19 +57,43 @@ pub fn run(cfg: &Config, command: DkimCommand) -> Result<String, String> {
         } => {
             let key = generate(&tenant, &domain, &selector, &algorithm)?;
             store.insert(&key)?;
-            Ok(record(&key))
+            Ok(format!(
+                "{}publish this record, then run: currawongd dkim activate --tenant {} --domain {} --selector {}\n",
+                record(&key),
+                key.tenant_id,
+                key.domain,
+                key.selector
+            ))
         }
-        DkimCommand::Rotate {
+        DkimCommand::Activate {
             tenant,
             domain,
             selector,
-            algorithm,
         } => {
-            let key = generate(&tenant, &domain, &selector, &algorithm)?;
-            store.rotate(&key, now)?;
+            let key = store
+                .find(&tenant, &domain, &selector)?
+                .ok_or_else(|| format!("no key {selector} for {tenant} {domain}"))?;
+            if key.state() != "pending" {
+                return Err(format!(
+                    "{} is {}, not pending",
+                    key.dns_name(),
+                    key.state()
+                ));
+            }
+            match dns.dkim_record_published(&key).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "{} does not serve this key yet; publish it and retry",
+                        key.dns_name()
+                    ))
+                }
+                Err(err) => return Err(format!("{} is not published: {err}", key.dns_name())),
+            }
+            store.activate(&key.id, now)?;
             Ok(format!(
-                "{}; keep the previous selector published for seven days\n",
-                record(&key).trim_end()
+                "{} is active; keep retired selectors published for seven days\n",
+                key.dns_name()
             ))
         }
         DkimCommand::Records { tenant, domain } => Ok(store
@@ -75,7 +104,9 @@ pub fn run(cfg: &Config, command: DkimCommand) -> Result<String, String> {
     }
 }
 
-/// Zone-file line. TXT strings are split at 255 bytes (RFC 1035 3.3.14) so
+/// Zone-file line with the key's state: `pending` (publish, not signing
+/// yet), `active` (signing) or `retired` (keep until seven days after
+/// retirement). TXT strings are split at 255 bytes (RFC 1035 3.3.14) so
 /// RSA-2048 records load as is.
 pub fn record(key: &StoredKey) -> String {
     let chunks: Vec<String> = key
@@ -84,17 +115,10 @@ pub fn record(key: &StoredKey) -> String {
         .chunks(255)
         .map(|chunk| format!("\"{}\"", String::from_utf8_lossy(chunk)))
         .collect();
-    let state = if key.active { "active" } else { "retired" };
     format!(
-        "{}. IN TXT {} ; {state}\n",
+        "{}. IN TXT {} ; {}\n",
         key.dns_name(),
-        chunks.join(" ")
+        chunks.join(" "),
+        key.state()
     )
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
 }

@@ -34,7 +34,7 @@ url = "2"
 ipnet = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 argon2 = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 governor = "0.8"

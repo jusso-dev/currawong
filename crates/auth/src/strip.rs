@@ -48,7 +48,10 @@ fn claims_id(field: &[u8], id: &[u8]) -> bool {
         .copied()
         .filter(|&byte| byte != b'\r' && byte != b'\n')
         .collect();
-    normalise(&authserv_id(&value)) == id
+    let found = authserv_id(&value);
+    // Control bytes (FF, VT, NUL, DEL...) hide an id from us while other
+    // parsers may skip them, so such a header is never trusted.
+    found.iter().any(u8::is_ascii_control) || normalise(&found) == id
 }
 
 /// First token or quoted-string after optional CFWS.
@@ -75,7 +78,7 @@ fn authserv_id(value: &[u8]) -> Vec<u8> {
         return out;
     }
     while let Some(&byte) = value.get(index) {
-        if byte == b';' || byte == b'(' || byte.is_ascii_whitespace() {
+        if byte == b';' || byte == b'(' || byte == b' ' || byte == b'\t' {
             break;
         }
         out.push(byte);
@@ -144,6 +147,26 @@ mod tests {
             assert!(!text.contains("dkim=pass"), "kept {forged:?}: {text}");
             assert!(text.contains("Subject: hi"), "{text}");
         }
+    }
+
+    /// Re-review finding 6: FF and VT are not CFWS, and an authserv-id with
+    /// control characters is never trusted downstream, so it is dropped.
+    #[test]
+    fn control_characters_in_the_authserv_id_are_dropped() {
+        for forged in [
+            "Authentication-Results: currawong.example.test\x0c; dkim=pass\r\n",
+            "Authentication-Results: currawong.example.test\x0b; dkim=pass\r\n",
+            "Authentication-Results: currawong\x00.example.test; dkim=pass\r\n",
+            "Authentication-Results: \"currawong.example.test\x7f\"; dkim=pass\r\n",
+        ] {
+            let text = stripped(forged);
+            assert!(!text.contains("dkim=pass"), "kept {forged:?}");
+        }
+        // Non-atom bytes are a different id, not ours: kept.
+        assert!(
+            stripped("Authentication-Results: currawong.example.test,x; dkim=pass\r\n")
+                .contains("dkim=pass")
+        );
     }
 
     #[test]

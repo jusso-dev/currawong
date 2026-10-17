@@ -47,7 +47,11 @@ async fn main() {
         return;
     }
     if let Some(Command::Dkim(command)) = args.command {
-        match currawongd::dkim::run(&cfg, command) {
+        let result = match AuthChecker::new(&cfg.auth.authserv_id) {
+            Ok(dns) => currawongd::dkim::run(&cfg, command, &dns).await,
+            Err(err) => Err(err),
+        };
+        match result {
             Ok(out) => print!("{out}"),
             Err(err) => {
                 eprintln!("currawongd: {err}");

@@ -52,8 +52,8 @@ async fn classify_one(
         .await
         .map_err(|err| err.to_string())?;
     let body_path = spool_body(spool, &env);
-    let (report, verdict) = pipeline.evaluate(&env, &raw, body_path.as_deref()).await;
-    env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report);
+    let (_report, verdict, headers) = pipeline.classify(&env, &raw, body_path.as_deref()).await;
+    env.prepend_headers = headers;
     match &verdict {
         Verdict::Deliver => {
             env.pipeline = "deliver".into();

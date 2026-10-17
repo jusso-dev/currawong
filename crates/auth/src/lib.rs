@@ -5,7 +5,7 @@ mod sign;
 mod strip;
 
 pub use cache::TxtCache;
-pub use keys::{generate, publishable, KeyStore, StoredKey, GATEWAY_TENANT};
+pub use keys::{generate, now_secs, publishable, KeyStore, StoredKey, GATEWAY_TENANT};
 pub use sign::{sign, sign_message, sign_outbound};
 pub use strip::strip_forged;
 
@@ -14,7 +14,7 @@ use currawong_spool::Envelope;
 use mail_auth::{
     common::{headers::HeaderWriter, parse::TxtRecordParser, verify::DomainKey},
     dmarc::{verify::DmarcParameters, Dmarc, Policy},
-    hickory_resolver::config::{ResolverConfig, ResolverOpts},
+    hickory_resolver::config::{ConnectionConfig, NameServerConfig, ResolverConfig, ResolverOpts},
     spf::{verify::SpfParameters, Spf},
     AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, MessageAuthenticator,
     Parameters, SpfResult, Txt,
@@ -46,6 +46,23 @@ impl AuthChecker {
         Ok(Self::with_parts(authserv_id, resolver, TxtCache::offline()))
     }
 
+    /// Checker that sends every query to one name server over UDP.
+    pub fn with_name_server(
+        authserv_id: impl Into<String>,
+        server: std::net::SocketAddr,
+    ) -> Result<Self, String> {
+        let mut connection = ConnectionConfig::udp();
+        connection.port = server.port();
+        let name_server = NameServerConfig::new(server.ip(), true, vec![connection]);
+        let mut opts = ResolverOpts::default();
+        opts.attempts = 1;
+        opts.timeout = std::time::Duration::from_secs(2);
+        let resolver =
+            MessageAuthenticator::new(ResolverConfig::from_name_servers(vec![name_server]), opts)
+                .map_err(|err| err.to_string())?;
+        Ok(Self::with_parts(authserv_id, resolver, TxtCache::new()))
+    }
+
     fn with_parts(
         authserv_id: impl Into<String>,
         resolver: MessageAuthenticator,
@@ -56,6 +73,31 @@ impl AuthChecker {
             resolver,
             cache,
         }
+    }
+
+    /// True when DNS serves a DKIM record at the key's selector whose `p=`
+    /// matches the key. Checked before a pending key is activated.
+    pub async fn dkim_record_published(&self, key: &StoredKey) -> Result<bool, String> {
+        use mail_auth::hickory_resolver::proto::rr::RData;
+        let name = format!("{}.", key.dns_name());
+        let lookup = self
+            .resolver
+            .resolver()
+            .txt_lookup(name.as_str())
+            .await
+            .map_err(|err| format!("{name}: {err}"))?;
+        let want = public_key_tag(&key.public_txt);
+        Ok(lookup.answers().iter().any(|record| match &record.data {
+            RData::TXT(txt) => {
+                let joined: Vec<u8> = txt
+                    .txt_data
+                    .iter()
+                    .flat_map(|part| part.iter().copied())
+                    .collect();
+                want.is_some() && public_key_tag(&String::from_utf8_lossy(&joined)) == want
+            }
+            _ => false,
+        }))
     }
 
     pub fn authserv_id(&self) -> &str {
@@ -83,7 +125,7 @@ impl AuthChecker {
         let Some(message) = AuthenticatedMessage::parse(&stripped) else {
             return empty(&self.authserv_id);
         };
-        let dkim_params = Parameters::new(&message).with_txt_cache(&self.cache);
+        let dkim_params = Parameters::new(&message).with_txt_cache(&self.cache.dkim);
         let dkim = self.resolver.verify_dkim(dkim_params).await;
         let helo = if env.helo.is_empty() {
             "localhost"
@@ -99,7 +141,7 @@ impl AuthChecker {
         };
         let spf_input =
             SpfParameters::verify_mail_from(env.remote_ip, helo, &self.authserv_id, sender);
-        let spf_params = Parameters::new(spf_input).with_txt_cache(&self.cache);
+        let spf_params = Parameters::new(spf_input).with_txt_cache(&self.cache.spf);
         let spf = self.resolver.verify_spf(spf_params).await;
         let mail_from_domain = sender
             .rsplit_once('@')
@@ -107,9 +149,9 @@ impl AuthChecker {
             .unwrap_or(sender);
         let header_from = message.from.first().map(String::as_str).unwrap_or("");
         let dmarc_input = DmarcParameters::new(&message, &dkim, mail_from_domain, &spf);
-        let dmarc_params = Parameters::new(dmarc_input).with_txt_cache(&self.cache);
+        let dmarc_params = Parameters::new(dmarc_input).with_txt_cache(&self.cache.dmarc);
         let dmarc = self.resolver.verify_dmarc(dmarc_params).await;
-        let arc_params = Parameters::new(&message).with_txt_cache(&self.cache);
+        let arc_params = Parameters::new(&message).with_txt_cache(&self.cache.dkim);
         let arc = self.resolver.verify_arc(arc_params).await;
         let built = AuthenticationResults::new(&self.authserv_id)
             .with_dkim_results(&dkim, header_from)
@@ -195,6 +237,14 @@ fn dmarc_method(result: DmarcResult) -> AuthMethodResult {
         result: label.into(),
         detail: String::new(),
     }
+}
+
+/// The `p=` tag of a DKIM record with whitespace removed.
+fn public_key_tag(record: &str) -> Option<String> {
+    record.split(';').find_map(|tag| {
+        let (name, value) = tag.split_once('=')?;
+        (name.trim() == "p").then(|| value.chars().filter(|ch| !ch.is_whitespace()).collect())
+    })
 }
 
 fn policy_label(policy: Policy) -> &'static str {

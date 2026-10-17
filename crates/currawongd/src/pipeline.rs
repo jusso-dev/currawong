@@ -1,5 +1,5 @@
 //! Auth, parse, scan and the M1 policy decision.
-use currawong_auth::{AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
+use currawong_auth::{strip_forged, AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
@@ -17,7 +17,7 @@ pub struct Pipeline {
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
     /// DKIM and ARC keys. `None` means nothing is signed or sealed.
-    pub keys: Option<KeyStore>,
+    pub keys: Option<Arc<KeyStore>>,
 }
 
 impl Pipeline {
@@ -39,38 +39,105 @@ impl Pipeline {
     }
 
     pub fn with_keys(mut self, keys: KeyStore) -> Self {
-        self.keys = Some(keys);
+        self.keys = Some(Arc::new(keys));
         self
     }
 
-    /// Headers the deliverer prepends: our Authentication-Results (plus the
-    /// ARC set when sealing), then DKIM signatures for outbound tenant mail.
-    /// Replaces any earlier set so re-evaluating deferred mail never stacks.
-    pub fn delivery_headers(&self, env: &Envelope, raw: &[u8], report: &ScanReport) -> Vec<String> {
-        let mut headers: Vec<String> = report.auth.iter().map(auth_header).collect();
-        if let (Some(keys), Some(tenant), Direction::Outbound, true) = (
-            &self.keys,
-            &env.tenant_id,
-            env.direction,
-            self.cfg.dkim.sign_outbound,
-        ) {
-            match currawong_auth::sign_outbound(keys, raw, tenant) {
-                Ok(signed) if !signed.is_empty() => headers.push(signed),
-                Ok(_) => tracing::warn!(id = %env.id, %tenant, "no DKIM key for sender domain"),
-                Err(err) => tracing::error!(id = %env.id, %err, "DKIM signing failed"),
+    /// Evaluate a spooled message and build the headers to prepend. Forged
+    /// Authentication-Results left in older spool files are stripped from
+    /// `body_path` first, so they are never delivered. A DKIM signing
+    /// failure defers rather than sending the mail unsigned.
+    pub async fn classify(
+        &mut self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, Verdict, Vec<String>) {
+        let cleaned = strip_forged(raw, self.auth.authserv_id());
+        if cleaned.len() != raw.len() {
+            if let Some(path) = body_path {
+                if let Err(err) = rewrite_body(path, &cleaned).await {
+                    let reason = format!("could not strip forged headers: {err}");
+                    let report = ScanReport::new(env.id.clone());
+                    return (report, Verdict::Defer { reason }, Vec::new());
+                }
             }
         }
-        headers
+        let (report, verdict) = self.evaluate(env, &cleaned, body_path).await;
+        if !matches!(verdict, Verdict::Deliver) {
+            let headers = self.auth_headers(env, &report);
+            return (report, verdict, headers);
+        }
+        match self.delivery_headers(env, &cleaned, &report).await {
+            Ok(headers) => (report, verdict, headers),
+            Err(reason) => {
+                tracing::error!(id = %env.id, %reason, "deferring: outbound signing failed");
+                (report, Verdict::Defer { reason }, Vec::new())
+            }
+        }
+    }
+
+    /// Our Authentication-Results, for inbound mail only: on outbound mail
+    /// it would leak internal addresses and attest a meaningless SPF result.
+    fn auth_headers(&self, env: &Envelope, report: &ScanReport) -> Vec<String> {
+        match env.direction {
+            Direction::Inbound => report.auth.iter().map(auth_header).collect(),
+            Direction::Outbound => Vec::new(),
+        }
+    }
+
+    /// Headers the deliverer prepends. Inbound: Authentication-Results, plus
+    /// an ARC set when a stage modified the message. Outbound: DKIM
+    /// signatures with the tenant's active keys. Replaces any earlier set so
+    /// re-evaluating deferred mail never stacks. `Err` when the tenant has a
+    /// key but signing failed.
+    pub async fn delivery_headers(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &ScanReport,
+    ) -> Result<Vec<String>, String> {
+        if env.direction == Direction::Inbound {
+            if report.modified {
+                if let Some(sealer) = self.arc_sealer().await {
+                    let sealed = self.auth.check_and_seal(raw, env, Some(&sealer)).await;
+                    return Ok(vec![sealed.header]);
+                }
+            }
+            return Ok(self.auth_headers(env, report));
+        }
+        let (Some(keys), Some(tenant), true) =
+            (&self.keys, &env.tenant_id, self.cfg.dkim.sign_outbound)
+        else {
+            return Ok(Vec::new());
+        };
+        let (keys, tenant_id, owned) = (Arc::clone(keys), tenant.clone(), raw.to_vec());
+        let signed = tokio::task::spawn_blocking(move || {
+            currawong_auth::sign_outbound(&keys, &owned, &tenant_id)
+        })
+        .await
+        .map_err(|err| err.to_string())??;
+        if signed.is_empty() {
+            tracing::warn!(id = %env.id, %tenant, "no active DKIM key for sender domain");
+            return Ok(Vec::new());
+        }
+        Ok(vec![signed])
     }
 
     /// Active gateway key for the authserv-id domain, RSA first because
     /// RFC 8617 verifiers are only required to support rsa-sha256.
-    fn arc_sealer(&self) -> Option<StoredKey> {
+    async fn arc_sealer(&self) -> Option<StoredKey> {
         if !self.cfg.dkim.seal_arc {
             return None;
         }
-        let keys = self.keys.as_ref()?;
-        match keys.signing_keys(GATEWAY_TENANT, self.auth.authserv_id(), now()) {
+        let keys = Arc::clone(self.keys.as_ref()?);
+        let domain = self.auth.authserv_id().to_string();
+        let found =
+            tokio::task::spawn_blocking(move || keys.signing_keys(GATEWAY_TENANT, &domain, now()))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|found| found);
+        match found {
             Ok(mut found) => {
                 found.sort_by_key(|key| key.algorithm != "rsa-sha256");
                 found.into_iter().next()
@@ -89,8 +156,15 @@ impl Pipeline {
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
         let mut report = ScanReport::new(env.id.clone());
-        let sealer = self.arc_sealer();
-        let auth = self.auth.check_and_seal(raw, env, sealer.as_ref()).await;
+        let auth = self.auth.check(raw, env).await;
+        // The DMARC record could not be fetched, so its policy is unknown:
+        // retry rather than deliver a possible p=reject spoof.
+        if auth.dmarc.result == "temperror" {
+            report.defer = true;
+            report
+                .notes
+                .push("dmarc temperror: policy DNS unreachable".into());
+        }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             let verdict = decide(&report);
@@ -231,6 +305,16 @@ pub fn worker_binary(cfg: &Config) -> Option<std::path::PathBuf> {
 
 pub fn auth_header(auth: &AuthResults) -> String {
     auth.header.clone()
+}
+
+/// Atomically replace a spool body (write beside it, fsync, rename).
+async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = path.with_extension("eml.strip");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&tmp, path).await
 }
 
 fn now() -> u64 {

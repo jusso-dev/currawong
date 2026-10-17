@@ -14,17 +14,26 @@ use mail_auth::{
 };
 use zeroize::Zeroizing;
 
-/// From is listed twice so a second From added in transit breaks the signature.
-const SIGNED_HEADERS: [&str; 8] = [
+/// Identity and content headers are listed twice (oversigned) so a copy
+/// added in transit, including one that was absent at signing, breaks the
+/// signature.
+const SIGNED_HEADERS: [&str; 14] = [
     "From",
     "From",
     "To",
+    "To",
+    "Cc",
+    "Cc",
+    "Reply-To",
+    "Reply-To",
+    "Subject",
     "Subject",
     "Date",
+    "Date",
     "Message-ID",
-    "MIME-Version",
-    "Content-Type",
+    "Message-ID",
 ];
+const CONTENT_HEADERS: [&str; 2] = ["MIME-Version", "Content-Type"];
 const SEALED_HEADERS: [&str; 7] = [
     "From",
     "To",
@@ -84,7 +93,7 @@ fn dkim_header<T: SigningKey<Hasher = Sha256>>(
     let signature = DkimSigner::from_key(signer)
         .domain(key.domain.clone())
         .selector(key.selector.clone())
-        .headers(SIGNED_HEADERS)
+        .headers(SIGNED_HEADERS.iter().chain(CONTENT_HEADERS.iter()).copied())
         .sign(raw)
         .map_err(|err| err.to_string())?;
     Ok(signature.to_header())

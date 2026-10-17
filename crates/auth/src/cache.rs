@@ -1,34 +1,50 @@
-//! Bounded TXT cache honouring DNS TTLs. Unit tests seed it so they never
-//! query a DNS server.
+//! TXT caches for SPF, DKIM and DMARC. mail-auth keys its TXT cache by name
+//! only, so a shared cache let one verifier's lookup answer another's: an
+//! SPF `include:_dmarc.victim` cached a parse failure that DMARC then read as
+//! "no record". Each verifier gets its own cache, each cache only stores its
+//! own record type, and failures are never cached. Entries live for the DNS
+//! TTL clamped to 30 s..1 h and are evicted least recently used.
 use mail_auth::{DnsError, Error, ResolverCache, Txt};
-use std::time::Instant;
-use std::{borrow::Borrow, collections::HashMap, hash::Hash, sync::Mutex};
+use std::time::{Duration, Instant};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, HashMap},
+    hash::Hash,
+    sync::Mutex,
+};
 
-/// Enough for a busy gateway's working set; the oldest-expiring entry goes
-/// when full.
 const MAX_ENTRIES: usize = 16_384;
+const MIN_TTL: Duration = Duration::from_secs(30);
+const MAX_TTL: Duration = Duration::from_secs(60 * 60);
 
-struct Entry {
-    value: Txt,
-    /// `None` for records seeded by tests or operators: they never expire.
-    valid_until: Option<Instant>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordKind {
+    Spf,
+    DomainKey,
+    Dmarc,
 }
 
+impl RecordKind {
+    fn accepts(self, value: &Txt) -> bool {
+        matches!(
+            (self, value),
+            (Self::Spf, Txt::Spf(_))
+                | (Self::DomainKey, Txt::DomainKey(_))
+                | (Self::Dmarc, Txt::Dmarc(_))
+        )
+    }
+}
+
+/// The three per-verifier caches.
 pub struct TxtCache {
-    records: Mutex<HashMap<Box<str>, Entry>>,
-    capacity: usize,
-    /// When set, a cache miss is a permanent DNS error. Unit tests use this
-    /// so a missing record never reaches a DNS server.
-    offline: bool,
+    pub(crate) spf: TypedCache,
+    pub(crate) dkim: TypedCache,
+    pub(crate) dmarc: TypedCache,
 }
 
 impl Default for TxtCache {
     fn default() -> Self {
-        Self {
-            records: Mutex::new(HashMap::new()),
-            capacity: MAX_ENTRIES,
-            offline: false,
-        }
+        Self::build(MAX_ENTRIES, false)
     }
 }
 
@@ -37,51 +53,120 @@ impl TxtCache {
         Self::default()
     }
 
+    /// A cache miss is a permanent DNS error, so unit tests never reach DNS.
     pub fn offline() -> Self {
+        Self::build(MAX_ENTRIES, true)
+    }
+
+    fn build(capacity: usize, offline: bool) -> Self {
         Self {
-            offline: true,
-            ..Self::default()
+            spf: TypedCache::new(RecordKind::Spf, capacity, offline),
+            dkim: TypedCache::new(RecordKind::DomainKey, capacity, offline),
+            dmarc: TypedCache::new(RecordKind::Dmarc, capacity, offline),
         }
     }
 
-    pub fn with_capacity(capacity: usize) -> Self {
+    /// Seed a record that never expires. It goes to the cache for its type.
+    pub fn insert_record(&self, name: &str, value: Txt) {
+        let cache = match &value {
+            Txt::Spf(_) => &self.spf,
+            Txt::DomainKey(_) => &self.dkim,
+            Txt::Dmarc(_) => &self.dmarc,
+            _ => return,
+        };
+        cache.put(canonical(name).into_boxed_str(), value, None);
+    }
+}
+
+struct Slot {
+    value: Txt,
+    /// `None` for seeded records.
+    expires: Option<Instant>,
+    tick: u64,
+}
+
+struct Lru {
+    slots: HashMap<Box<str>, Slot>,
+    order: BTreeMap<u64, Box<str>>,
+    tick: u64,
+}
+
+impl Lru {
+    fn touch(&mut self, key: &str) {
+        self.tick += 1;
+        let tick = self.tick;
+        if let Some(slot) = self.slots.get_mut(key) {
+            self.order.remove(&slot.tick);
+            slot.tick = tick;
+            self.order.insert(tick, key.into());
+        }
+    }
+
+    fn remove<Q>(&mut self, key: &Q) -> Option<Slot>
+    where
+        Box<str>: Borrow<Q>,
+        Q: Hash + Eq + ?Sized,
+    {
+        let slot = self.slots.remove(key)?;
+        self.order.remove(&slot.tick);
+        Some(slot)
+    }
+}
+
+pub struct TypedCache {
+    kind: RecordKind,
+    inner: Mutex<Lru>,
+    capacity: usize,
+    offline: bool,
+}
+
+impl TypedCache {
+    pub fn new(kind: RecordKind, capacity: usize, offline: bool) -> Self {
         Self {
+            kind,
+            inner: Mutex::new(Lru {
+                slots: HashMap::new(),
+                order: BTreeMap::new(),
+                tick: 0,
+            }),
             capacity: capacity.max(1),
-            ..Self::default()
+            offline,
         }
     }
 
-    pub fn len(&self) -> usize {
-        self.records.lock().expect("txt cache").len()
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().expect("txt cache").slots.len()
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Seed a record that never expires.
-    pub fn insert_record(&self, name: &str, value: Txt) {
-        self.put(canonical(name).into_boxed_str(), value, None);
-    }
-
-    fn put(&self, key: Box<str>, value: Txt, valid_until: Option<Instant>) {
-        let mut records = self.records.lock().expect("txt cache");
-        if records.len() >= self.capacity && !records.contains_key(&key) {
-            let now = Instant::now();
-            records.retain(|_, entry| entry.valid_until.is_none_or(|until| until > now));
-            if records.len() >= self.capacity {
-                let victim = records
-                    .iter()
-                    .filter_map(|(key, entry)| entry.valid_until.map(|until| (until, key)))
-                    .min_by_key(|(until, _)| *until)
-                    .map(|(_, key)| key.clone())
-                    .or_else(|| records.keys().next().cloned());
-                if let Some(victim) = victim {
-                    records.remove(&victim);
-                }
-            }
+    fn put(&self, key: Box<str>, value: Txt, expires: Option<Instant>) {
+        if !self.kind.accepts(&value) {
+            return;
         }
-        records.insert(key, Entry { value, valid_until });
+        let mut lru = self.inner.lock().expect("txt cache");
+        lru.remove(&*key);
+        while lru.slots.len() >= self.capacity {
+            let Some((_, oldest)) = lru.order.pop_first() else {
+                break;
+            };
+            lru.slots.remove(&oldest);
+        }
+        lru.tick += 1;
+        let tick = lru.tick;
+        lru.order.insert(tick, key.clone());
+        lru.slots.insert(
+            key,
+            Slot {
+                value,
+                expires,
+                tick,
+            },
+        );
     }
 }
 
@@ -90,24 +175,31 @@ fn canonical(name: &str) -> String {
     format!("{name}.")
 }
 
-impl ResolverCache<Box<str>, Txt> for TxtCache {
+impl ResolverCache<Box<str>, Txt> for TypedCache {
     fn get<Q>(&self, name: &Q) -> Option<Txt>
     where
         Box<str>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        let mut records = self.records.lock().expect("txt cache");
-        if let Some(entry) = records.get(name) {
-            if entry.valid_until.is_none_or(|until| until > Instant::now()) {
-                return Some(entry.value.clone());
+        let mut lru = self.inner.lock().expect("txt cache");
+        let fresh = lru.slots.get_key_value(name).map(|(key, slot)| {
+            (
+                key.clone(),
+                slot.expires.is_none_or(|at| at > Instant::now()),
+            )
+        });
+        match fresh {
+            Some((key, true)) => {
+                lru.touch(&key);
+                return lru.slots.get::<str>(&key).map(|slot| slot.value.clone());
             }
-            records.remove(name);
+            Some((_, false)) => {
+                lru.remove(name);
+            }
+            None => {}
         }
-        if self.offline {
-            Some(Txt::Error(Error::Dns(DnsError::InvalidRecordType)))
-        } else {
-            None
-        }
+        self.offline
+            .then(|| Txt::Error(Error::Dns(DnsError::InvalidRecordType)))
     }
 
     fn remove<Q>(&self, name: &Q) -> Option<Txt>
@@ -115,53 +207,98 @@ impl ResolverCache<Box<str>, Txt> for TxtCache {
         Box<str>: Borrow<Q>,
         Q: Hash + Eq + ?Sized,
     {
-        self.records
+        self.inner
             .lock()
             .expect("txt cache")
             .remove(name)
-            .map(|entry| entry.value)
+            .map(|slot| slot.value)
     }
 
     fn insert(&self, key: Box<str>, value: Txt, valid_until: Instant) {
-        self.put(key, value, Some(valid_until));
+        let now = Instant::now();
+        let expires = valid_until.clamp(now + MIN_TTL, now + MAX_TTL);
+        self.put(key, value, Some(expires));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::TxtCache;
-    use mail_auth::{DnsError, Error, ResolverCache, Txt};
-    use std::time::{Duration, Instant};
+    use super::{RecordKind, TypedCache};
+    use mail_auth::{
+        common::parse::TxtRecordParser, dmarc::Dmarc, spf::Spf, DnsError, Error, ResolverCache, Txt,
+    };
+    use std::{
+        sync::Arc,
+        time::{Duration, Instant},
+    };
 
-    fn error() -> Txt {
-        Txt::Error(Error::Dns(DnsError::InvalidRecordType))
+    fn spf() -> Txt {
+        Txt::Spf(Arc::new(Spf::parse(b"v=spf1 -all").unwrap()))
+    }
+
+    #[test]
+    fn failures_and_other_record_types_are_never_cached() {
+        let cache = TypedCache::new(RecordKind::Dmarc, 8, false);
+        let soon = Instant::now() + Duration::from_secs(300);
+        cache.insert(
+            "_dmarc.victim.test.".into(),
+            Txt::Error(Error::Dns(DnsError::InvalidRecordType)),
+            soon,
+        );
+        cache.insert("_dmarc.victim.test.".into(), spf(), soon);
+        assert!(cache.get("_dmarc.victim.test.").is_none());
+        let dmarc = Txt::Dmarc(Arc::new(Dmarc::parse(b"v=DMARC1; p=reject").unwrap()));
+        cache.insert("_dmarc.victim.test.".into(), dmarc, soon);
+        assert!(matches!(
+            cache.get("_dmarc.victim.test."),
+            Some(Txt::Dmarc(_))
+        ));
+    }
+
+    #[test]
+    fn ttl_is_clamped_between_30_seconds_and_an_hour() {
+        let cache = TypedCache::new(RecordKind::Spf, 8, false);
+        // A zero TTL is still held for 30 s.
+        cache.insert("short.test.".into(), spf(), Instant::now());
+        assert!(cache.get("short.test.").is_some());
+        // A week-long TTL is cut to an hour.
+        let week = Instant::now() + Duration::from_secs(7 * 24 * 3600);
+        cache.insert("long.test.".into(), spf(), week);
+        let expires = cache
+            .inner
+            .lock()
+            .unwrap()
+            .slots
+            .get("long.test.")
+            .and_then(|slot| slot.expires)
+            .unwrap();
+        assert!(expires <= Instant::now() + Duration::from_secs(3600));
     }
 
     #[test]
     fn expired_answers_are_not_served() {
-        let cache = TxtCache::new();
-        cache.insert("gone.example.test.".into(), error(), Instant::now());
-        std::thread::sleep(Duration::from_millis(5));
-        assert!(cache.get("gone.example.test.").is_none());
-        cache.insert(
-            "fresh.example.test.".into(),
-            error(),
-            Instant::now() + Duration::from_secs(60),
+        let cache = TypedCache::new(RecordKind::Spf, 8, false);
+        cache.put(
+            "gone.test.".into(),
+            spf(),
+            Some(Instant::now() - Duration::from_secs(1)),
         );
-        assert!(cache.get("fresh.example.test.").is_some());
+        assert!(cache.get("gone.test.").is_none());
+        assert!(cache.is_empty());
     }
 
     #[test]
-    fn cache_is_bounded() {
-        let cache = TxtCache::with_capacity(4);
-        for index in 0..20 {
-            cache.insert(
-                format!("host{index}.example.test.").into_boxed_str(),
-                error(),
-                Instant::now() + Duration::from_secs(60 + index),
-            );
+    fn least_recently_used_entry_is_evicted() {
+        let cache = TypedCache::new(RecordKind::Spf, 3, false);
+        let soon = Instant::now() + Duration::from_secs(300);
+        for name in ["a.test.", "b.test.", "c.test."] {
+            cache.insert(name.into(), spf(), soon);
         }
-        assert_eq!(cache.len(), 4);
-        assert!(cache.get("host19.example.test.").is_some());
+        assert!(cache.get("a.test.").is_some());
+        cache.insert("d.test.".into(), spf(), soon);
+        assert_eq!(cache.len(), 3);
+        assert!(cache.get("b.test.").is_none(), "b was least recently used");
+        assert!(cache.get("a.test.").is_some());
+        assert!(cache.get("d.test.").is_some());
     }
 }
