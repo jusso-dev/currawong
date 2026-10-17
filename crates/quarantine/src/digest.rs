@@ -3,7 +3,7 @@
 use crate::{derived_id, Item, Link, LinkAction, LinkSigner, QuarantineError, QuarantineStore};
 use askama::Template;
 use currawong_core::{config::Config, Direction, MessageId};
-use currawong_spool::{Envelope, Spool, SpoolState};
+use currawong_spool::{Envelope, Spool, SpoolError, SpoolState};
 use mail_builder::{
     headers::{date::Date, text::Text},
     MessageBuilder,
@@ -40,18 +40,21 @@ impl DigestSettings {
 }
 
 struct Entry {
-    sender: String,
+    /// The sender for a recipient's digest, the recipient for a sender notice.
+    address: String,
     subject: String,
     queue: String,
     received: String,
-    release: String,
-    delete: String,
+    /// Links only in a recipient's digest of inbound mail.
+    release: Option<String>,
+    delete: Option<String>,
 }
 
 #[derive(Template)]
 #[template(path = "digest.html")]
 struct DigestHtml<'a> {
     recipient: &'a str,
+    outbound: bool,
     entries: &'a [Entry],
 }
 
@@ -59,13 +62,17 @@ struct DigestHtml<'a> {
 #[template(path = "digest.txt")]
 struct DigestText<'a> {
     recipient: &'a str,
+    outbound: bool,
     entries: &'a [Entry],
 }
 
-/// One digest per recipient for items not yet in a digest, at most once per
-/// `interval_hours`. Digest ids derive from the items, so a retry after a
-/// crash finds the digest instead of queueing a second one. Returns the
-/// number of digests queued.
+/// At most once per `interval_hours`: one digest per recipient of held
+/// inbound mail in user queues, with release and delete links, and one
+/// notice per internal sender of held outbound mail, without links (the
+/// external recipient must never be able to release what was held from
+/// them; an administrator decides). Ids derive from the items, so a retry
+/// after a crash finds the message instead of queueing a second one.
+/// Returns the number queued.
 pub async fn send_digests(
     store: &QuarantineStore,
     spool: &Spool,
@@ -79,16 +86,20 @@ pub async fn send_digests(
     if last.is_some_and(|last| at.saturating_sub(last) < interval) {
         return Ok(0);
     }
-    let mut groups: BTreeMap<(Option<String>, String), Vec<Item>> = BTreeMap::new();
+    let mut groups: BTreeMap<(Option<String>, bool, String), Vec<Item>> = BTreeMap::new();
     for item in store.undigested(at)? {
-        groups
-            .entry((item.tenant_id.clone(), item.recipient.clone()))
-            .or_default()
-            .push(item);
+        let key = match item.direction {
+            Direction::Outbound => (item.tenant_id.clone(), true, item.sender.clone()),
+            Direction::Inbound if store.user_queue(&item.queue) => {
+                (item.tenant_id.clone(), false, item.recipient.clone())
+            }
+            Direction::Inbound => continue,
+        };
+        groups.entry(key).or_default().push(item);
     }
     let ttl = i64::try_from(settings.link_ttl_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
     let mut sent = 0;
-    for ((tenant_id, recipient), items) in groups {
+    for ((tenant_id, outbound, recipient), items) in groups {
         let entries: Vec<Entry> = items
             .iter()
             .map(|item| {
@@ -102,24 +113,32 @@ pub async fn send_digests(
                     format!("{}/quarantine/link/{token}", settings.base_url)
                 };
                 Entry {
-                    sender: item.sender.clone(),
+                    address: if outbound {
+                        item.recipient.clone()
+                    } else {
+                        item.sender.clone()
+                    },
                     subject: item.subject.clone(),
                     queue: item.queue.clone(),
                     received: received(item.created_at),
-                    release: url(LinkAction::Release),
-                    delete: url(LinkAction::Delete),
+                    release: (!outbound).then(|| url(LinkAction::Release)),
+                    delete: (!outbound).then(|| url(LinkAction::Delete)),
                 }
             })
             .collect();
         let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
         let id = MessageId(derived_id(&ids.join("\n"), "digest"));
-        if spool.load(&id).await.is_err() {
-            let body = render(&id, &recipient, &entries, settings, at)?;
-            let env = envelope(id.clone(), tenant_id, &recipient, settings, now);
-            spool
-                .accept(env, Cursor::new(body))
-                .await
-                .map_err(|err| QuarantineError::Store(err.to_string()))?;
+        match spool.load(&id).await {
+            Ok(_) => {}
+            Err(SpoolError::NotFound(_)) => {
+                let body = render(&id, &recipient, outbound, &entries, settings, at)?;
+                let env = envelope(id.clone(), tenant_id, &recipient, settings, now);
+                spool
+                    .accept(env, Cursor::new(body))
+                    .await
+                    .map_err(|err| QuarantineError::Store(err.to_string()))?;
+            }
+            Err(err) => return Err(QuarantineError::Store(err.to_string())),
         }
         store.mark_digested(&ids, at)?;
         tracing::info!(%id, count = ids.len(), "quarantine digest queued");
@@ -132,20 +151,31 @@ pub async fn send_digests(
 fn render(
     id: &MessageId,
     recipient: &str,
+    outbound: bool,
     entries: &[Entry],
     settings: &DigestSettings,
     at: i64,
 ) -> Result<Vec<u8>, QuarantineError> {
     let template = |err: askama::Error| QuarantineError::Store(err.to_string());
-    let html = DigestHtml { recipient, entries }
-        .render()
-        .map_err(template)?;
-    let text = DigestText { recipient, entries }
-        .render()
-        .map_err(template)?;
-    let subject = match entries.len() {
-        1 => "Quarantine digest: 1 message held for you".to_string(),
-        n => format!("Quarantine digest: {n} messages held for you"),
+    let html = DigestHtml {
+        recipient,
+        outbound,
+        entries,
+    }
+    .render()
+    .map_err(template)?;
+    let text = DigestText {
+        recipient,
+        outbound,
+        entries,
+    }
+    .render()
+    .map_err(template)?;
+    let subject = match (outbound, entries.len()) {
+        (true, 1) => "Quarantine notice: 1 message you sent was held".to_string(),
+        (true, n) => format!("Quarantine notice: {n} messages you sent were held"),
+        (false, 1) => "Quarantine digest: 1 message held for you".to_string(),
+        (false, n) => format!("Quarantine digest: {n} messages held for you"),
     };
     MessageBuilder::new()
         .from(settings.from.as_str())

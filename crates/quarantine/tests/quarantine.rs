@@ -7,11 +7,14 @@ use currawong_core::{config::Config, Direction, MessageId};
 use currawong_quarantine::{
     digest::{send_digests, DigestSettings},
     http::{router, HttpState},
-    BlobStore, FsBlobStore, Hold, Link, LinkAction, LinkSigner, Principal, QuarantineStore, Role,
-    RELEASE_PIPELINE,
+    AuditEvent, AuditSink, BlobStore, FsBlobStore, Hold, Link, LinkAction, LinkSigner, ListQuery,
+    Principal, QuarantineError, QuarantineStore, Role, RELEASE_HAM_PIPELINE, RELEASE_PIPELINE,
 };
 use currawong_spool::{Spool, SpoolState};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
@@ -177,7 +180,7 @@ async fn spam_released_from_a_digest_link_is_reinjected_and_audited() {
         .await
         .unwrap()
         .into_iter()
-        .find(|env| env.pipeline == RELEASE_PIPELINE)
+        .find(|env| env.pipeline == RELEASE_HAM_PIPELINE)
         .unwrap();
     assert_eq!(released.rcpt_to, ["user@example.test"]);
     assert_eq!(released.mail_from, "sender@outside.test");
@@ -206,7 +209,7 @@ async fn spam_released_from_a_digest_link_is_reinjected_and_audited() {
             .await
             .unwrap()
             .iter()
-            .filter(|env| env.pipeline == RELEASE_PIPELINE)
+            .filter(|env| env.pipeline == RELEASE_HAM_PIPELINE)
             .count(),
         1
     );
@@ -253,7 +256,10 @@ async fn end_users_get_403_on_virus_items() {
         request
     })
     .await;
-    assert_eq!((status, list.as_str()), (StatusCode::OK, "[]"));
+    assert_eq!(
+        (status, list.as_str()),
+        (StatusCode::OK, r#"{"items":[],"next":null}"#)
+    );
 
     // No caller at all.
     let (status, _) = send(&s.app, post(&release, None, "{}")).await;
@@ -377,7 +383,11 @@ async fn holding_again_after_a_crash_adds_nothing_and_retention_is_per_queue() {
         role: Role::PlatformAdmin,
         tenant_id: None,
     };
-    assert_eq!(store.list(&admin, Some("malware")).unwrap().len(), 2);
+    let malware = ListQuery {
+        queue: Some("Malware".into()),
+        ..ListQuery::default()
+    };
+    assert_eq!(store.list(&admin, &malware).unwrap().items.len(), 2);
 
     // Deleting one recipient's copy keeps the bytes for the other.
     store
@@ -390,4 +400,404 @@ async fn holding_again_after_a_crash_adds_nothing_and_retention_is_per_queue() {
         .await
         .unwrap();
     assert!(s.blobs.get(SPAM_ID).await.is_err());
+}
+
+fn principal(actor: &str, role: Role, tenant: Option<&str>) -> Principal {
+    Principal {
+        actor: actor.into(),
+        role,
+        tenant_id: tenant.map(str::to_string),
+    }
+}
+
+#[tokio::test]
+async fn outbound_holds_notify_the_sender_and_never_the_external_recipient() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let mut out = hold(SPAM_ID, "spam", Some("t1"));
+    out.direction = Direction::Outbound;
+    out.sender = "staff@example.test".into();
+    out.recipients = vec!["victim@outside.test".into()];
+    let ids = s.store.hold(&out, RAW, now).await.unwrap();
+
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let notices = s.spool.list(SpoolState::Incoming).await.unwrap();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].rcpt_to, ["staff@example.test"]);
+    let body = s.spool.read_body(&notices[0].id).await.unwrap();
+    let text = mail_parser::MessageParser::default()
+        .parse(&body[..])
+        .unwrap()
+        .body_text(0)
+        .unwrap()
+        .into_owned();
+    assert!(text.contains("To: victim@outside.test"), "{text}");
+    assert!(!text.contains("/quarantine/link/"), "{text}");
+    assert!(!String::from_utf8_lossy(&body).contains("/quarantine/link/"));
+
+    // A correctly signed link for the external recipient is still refused,
+    // and neither party sees the item as an end user.
+    let token = s.links.sign(&Link {
+        item_id: ids[0].clone(),
+        recipient: "victim@outside.test".into(),
+        action: LinkAction::Release,
+        expires_at: now.unix_timestamp() + 3600,
+    });
+    let (status, _) = send(
+        &s.app,
+        Request::post(format!("/quarantine/link/{token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    for actor in ["victim@outside.test", "staff@example.test"] {
+        let user = principal(actor, Role::EndUser, Some("t1"));
+        assert!(s
+            .store
+            .list(&user, &ListQuery::default())
+            .unwrap()
+            .items
+            .is_empty());
+        let err = s
+            .store
+            .act(&s.spool, &user, &ids[0], LinkAction::Release, None, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QuarantineError::Forbidden), "{err:?}");
+    }
+    // An administrator can.
+    let admin = principal("admin@t1", Role::TenantAdmin, Some("t1"));
+    s.store
+        .act(&s.spool, &admin, &ids[0], LinkAction::Release, None, now)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn lists_are_scoped_in_the_query_searchable_and_paged() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    // Many newer items for another tenant must not crowd t1 out of a page.
+    for n in 0..30u32 {
+        let id = format!("01ARZ3NDEKTSV4RRFFQ69G{n:04}");
+        let mut other = hold(&id, "spam", Some("t2"));
+        other.recipients = vec![format!("u{n}@other.test")];
+        s.store.hold(&other, RAW, now).await.unwrap();
+    }
+    let ids = [
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+        "01ARZ3NDEKTSV4RRFFQ69G5FA3",
+    ];
+    for (n, id) in ids.iter().enumerate() {
+        let mut mine = hold(id, "spam", Some("t1"));
+        mine.sender = format!("sender{n}@outside.test");
+        let raw = format!("Subject: invoice {n}\r\n\r\nbody\r\n");
+        let at = now - Duration::hours(10 + n as i64);
+        s.store.hold(&mine, raw.as_bytes(), at).await.unwrap();
+    }
+    let admin = principal("admin@t1", Role::TenantAdmin, Some("t1"));
+    let first = s
+        .store
+        .list(
+            &admin,
+            &ListQuery {
+                limit: Some(2),
+                ..ListQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(first.items.len(), 2);
+    assert!(first
+        .items
+        .iter()
+        .all(|i| i.tenant_id.as_deref() == Some("t1")));
+    let second = s
+        .store
+        .list(
+            &admin,
+            &ListQuery {
+                limit: Some(2),
+                cursor: first.next.clone(),
+                ..ListQuery::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(second.items.len(), 1);
+    assert_eq!(second.next, None);
+    assert_ne!(second.items[0].id, first.items[0].id);
+
+    let search = |query: ListQuery| s.store.list(&admin, &query).unwrap().items;
+    let hit = search(ListQuery {
+        subject: Some("voice 1".into()),
+        ..ListQuery::default()
+    });
+    assert_eq!(hit.len(), 1);
+    assert_eq!(hit[0].subject, "invoice 1");
+    assert!(search(ListQuery {
+        subject: Some("%".into()),
+        ..ListQuery::default()
+    })
+    .is_empty());
+    assert_eq!(
+        search(ListQuery {
+            sender: Some("SENDER2@outside.test".into()),
+            ..ListQuery::default()
+        })
+        .len(),
+        1
+    );
+    assert_eq!(
+        search(ListQuery {
+            since: Some((now - Duration::hours(11)).unix_timestamp()),
+            ..ListQuery::default()
+        })
+        .len(),
+        2
+    );
+    // An end user sees only their own inbound items.
+    let user = principal("User@Example.test", Role::EndUser, Some("t1"));
+    assert_eq!(
+        s.store
+            .list(&user, &ListQuery::default())
+            .unwrap()
+            .items
+            .len(),
+        3
+    );
+    let user = principal("u3@other.test", Role::EndUser, Some("t1"));
+    assert!(s
+        .store
+        .list(&user, &ListQuery::default())
+        .unwrap()
+        .items
+        .is_empty());
+}
+
+/// Fails while `fail` is set.
+struct FlakyAudit {
+    fail: AtomicBool,
+    events: std::sync::Mutex<Vec<AuditEvent>>,
+}
+
+impl AuditSink for FlakyAudit {
+    fn record(&self, event: &AuditEvent) -> Result<(), String> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err("audit store unavailable".into());
+        }
+        self.events.lock().unwrap().push(event.clone());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_audit_write_leaves_the_item_held_and_a_retry_completes() {
+    let s = setup().await;
+    let audit = Arc::new(FlakyAudit {
+        fail: AtomicBool::new(true),
+        events: std::sync::Mutex::new(Vec::new()),
+    });
+    let store = s.store.clone().with_audit(audit.clone());
+    let now = OffsetDateTime::now_utc();
+    let ids = store
+        .hold(&hold(SPAM_ID, "spam", None), RAW, now)
+        .await
+        .unwrap();
+    let admin = principal("root", Role::PlatformAdmin, None);
+    for action in [LinkAction::Release, LinkAction::Delete] {
+        let err = store
+            .act(&s.spool, &admin, &ids[0], action, None, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QuarantineError::Store(_)), "{err:?}");
+        assert!(store.get(&ids[0]).unwrap().unwrap().held());
+    }
+    // Nothing was released without its audit row.
+    assert!(s.spool.list(SpoolState::Incoming).await.unwrap().is_empty());
+    assert!(s.blobs.get(SPAM_ID).await.is_ok());
+
+    audit.fail.store(false, Ordering::SeqCst);
+    let released = store
+        .act(&s.spool, &admin, &ids[0], LinkAction::Release, None, now)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(s.spool.list(SpoolState::Incoming).await.unwrap().len(), 1);
+    let events = audit.events.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].action, "release");
+    assert_eq!(events[0].detail.as_deref(), Some(released.as_str()));
+}
+
+/// File blobs whose delete fails for one key.
+struct StuckBlob {
+    inner: FsBlobStore,
+    stuck: String,
+}
+
+#[async_trait::async_trait]
+impl BlobStore for StuckBlob {
+    async fn put(&self, key: &str, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.put(key, bytes).await
+    }
+    async fn get(&self, key: &str) -> std::io::Result<Vec<u8>> {
+        self.inner.get(key).await
+    }
+    async fn delete(&self, key: &str) -> std::io::Result<()> {
+        if key == self.stuck {
+            return Err(std::io::Error::other("bucket unavailable"));
+        }
+        self.inner.delete(key).await
+    }
+}
+
+#[tokio::test]
+async fn purge_continues_past_a_failing_item_and_expired_items_cannot_be_released() {
+    let s = setup().await;
+    let store = s.store.clone().with_blobs(Arc::new(StuckBlob {
+        inner: s.blobs.clone(),
+        stuck: SPAM_ID.into(),
+    }));
+    let now = OffsetDateTime::now_utc();
+    let old = now - Duration::days(31);
+    let stuck = store
+        .hold(&hold(SPAM_ID, "spam", None), RAW, old)
+        .await
+        .unwrap();
+    let gone = store
+        .hold(&hold(VIRUS_ID, "virus", None), RAW, old)
+        .await
+        .unwrap();
+
+    // Expired but not yet purged: nobody can release it.
+    let admin = principal("root", Role::PlatformAdmin, None);
+    let err = store
+        .act(&s.spool, &admin, &stuck[0], LinkAction::Release, None, now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, QuarantineError::NotFound), "{err:?}");
+
+    assert_eq!(store.purge(now).await.unwrap(), 1);
+    assert!(store.get(&gone[0]).unwrap().is_none());
+    assert!(s.blobs.get(VIRUS_ID).await.is_err());
+    // The failing item is kept, bytes and row, for the next pass.
+    assert!(store.get(&stuck[0]).unwrap().is_some());
+    assert!(s.blobs.get(SPAM_ID).await.is_ok());
+    assert!(s.spool.list(SpoolState::Incoming).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_blob_goes_when_the_last_recipient_is_released() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let mut two = hold(SPAM_ID, "spam", None);
+    two.recipients.push("other@example.test".into());
+    let ids = s.store.hold(&two, RAW, now).await.unwrap();
+    let admin = principal("root", Role::PlatformAdmin, None);
+    s.store
+        .act(&s.spool, &admin, &ids[0], LinkAction::Release, None, now)
+        .await
+        .unwrap();
+    assert!(s.blobs.get(SPAM_ID).await.is_ok());
+    s.store
+        .act(&s.spool, &admin, &ids[1], LinkAction::Release, None, now)
+        .await
+        .unwrap();
+    assert!(s.blobs.get(SPAM_ID).await.is_err());
+    // Both re-injected copies carry the bytes.
+    for env in s.spool.list(SpoolState::Incoming).await.unwrap() {
+        assert_eq!(s.spool.read_body(&env.id).await.unwrap(), RAW);
+        assert_eq!(env.pipeline, RELEASE_HAM_PIPELINE);
+    }
+}
+
+#[tokio::test]
+async fn queue_names_are_canonical_and_virus_and_pspf_need_an_admin() {
+    let s = setup().await;
+    let mut cfg = Config::default();
+    cfg.quarantine.user_release_queues = vec!["SPAM".into()];
+    cfg.quarantine
+        .queue_retention_days
+        .insert("Virus".into(), 90);
+    let store = s.store.clone().with_config(&cfg.quarantine);
+    let now = OffsetDateTime::now_utc();
+    let mut score = hold("01ARZ3NDEKTSV4RRFFQ69G5FAX", "Spam ", None);
+    score.score = Some(9.5);
+    let spam = store.hold(&score, RAW, now).await.unwrap();
+    let virus = store
+        .hold(&hold(VIRUS_ID, " Virus", None), RAW, now)
+        .await
+        .unwrap();
+    let pspf = store
+        .hold(&hold(SPAM_ID, "PSPF", None), RAW, now)
+        .await
+        .unwrap();
+    let item = store.get(&virus[0]).unwrap().unwrap();
+    assert_eq!(item.queue, "virus");
+    assert_eq!(item.expires_at - item.created_at, 90 * 86_400);
+    assert_eq!(store.get(&spam[0]).unwrap().unwrap().score, Some(9.5));
+
+    let user = principal("user@example.test", Role::EndUser, None);
+    for id in [&virus[0], &pspf[0]] {
+        let err = store
+            .act(&s.spool, &user, id, LinkAction::Release, Some("mine"), now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QuarantineError::Forbidden), "{err:?}");
+        let err = store
+            .act(&s.spool, &user, id, LinkAction::Delete, None, now)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, QuarantineError::Forbidden), "{err:?}");
+    }
+    // "SPAM" in config matches the "spam" queue for end users.
+    store
+        .act(&s.spool, &user, &spam[0], LinkAction::Delete, None, now)
+        .await
+        .unwrap();
+    let admin = principal("root", Role::PlatformAdmin, None);
+    let err = store
+        .act(&s.spool, &admin, &pspf[0], LinkAction::Release, None, now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, QuarantineError::BadRequest(_)), "{err:?}");
+    store
+        .act(
+            &s.spool,
+            &admin,
+            &pspf[0],
+            LinkAction::Release,
+            Some("cleared"),
+            now,
+        )
+        .await
+        .unwrap();
+    // Not a spam release, so it does not train the classifier.
+    let released = s.spool.list(SpoolState::Incoming).await.unwrap();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].pipeline, RELEASE_PIPELINE);
+    let actions: Vec<String> = store
+        .audit_table()
+        .events()
+        .unwrap()
+        .into_iter()
+        .map(|e| e.action)
+        .collect();
+    assert_eq!(
+        actions,
+        [
+            "denied:release",
+            "denied:delete",
+            "denied:release",
+            "denied:delete",
+            "delete",
+            "release"
+        ]
+    );
 }

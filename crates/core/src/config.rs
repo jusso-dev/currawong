@@ -449,7 +449,21 @@ pub struct PolicyConfig {
 }
 
 /// Quarantine queues only an administrator may release, and only with a reason.
+/// Compare queue names with [`canonical_queue`]; `malware` is the floor's
+/// name for the issue's `virus` queue.
 pub const ADMIN_RELEASE_QUEUES: &[&str] = &["malware", "virus", "pspf"];
+
+/// Queue names are free text from policy. Trimmed, lower case and with `_`
+/// as `-`, so `Virus`, ` virus` and `scan_failed` match `virus` and
+/// `scan-failed`.
+pub fn canonical_queue(queue: &str) -> String {
+    queue.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// Only an administrator may release from this queue, and only with a reason.
+pub fn admin_release_queue(queue: &str) -> bool {
+    ADMIN_RELEASE_QUEUES.contains(&canonical_queue(queue).as_str())
+}
 
 /// Quarantine index, blobs, retention, user digests and release links.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1118,7 +1132,7 @@ impl Config {
         if let Some(queue) = q
             .user_release_queues
             .iter()
-            .find(|queue| ADMIN_RELEASE_QUEUES.contains(&queue.as_str()))
+            .find(|queue| admin_release_queue(queue))
         {
             return bad(format!(
                 "user_release_queues may not include {queue:?}: only administrators release it"
@@ -1285,7 +1299,7 @@ mod tests {
     #[test]
     fn quarantine_settings_are_validated() {
         let mut cfg = Config::load(&example_path()).unwrap();
-        cfg.quarantine.user_release_queues.push("malware".into());
+        cfg.quarantine.user_release_queues.push(" Virus".into());
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("user_release_queues"), "{err}");
         let mut cfg = Config::load(&example_path()).unwrap();

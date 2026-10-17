@@ -5,7 +5,7 @@
 //!
 //! `GET` on a link only shows a confirmation page, so a mail scanner that
 //! follows links cannot release or delete anything; the form `POST`s back.
-use crate::{Item, LinkAction, LinkSigner, Principal, QuarantineError, QuarantineStore};
+use crate::{LinkAction, LinkSigner, ListQuery, Page, Principal, QuarantineError, QuarantineStore};
 use askama::Template;
 use axum::{
     extract::{FromRequestParts, Path, Query, State},
@@ -168,20 +168,13 @@ async fn follow(State(state): State<HttpState>, Path(token): Path<String>) -> Re
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct ListQuery {
-    queue: Option<String>,
-}
-
+/// `?queue=&sender=&recipient=&subject=&since=&until=&cursor=&limit=`
 async fn list(
     State(state): State<HttpState>,
     Caller(principal): Caller,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Vec<Item>>, QuarantineError> {
-    state
-        .store
-        .list(&principal, query.queue.as_deref())
-        .map(Json)
+) -> Result<Json<Page>, QuarantineError> {
+    state.store.list(&principal, &query).map(Json)
 }
 
 #[derive(Debug, Default, Deserialize)]

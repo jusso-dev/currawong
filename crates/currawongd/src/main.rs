@@ -338,6 +338,12 @@ async fn spawn_quarantine(
             .await
             .map_err(|err| format!("{listen}: {err}"))?;
         tracing::info!(bind = %listen, "quarantine endpoints listening");
+        if listener
+            .local_addr()
+            .is_ok_and(|addr| !addr.ip().is_loopback())
+        {
+            tracing::warn!(bind = %listen, "quarantine endpoints serve plain HTTP off loopback; put a TLS proxy in front and bind to loopback");
+        }
         let app = http::router(http::HttpState {
             store: store.clone(),
             spool: Arc::clone(&spool),

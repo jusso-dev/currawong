@@ -82,9 +82,20 @@ impl LinkSigner {
         })
     }
 
-    /// Read the key file, or create a random 32-byte one with mode 0600.
+    /// Read the key file, or create a random 32-byte one with mode 0600. A
+    /// key file that group or others can read is refused.
     pub fn load_or_create(path: &Path) -> io::Result<Self> {
         if path.exists() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if fs::metadata(path)?.permissions().mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "quarantine link key must not be readable by group or others (chmod 600)",
+                    ));
+                }
+            }
             return Self::new(fs::read(path)?);
         }
         if let Some(parent) = path.parent() {
@@ -225,5 +236,12 @@ mod tests {
             assert_eq!(mode & 0o777, 0o600);
         }
         assert_eq!(format!("{first:?}"), "LinkSigner(***)");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+            let err = LinkSigner::load_or_create(&path).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        }
     }
 }

@@ -14,12 +14,12 @@ pub use links::{Link, LinkAction, LinkError, LinkSigner};
 pub use store::{open_blob_store, BlobStore, FsBlobStore, S3BlobStore};
 
 use currawong_core::{
-    config::{QuarantineConfig, ADMIN_RELEASE_QUEUES},
+    config::{admin_release_queue, canonical_queue, QuarantineConfig},
     Direction, MessageId,
 };
 use currawong_integrations::export;
-use currawong_spool::{Envelope, Spool, SpoolState};
-use rusqlite::{params, Connection, OptionalExtension};
+use currawong_spool::{Envelope, Spool, SpoolError, SpoolState};
+use rusqlite::{params, types::Value, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -33,9 +33,36 @@ use time::OffsetDateTime;
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_quarantine.sql")];
 
 /// Spool `pipeline` of a released message: the scheduler delivers it without
-/// running policy again, so it cannot be quarantined a second time, and
-/// trains the Bayes classifier on it.
+/// running policy again, so it cannot be quarantined a second time.
 pub const RELEASE_PIPELINE: &str = "release";
+
+/// As [`RELEASE_PIPELINE`], for a release from the spam queue: the scheduler
+/// also trains the Bayes classifier on it as ham. Releases from malware,
+/// phishing, DLP or PSPF holds say nothing about whether the mail is spam.
+pub const RELEASE_HAM_PIPELINE: &str = "release-ham";
+
+/// Search and paging for [`QuarantineStore::list`]. `subject` matches a
+/// substring; `since` and `until` are Unix seconds on `created_at`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ListQuery {
+    pub queue: Option<String>,
+    pub sender: Option<String>,
+    pub recipient: Option<String>,
+    pub subject: Option<String>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
+    /// `next` from the previous page.
+    pub cursor: Option<String>,
+    /// Default 100, at most 500.
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Page {
+    pub items: Vec<Item>,
+    /// Pass back as `cursor` for the next page; `None` on the last one.
+    pub next: Option<String>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum QuarantineError {
@@ -210,6 +237,7 @@ impl QuarantineStore {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(db)?;
         }
+        warn_old_layout(dir);
         let conn = Connection::open(dir.join("quarantine.sqlite")).map_err(db)?;
         let done: usize = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -261,15 +289,24 @@ impl QuarantineStore {
     fn retention_days(&self, queue: &str) -> u64 {
         self.cfg
             .queue_retention_days
-            .get(queue)
-            .copied()
+            .iter()
+            .find(|(name, _)| canonical_queue(name) == queue)
+            .map(|(_, days)| *days)
             .unwrap_or(self.cfg.retention_days)
     }
 
-    /// Queues an end user may act on.
+    /// Queues an end user may act on, by canonical name.
+    fn user_queues(&self) -> Vec<String> {
+        self.cfg
+            .user_release_queues
+            .iter()
+            .map(|q| canonical_queue(q))
+            .filter(|q| !admin_release_queue(q))
+            .collect()
+    }
+
     pub fn user_queue(&self, queue: &str) -> bool {
-        !ADMIN_RELEASE_QUEUES.contains(&queue)
-            && self.cfg.user_release_queues.iter().any(|q| q == queue)
+        self.user_queues().contains(&canonical_queue(queue))
     }
 
     /// Store the bytes, then one row per recipient. Row ids derive from the
@@ -283,7 +320,8 @@ impl QuarantineStore {
         let message_id = hold.message_id.as_str();
         self.blobs.put(message_id, raw).await.map_err(db)?;
         let now = now.unix_timestamp();
-        let days = i64::try_from(self.retention_days(&hold.queue)).unwrap_or(i64::MAX / 86_400);
+        let queue = canonical_queue(&hold.queue);
+        let days = i64::try_from(self.retention_days(&queue)).unwrap_or(i64::MAX / 86_400);
         let expires = now.saturating_add(days.saturating_mul(86_400));
         let subject = subject(raw);
         let reasons = serde_json::to_string(&hold.reasons).map_err(db)?;
@@ -306,7 +344,7 @@ impl QuarantineStore {
                     id,
                     hold.tenant_id,
                     message_id,
-                    hold.queue,
+                    queue,
                     recipient,
                     hold.sender,
                     subject,
@@ -380,28 +418,104 @@ impl QuarantineStore {
             .map_err(db)
     }
 
-    /// Items the principal may see, newest first, optionally one queue.
-    pub fn list(
-        &self,
-        principal: &Principal,
-        queue: Option<&str>,
-    ) -> Result<Vec<Item>, QuarantineError> {
+    /// Items the principal may see, newest first. Role and tenant scoping
+    /// are part of the query, so other tenants' mail never fills a page.
+    pub fn list(&self, principal: &Principal, query: &ListQuery) -> Result<Page, QuarantineError> {
+        let mut args: Vec<Value> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
+        match principal.role {
+            Role::PlatformAdmin => {}
+            Role::MspAdmin | Role::TenantAdmin | Role::Auditor => {
+                let Some(tenant) = &principal.tenant_id else {
+                    return Ok(Page::default());
+                };
+                let mark = bind(&mut args, Value::Text(tenant.clone()));
+                clauses.push(format!("tenant_id = {mark}"));
+            }
+            Role::EndUser => {
+                let tenant = principal.tenant_id.clone().map_or(Value::Null, Value::Text);
+                let mark = bind(&mut args, tenant);
+                clauses.push(format!("tenant_id IS {mark}"));
+                let mark = bind(&mut args, Value::Text(principal.actor.clone()));
+                clauses.push(format!("recipient = {mark} COLLATE NOCASE"));
+                clauses.push("direction = 'inbound'".into());
+                let queues = self.user_queues();
+                if queues.is_empty() {
+                    return Ok(Page::default());
+                }
+                let marks: Vec<String> = queues
+                    .into_iter()
+                    .map(|queue| bind(&mut args, Value::Text(queue)))
+                    .collect();
+                clauses.push(format!("queue IN ({})", marks.join(", ")));
+            }
+        }
+        if let Some(queue) = &query.queue {
+            let mark = bind(&mut args, Value::Text(canonical_queue(queue)));
+            clauses.push(format!("queue = {mark}"));
+        }
+        if let Some(sender) = &query.sender {
+            let mark = bind(&mut args, Value::Text(sender.clone()));
+            clauses.push(format!("sender = {mark} COLLATE NOCASE"));
+        }
+        if let Some(recipient) = &query.recipient {
+            let mark = bind(&mut args, Value::Text(recipient.clone()));
+            clauses.push(format!("recipient = {mark} COLLATE NOCASE"));
+        }
+        if let Some(subject) = &query.subject {
+            let escaped = subject
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let mark = bind(&mut args, Value::Text(format!("%{escaped}%")));
+            clauses.push(format!("subject LIKE {mark} ESCAPE '\\'"));
+        }
+        if let Some(since) = query.since {
+            let mark = bind(&mut args, Value::Integer(since));
+            clauses.push(format!("created_at >= {mark}"));
+        }
+        if let Some(until) = query.until {
+            let mark = bind(&mut args, Value::Integer(until));
+            clauses.push(format!("created_at < {mark}"));
+        }
+        if let Some(cursor) = &query.cursor {
+            let (at, id) = cursor
+                .split_once(':')
+                .and_then(|(at, id)| Some((at.parse::<i64>().ok()?, id.to_string())))
+                .ok_or_else(|| QuarantineError::BadRequest("cursor is not valid".into()))?;
+            let at = bind(&mut args, Value::Integer(at));
+            let id = bind(&mut args, Value::Text(id));
+            clauses.push(format!(
+                "(created_at < {at} OR (created_at = {at} AND id < {id}))"
+            ));
+        }
+        let limit = query.limit.unwrap_or(100).clamp(1, 500);
+        let filter = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
         let conn = self.conn()?;
         let mut stmt = conn
             .prepare(&format!(
-                "SELECT {ITEM_COLUMNS} FROM quarantine
-                 WHERE (?1 IS NULL OR queue = ?1) ORDER BY created_at DESC, id LIMIT 1000"
+                "SELECT {ITEM_COLUMNS} FROM quarantine {filter}
+                 ORDER BY created_at DESC, id DESC LIMIT {}",
+                limit + 1
             ))
             .map_err(db)?;
-        let items = stmt
-            .query_map([queue], item_from_row)
+        let mut items = stmt
+            .query_map(rusqlite::params_from_iter(args), item_from_row)
             .map_err(db)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(db)?;
-        Ok(items
-            .into_iter()
-            .filter(|item| self.can_see(principal, item))
-            .collect())
+        let next = (items.len() > limit).then(|| {
+            items.truncate(limit);
+            let last = &items[limit - 1];
+            format!("{}:{}", last.created_at, last.id)
+        });
+        // The query already scoped the rows; this is a second check.
+        items.retain(|item| self.can_see(principal, item));
+        Ok(Page { items, next })
     }
 
     fn can_see(&self, principal: &Principal, item: &Item) -> bool {
@@ -410,8 +524,11 @@ impl QuarantineStore {
             Role::MspAdmin | Role::TenantAdmin | Role::Auditor => {
                 principal.tenant_id.is_some() && principal.tenant_id == item.tenant_id
             }
+            // Outbound holds stay with administrators: the recipient is the
+            // outside party the mail was held from.
             Role::EndUser => {
                 principal.tenant_id == item.tenant_id
+                    && item.direction == Direction::Inbound
                     && principal.actor.eq_ignore_ascii_case(&item.recipient)
                     && self.user_queue(&item.queue)
             }
@@ -431,7 +548,7 @@ impl QuarantineStore {
         if principal.role == Role::Auditor || !self.can_see(principal, item) {
             return Err(QuarantineError::Forbidden);
         }
-        let restricted = ADMIN_RELEASE_QUEUES.contains(&item.queue.as_str());
+        let restricted = admin_release_queue(&item.queue);
         if action == LinkAction::Release && restricted && reason.is_none_or(|r| r.trim().is_empty())
         {
             return Err(QuarantineError::BadRequest(format!(
@@ -494,7 +611,11 @@ impl QuarantineStore {
     ) -> Result<Option<MessageId>, QuarantineError> {
         let _one = self.actions.lock().await;
         let now = now.unix_timestamp();
-        let item = self.get(item_id)?.ok_or(QuarantineError::NotFound)?;
+        let item = self
+            .get(item_id)?
+            // Expired items are as good as purged.
+            .filter(|item| item.expires_at > now)
+            .ok_or(QuarantineError::NotFound)?;
         if let Err(err) = self.authorise(principal, &item, action, reason) {
             if matches!(err, QuarantineError::Forbidden) {
                 let denied = format!("denied:{}", action.as_str());
@@ -573,8 +694,9 @@ impl QuarantineStore {
     }
 
     /// Re-inject the original bytes for this one recipient, marked so the
-    /// scheduler delivers without policy. The spool id derives from the item,
-    /// so a retry after a crash finds the same message.
+    /// scheduler delivers without policy. The audit row is written first; the
+    /// spool id derives from the item, so if a later step fails the item
+    /// stays held and a retry finishes the same release.
     async fn release(
         &self,
         spool: &Spool,
@@ -585,18 +707,6 @@ impl QuarantineStore {
     ) -> Result<Option<MessageId>, QuarantineError> {
         let raw = self.blobs.get(&item.message_id).await.map_err(db)?;
         let env = release_envelope(item, now);
-        if spool.load(&env.id).await.is_err() {
-            spool
-                .accept(env.clone(), Cursor::new(raw.clone()))
-                .await
-                .map_err(db)?;
-        }
-        self.conn()?
-            .execute(
-                "UPDATE quarantine SET released_at = ?2, released_by = ?3 WHERE id = ?1",
-                params![item.id, now, principal.actor],
-            )
-            .map_err(db)?;
         self.audit(
             principal,
             item,
@@ -605,6 +715,22 @@ impl QuarantineStore {
             Some(env.id.to_string()),
             now,
         )?;
+        match spool.load(&env.id).await {
+            Ok(_) => {}
+            Err(SpoolError::NotFound(_)) => {
+                spool
+                    .accept(env.clone(), Cursor::new(raw))
+                    .await
+                    .map_err(db)?;
+            }
+            Err(err) => return Err(db(err)),
+        }
+        self.conn()?
+            .execute(
+                "UPDATE quarantine SET released_at = ?2, released_by = ?3 WHERE id = ?1",
+                params![item.id, now, principal.actor],
+            )
+            .map_err(db)?;
         tracing::info!(item = %item.id, released = %env.id, actor = %principal.actor, "quarantine item released");
         export::emit(export::Event::new(
             item.tenant_id.as_deref(),
@@ -614,9 +740,12 @@ impl QuarantineStore {
                 rcpt_to: vec![item.recipient.clone()],
             },
         ));
+        self.drop_blob_if_done(&item.message_id).await;
         Ok(Some(env.id))
     }
 
+    /// Audit first, then mark deleted. The bytes go once no recipient still
+    /// has the message held; a failed blob delete is left to the purge.
     async fn delete(
         &self,
         principal: &Principal,
@@ -624,31 +753,44 @@ impl QuarantineStore {
         reason: Option<&str>,
         now: i64,
     ) -> Result<Option<MessageId>, QuarantineError> {
+        self.audit(principal, item, "delete", reason, None, now)?;
         self.conn()?
             .execute(
                 "UPDATE quarantine SET deleted_at = ?2, deleted_by = ?3 WHERE id = ?1",
                 params![item.id, now, principal.actor],
             )
             .map_err(db)?;
-        let still_held: bool = self
-            .conn()?
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM quarantine WHERE message_id = ?1
-                 AND released_at IS NULL AND deleted_at IS NULL",
-                [&item.message_id],
-                |row| row.get(0),
-            )
-            .map_err(db)?;
-        if !still_held {
-            self.blobs.delete(&item.message_id).await.map_err(db)?;
-        }
-        self.audit(principal, item, "delete", reason, None, now)?;
+        self.drop_blob_if_done(&item.message_id).await;
         Ok(None)
     }
 
+    /// Delete a message's bytes once none of its rows is still held. Best
+    /// effort: otherwise the purge removes them with the last row.
+    async fn drop_blob_if_done(&self, message_id: &str) {
+        let still_held = self.conn().and_then(|conn| {
+            conn.query_row(
+                "SELECT COUNT(*) > 0 FROM quarantine WHERE message_id = ?1
+                 AND released_at IS NULL AND deleted_at IS NULL",
+                [message_id],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(db)
+        });
+        let result = match still_held {
+            Ok(true) => return,
+            Ok(false) => self.blobs.delete(message_id).await.map_err(db),
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            tracing::warn!(%message_id, %err, "quarantine blob not deleted, the purge will retry");
+        }
+    }
+
     /// Remove expired items from the index and their bytes from the blob
-    /// store, and spent links that have expired. Blobs go first, so a failed
-    /// pass leaves rows to retry from.
+    /// store, and spent links that have expired. Per item: audit, then the
+    /// blob (unless an unexpired row still holds it), then the row. A failing
+    /// item is logged and retried next pass; the rest still go. Each item
+    /// takes the action lock, so a release never loses its bytes mid-way.
     pub async fn purge(&self, now: OffsetDateTime) -> Result<usize, QuarantineError> {
         let now = now.unix_timestamp();
         let expired: Vec<Item> = {
@@ -665,29 +807,13 @@ impl QuarantineStore {
                 .map_err(db)?;
             rows
         };
-        let system = Principal {
-            actor: "system".into(),
-            role: Role::PlatformAdmin,
-            tenant_id: None,
-        };
         let mut purged = 0;
         for item in &expired {
-            let others: bool = self
-                .conn()?
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM quarantine WHERE message_id = ?1 AND expires_at > ?2",
-                    params![item.message_id, now],
-                    |row| row.get(0),
-                )
-                .map_err(db)?;
-            if !others {
-                self.blobs.delete(&item.message_id).await.map_err(db)?;
+            let _one = self.actions.lock().await;
+            match self.purge_one(item, now).await {
+                Ok(()) => purged += 1,
+                Err(err) => tracing::error!(item = %item.id, %err, "quarantine item not purged"),
             }
-            self.conn()?
-                .execute("DELETE FROM quarantine WHERE id = ?1", [&item.id])
-                .map_err(db)?;
-            self.audit(&system, item, "purge", None, None, now)?;
-            purged += 1;
         }
         self.conn()?
             .execute("DELETE FROM quarantine_links WHERE expires_at <= ?1", [now])
@@ -695,7 +821,32 @@ impl QuarantineStore {
         Ok(purged)
     }
 
-    /// Held items in user queues not yet in a digest.
+    async fn purge_one(&self, item: &Item, now: i64) -> Result<(), QuarantineError> {
+        let system = Principal {
+            actor: "system".into(),
+            role: Role::PlatformAdmin,
+            tenant_id: None,
+        };
+        self.audit(&system, item, "purge", None, None, now)?;
+        let others: bool = self
+            .conn()?
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM quarantine WHERE message_id = ?1 AND expires_at > ?2
+                 AND released_at IS NULL AND deleted_at IS NULL",
+                params![item.message_id, now],
+                |row| row.get(0),
+            )
+            .map_err(db)?;
+        if !others {
+            self.blobs.delete(&item.message_id).await.map_err(db)?;
+        }
+        self.conn()?
+            .execute("DELETE FROM quarantine WHERE id = ?1", [&item.id])
+            .map_err(db)?;
+        Ok(())
+    }
+
+    /// Held items not yet in a digest or a sender notice.
     pub(crate) fn undigested(&self, now: i64) -> Result<Vec<Item>, QuarantineError> {
         let conn = self.conn()?;
         let mut stmt = conn
@@ -710,10 +861,7 @@ impl QuarantineStore {
             .map_err(db)?
             .collect::<Result<_, _>>()
             .map_err(db)?;
-        Ok(items
-            .into_iter()
-            .filter(|item| self.user_queue(&item.queue))
-            .collect())
+        Ok(items)
     }
 
     pub(crate) fn mark_digested(&self, ids: &[String], now: i64) -> Result<(), QuarantineError> {
@@ -752,6 +900,37 @@ impl QuarantineStore {
     }
 }
 
+/// Earlier builds kept `<id>/message.eml` and `reason.txt` here. They are
+/// not imported into the index, so say so rather than leave them silently.
+fn warn_old_layout(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let old = entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(currawong_spool::is_safe_id)
+                && entry.path().join("message.eml").exists()
+        })
+        .count();
+    if old > 0 {
+        tracing::warn!(
+            count = old,
+            dir = %dir.display(),
+            "messages quarantined by an earlier build are not in the quarantine index; review and remove them by hand"
+        );
+    }
+}
+
+/// Add a bound value; returns its `?N` placeholder.
+fn bind(args: &mut Vec<Value>, value: Value) -> String {
+    args.push(value);
+    format!("?{}", args.len())
+}
+
 fn release_envelope(item: &Item, now: i64) -> Envelope {
     Envelope {
         id: MessageId(derived_id(&item.id, "release")),
@@ -772,7 +951,12 @@ fn release_envelope(item: &Item, now: i64) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: item.headers.clone(),
         dsn_sent: false,
-        pipeline: RELEASE_PIPELINE.into(),
+        pipeline: if item.queue == "spam" {
+            RELEASE_HAM_PIPELINE
+        } else {
+            RELEASE_PIPELINE
+        }
+        .into(),
     }
 }
 
