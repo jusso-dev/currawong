@@ -16,7 +16,7 @@ Tests must pass without a network, a display, clamd or a DNS server. Bind SMTP o
 
 `cargo test -p currawong-fuzzstand` covers the parser entry points when cargo-fuzz is not installed. See `docs/fuzzing.md`.
 
-CI config is in `docs/ci/`. Do not add `.github/workflows` until the workflow scope is available.
+CI config is in `.github/workflows/`.
 
 ## Layout
 

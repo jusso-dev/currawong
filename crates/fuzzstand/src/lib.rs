@@ -258,7 +258,7 @@ mod tests {
             .collect();
         assert_eq!(ours, files);
         let manifest = std::fs::read_to_string(root().join("fuzz/Cargo.toml")).unwrap();
-        let ci = std::fs::read_to_string(root().join("docs/ci/fuzz.yml")).unwrap();
+        let ci = std::fs::read_to_string(root().join(".github/workflows/fuzz.yml")).unwrap();
         for name in &ours {
             assert!(
                 manifest.contains(&format!("name = \"{name}\"")),
@@ -266,7 +266,7 @@ mod tests {
             );
             assert!(
                 ci.contains(&format!("- {name}")),
-                "{name} in docs/ci/fuzz.yml"
+                "{name} in .github/workflows/fuzz.yml"
             );
         }
     }
