@@ -89,15 +89,6 @@ pub fn scan(text: &str, profile: &DlpProfile) -> DlpReport {
             });
         }
     }
-    report.review = report
-        .counts
-        .iter()
-        .filter(|(kind, count)| {
-            let threshold = profile.review_thresholds.get(**kind);
-            threshold > 0 && **count >= threshold
-        })
-        .map(|(kind, _)| *kind)
-        .collect();
     report
 }
 

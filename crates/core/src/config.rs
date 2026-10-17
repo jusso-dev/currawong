@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub policy: PolicyConfig,
     pub dlp: DlpProfile,
 }
 
@@ -272,7 +273,8 @@ pub struct AuthConfig {
 }
 
 /// `[dlp]`: Australian identifier detection on outbound mail, and inbound
-/// mail when `scan_inbound` is set.
+/// mail when `scan_inbound` is set. What happens to a message with findings
+/// is set by policy (`dlp.<kind>` counts and the `dlp.incomplete` flag).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DlpProfile {
@@ -280,34 +282,18 @@ pub struct DlpProfile {
     pub scan_inbound: bool,
     /// Matches below this confidence (0 to 100) are not counted.
     pub min_confidence: u8,
-    pub review_thresholds: DlpThresholds,
 }
 
-/// Distinct identifiers of one kind that send a message to review.
-/// 0 never triggers review.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Policy engine. With neither set, the built-in default pack applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct DlpThresholds {
-    pub tfn: u32,
-    pub medicare: u32,
-    pub abn: u32,
-    pub acn: u32,
-    pub driver_licence: u32,
-    pub card: u32,
-}
-
-impl DlpThresholds {
-    pub fn get(&self, kind: crate::DlpKind) -> u32 {
-        use crate::DlpKind;
-        match kind {
-            DlpKind::Tfn => self.tfn,
-            DlpKind::Medicare => self.medicare,
-            DlpKind::Abn => self.abn,
-            DlpKind::Acn => self.acn,
-            DlpKind::DriverLicence => self.driver_licence,
-            DlpKind::Card => self.card,
-        }
-    }
+pub struct PolicyConfig {
+    /// TOML policy pack. Seeds the database when the database has no policies.
+    pub pack: Option<PathBuf>,
+    /// SQLite policy store. When set, policies are read from it.
+    pub database: Option<PathBuf>,
+    /// Domains outside the tenant's own that redirect and bcc may send to.
+    pub forward_domains: Vec<String>,
 }
 
 impl Default for LogConfig {
@@ -486,21 +472,6 @@ impl Default for DlpProfile {
             enabled: true,
             scan_inbound: false,
             min_confidence: 50,
-            review_thresholds: DlpThresholds::default(),
-        }
-    }
-}
-
-impl Default for DlpThresholds {
-    /// ABNs and ACNs are on public registers, so they do not trigger review.
-    fn default() -> Self {
-        Self {
-            tfn: 5,
-            medicare: 5,
-            abn: 0,
-            acn: 0,
-            driver_licence: 5,
-            card: 5,
         }
     }
 }
@@ -548,6 +519,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            policy: PolicyConfig::default(),
             dlp: DlpProfile::default(),
         }
     }
@@ -669,6 +641,18 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        // An empty tenant id would share the platform's policy namespace.
+        if let Some(tenant) = self
+            .relay
+            .tenants
+            .iter()
+            .find(|t| t.id.trim().is_empty() || t.id.trim() != t.id)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "relay tenant id {:?} must be non-empty with no surrounding spaces",
+                tenant.id
+            )));
+        }
         Ok(())
     }
 
@@ -715,6 +699,19 @@ mod tests {
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
+    }
+
+    #[test]
+    fn blank_tenant_id_is_refused() {
+        for id in ["", " ", " t1"] {
+            let mut cfg = Config::load(&example_path()).unwrap();
+            cfg.relay.tenants.push(TenantConfig {
+                id: id.into(),
+                domains: vec!["example.test".into()],
+                trusted_cidrs: Vec::new(),
+            });
+            assert!(cfg.validate().is_err(), "{id:?}");
+        }
     }
 
     #[test]

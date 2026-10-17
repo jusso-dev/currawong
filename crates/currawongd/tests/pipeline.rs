@@ -195,13 +195,15 @@ async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
     let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
     let mut env = envelope("payroll@example.test");
     env.direction = Direction::Outbound;
+    env.rcpt_to = vec!["agent@external.test".into()];
 
     let tfns = sample_tfns();
     let (held, verdict) = pipeline.evaluate(&env, &tfn_message(&tfns), None).await;
     let Verdict::Quarantine { reason } = verdict else {
         panic!("{verdict:?}");
     };
-    assert_eq!(reason, "dlp review: tfn x5");
+    // The default pack's outbound TFN policy.
+    assert_eq!(reason, "dlp-tfn");
     let dlp = held.dlp.as_ref().unwrap();
     assert_eq!(dlp.counts.get(&currawong_core::DlpKind::Tfn), Some(&5));
 
@@ -209,6 +211,15 @@ async fn five_tfns_outbound_are_held_for_review_and_logs_are_redacted() {
     let (_, verdict) = pipeline
         .evaluate(&env, &tfn_message(&tfns[..4]), None)
         .await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    // Five checksum-valid numbers that are only invoice references.
+    let invoices: Vec<String> = tfns.iter().map(|t| format!("Invoice {t}")).collect();
+    let raw = format!(
+        "From: payroll@example.test\r\nTo: agent@external.test\r\nSubject: invoices\r\nDate: Wed, 14 Oct 2026 01:00:00 +0000\r\n\r\n{}\r\n",
+        invoices.join("\r\n")
+    );
+    let (report, verdict) = pipeline.evaluate(&env, raw.as_bytes(), None).await;
+    assert!(report.dlp.as_ref().unwrap().counts.is_empty(), "{report:?}");
     assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
     let mut inbound = env.clone();
     inbound.direction = Direction::Inbound;

@@ -279,16 +279,13 @@ fn hostile_input_scans_in_linear_time() {
 }
 
 #[test]
-fn bare_numbers_without_context_do_not_trigger_review() {
-    let profile = DlpProfile::default();
+fn bare_numbers_without_context_are_not_counted() {
     let mut values = vec![TFN.to_string()];
     values.extend(synthetic_tfns(4, 9));
     let invoices: Vec<String> = values.iter().map(|v| format!("Invoice {v}")).collect();
-    let report = scan(&invoices.join("\n"), &profile);
-    assert!(report.review.is_empty(), "{report:?}");
+    assert_eq!(tfn_count(&invoices.join("\n")), 0);
     // The same numbers under a TFN heading count.
-    let report = scan(&format!("Name, TFN\n{}", values.join("\n")), &profile);
-    assert_eq!(report.review, vec![DlpKind::Tfn], "{report:?}");
+    assert_eq!(tfn_count(&format!("Name, TFN\n{}", values.join("\n"))), 5);
 }
 
 #[test]
@@ -324,7 +321,7 @@ fn overlapping_matches_keep_the_most_confident() {
 }
 
 #[test]
-fn scan_counts_distinct_values_and_flags_review() {
+fn scan_counts_distinct_values() {
     let profile = DlpProfile::default();
     let mut values = vec![TFN.to_string()];
     values.extend(synthetic_tfns(4, 9));
@@ -333,15 +330,12 @@ fn scan_counts_distinct_values_and_flags_review() {
         .map(|t| format!("TFN {t}"))
         .collect::<Vec<_>>()
         .join("\n");
+    // The same identifiers twice (text and HTML parts) count once.
     let report = scan(&format!("{body}\n{body}"), &profile);
     assert_eq!(report.counts.get(&DlpKind::Tfn), Some(&5));
-    assert_eq!(report.review, vec![DlpKind::Tfn]);
-    let four = scan(&body[..body.rfind('\n').unwrap()], &profile);
-    assert!(four.review.is_empty(), "{four:?}");
-    // ABNs are public and never trigger review by default.
+    assert_eq!(tfn_count(&body[..body.rfind('\n').unwrap()]), 4);
     let abns = scan(&format!("ABN {ABN}\n").repeat(6), &profile);
     assert_eq!(abns.counts.get(&DlpKind::Abn), Some(&1));
-    assert!(abns.review.is_empty());
 }
 
 #[test]
