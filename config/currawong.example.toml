@@ -208,3 +208,12 @@ seal_arc = true
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
 [auth]
 authserv_id = "currawong.example.test"
+
+# policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
+# policy.database: SQLite policy store, seeded from the pack the first time it is opened.
+# policy.forward_domains: domains, beyond the recipient tenant's own, that redirect and bcc may target.
+# Policies are reloaded on every pipeline pass.
+[policy]
+# pack = "/etc/currawong/policies.toml"
+# database = "/var/lib/currawong/policy.db"
+forward_domains = []
