@@ -940,3 +940,168 @@ fn yara_matches_are_signals_policies_can_act_on() {
     );
     assert_eq!(clean.verdict, Verdict::Deliver);
 }
+
+fn government_pack() -> PolicySet {
+    let text = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/policies/government.toml"
+    ))
+    .unwrap();
+    PolicySet::from_toml(&text).unwrap()
+}
+
+fn marked(classification: currawong_core::Classification) -> ScanReport {
+    let mut scanned = report();
+    scanned.marking = Some(currawong_core::MarkingReport {
+        classification: Some(classification),
+        header: Some(classification),
+        ..Default::default()
+    });
+    scanned
+}
+
+#[test]
+fn pspf_government_pack_contains_the_default_pack_unchanged() {
+    let government = government_pack();
+    for policy in &default_pack().policies {
+        let found = government.policies.iter().find(|p| p.id == policy.id);
+        assert_eq!(
+            found,
+            Some(policy),
+            "{} differs from the default pack",
+            policy.id
+        );
+    }
+}
+
+#[test]
+fn pspf_government_pack_blocks_protected_outside_government() {
+    use currawong_core::Classification::*;
+    let pack = government_pack();
+    let verdict = |scanned: &ScanReport, rcpt: &str| {
+        let outbound = Context {
+            direction: Direction::Outbound,
+            ..ctx(rcpt)
+        };
+        evaluate(&Signals::from_report(scanned), &outbound, &pack).verdict
+    };
+    let blocked = |id: &str| Verdict::Reject {
+        code: 550,
+        reason: id.into(),
+    };
+    assert_eq!(
+        verdict(&marked(Protected), "someone@gmail.com"),
+        blocked("pspf-protected-external")
+    );
+    assert_eq!(
+        verdict(&marked(Protected), "officer@finance.gov.au"),
+        Verdict::Deliver
+    );
+    assert_eq!(
+        verdict(&marked(Protected), "officer@gov.au"),
+        Verdict::Deliver
+    );
+    assert_eq!(
+        verdict(&marked(Protected), "Officer@Finance.GOV.AU."),
+        Verdict::Deliver
+    );
+    assert_eq!(
+        verdict(&marked(Protected), "x@gov.au.evil.test"),
+        blocked("pspf-protected-external")
+    );
+    // A lookalike suffix is not a subdomain of gov.au.
+    assert_eq!(
+        verdict(&marked(Protected), "x@notgov.au"),
+        blocked("pspf-protected-external")
+    );
+    assert_eq!(
+        verdict(&marked(Secret), "officer@finance.gov.au"),
+        blocked("pspf-secret")
+    );
+    assert_eq!(
+        verdict(&marked(TopSecret), "someone@gmail.com"),
+        blocked("pspf-secret")
+    );
+    assert_eq!(
+        verdict(&marked(OfficialSensitive), "someone@gmail.com"),
+        Verdict::Deliver
+    );
+    // Unmarked outbound mail from a government tenant is held.
+    let mut unmarked = report();
+    unmarked.marking = Some(currawong_core::MarkingReport::default());
+    assert_eq!(
+        verdict(&unmarked, "someone@gmail.com"),
+        quarantine("pspf-required")
+    );
+    // No marking inspection at all (report.marking None) is left to other policies.
+    assert_eq!(verdict(&report(), "someone@gmail.com"), Verdict::Deliver);
+    // Inbound PROTECTED mail is not blocked by the outbound rules.
+    let inbound = evaluate(
+        &Signals::from_report(&marked(Protected)),
+        &ctx("a@gmail.com"),
+        &pack,
+    );
+    assert_eq!(inbound.verdict, Verdict::Deliver);
+
+    let mut mismatch = marked(Protected);
+    mismatch.marking.as_mut().unwrap().mismatch = true;
+    assert_eq!(
+        verdict(&mismatch, "officer@finance.gov.au"),
+        quarantine("pspf-mismatch")
+    );
+    let mut invalid = report();
+    invalid.marking = Some(currawong_core::MarkingReport {
+        invalid: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        verdict(&invalid, "officer@finance.gov.au"),
+        quarantine("pspf-invalid")
+    );
+}
+
+#[test]
+fn pspf_marking_conditions_and_not_are_validated() {
+    let toml = |cond: &str| {
+        PolicySet::from_toml(&format!(
+            "[[policy]]\nid = \"p\"\nconditions = [{cond}]\nactions = [\"deliver\"]\n"
+        ))
+    };
+    assert!(toml(r#"{ marking_at_least = "PROTECTED" }"#).is_ok());
+    assert!(toml(r#"{ marking_at_least = "CONFIDENTIAL" }"#).is_err());
+    assert!(toml(r#"{ not = { recipient = "*@*.gov.au" } }"#).is_ok());
+    assert!(toml(r#"{ not = { marking_at_least = "BOGUS" } }"#).is_err());
+    assert!(toml(r#"{ not = { not = { flag = "x" } } }"#).is_err());
+    let signals = Signals::from_report(&marked(currawong_core::Classification::Official));
+    assert_eq!(signals.marking.as_deref(), Some("OFFICIAL"));
+    assert!(!signals.flags.contains("pspf.missing"));
+    let mut unmarked = report();
+    unmarked.marking = Some(currawong_core::MarkingReport::default());
+    assert!(Signals::from_report(&unmarked)
+        .flags
+        .contains("pspf.missing"));
+}
+
+#[test]
+fn pspf_default_marking_policy_marks_unmarked_outbound_mail_when_enabled() {
+    let mut pack = government_pack();
+    for policy in pack.policies.iter_mut() {
+        match policy.id.as_str() {
+            "pspf-default-marking" => policy.enabled = true,
+            "pspf-required" => policy.enabled = false,
+            _ => {}
+        }
+    }
+    let mut unmarked = report();
+    unmarked.marking = Some(currawong_core::MarkingReport::default());
+    let outbound = Context {
+        direction: Direction::Outbound,
+        ..ctx("x@gmail.com")
+    };
+    let decision = evaluate(&Signals::from_report(&unmarked), &outbound, &pack);
+    assert_eq!(decision.verdict, Verdict::Deliver);
+    assert!(decision.actions.contains(&Action::AddHeader {
+        name: "X-Protective-Marking".into(),
+        value: "VER=2018.6, NS=gov.au, SEC=OFFICIAL".into(),
+    }));
+}

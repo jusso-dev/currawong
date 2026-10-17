@@ -128,3 +128,10 @@ ADR 0002 says the supervisor talks to parser workers over a Unix socket. Issue #
 ## Malware accuracy
 
 Official ClamAV signatures are the baseline only. See `docs/adr/0005-malware-engines.md`. Do not treat a clean clamd result, on the official set alone, as proof that a message is safe. File-type and macro findings are part of the M1 decision.
+
+## PSPF protective markings (#36)
+
+- The parser follows the EPMS header syntax as published for 2018.6 and 2024.1 (taken from Microsoft's Australian Government Purview guidance, which quotes the standard). The EPMS 2026 text on protectivesecurity.gov.au was not retrieved, so any 2026 changes are not reflected, and the test examples are built from that syntax rather than copied from the standard. The CAVEAT form, the three ACCESS markers and the EXPIRES/DOWNTO pairing should be checked against the 2026 text.
+- The parser is hand written rather than built on `nom`, to avoid a new dependency; it is covered by the `pspf` unit tests and the DLP fuzz entry (`fuzz_scan` now also drives `pspf::parse_subject` and `pspf::inspect`).
+- PROTECTED "only over TLS" is not enforced by the government pack yet: it needs the `require_tls` action (#35).
+- Markings are not yet copied into exported SIEM events; the verdict event carries the policy id (`pspf-*`).

@@ -315,6 +315,8 @@ allowed_domains = []
 # Policies are reloaded on every pipeline pass.
 [policy]
 # pack = "/etc/currawong/policies.toml"
+# Australian Government tenants: config/policies/government.toml adds PSPF
+# protective marking enforcement to the default pack (docs/pspf.md).
 # database = "/var/lib/currawong/policy.db"
 forward_domains = []
 
