@@ -1,6 +1,6 @@
 //! BIMI brand logos for the quarantine UI. `mail-auth` has no BIMI support,
 //! so this reads the `default._bimi.<domain>` TXT record itself. A logo is
-//! only offered for mail that passed DMARC for the DMARC header.from domain,
+//! only offered for mail that passed DMARC for the DMARC author domain,
 //! under a published record at enforcement: `p` and `sp` quarantine or
 //! reject, and `pct` 100 when present.
 use crate::{dmarc_report::valid_host, AuthChecker};
@@ -124,21 +124,12 @@ pub fn safe_url(url: &str) -> bool {
         && matches!(parsed.host(), Some(url::Host::Domain(host)) if valid_host(host))
 }
 
-/// The DMARC `header.from` domain from our Authentication-Results header.
+/// The DMARC author domain, from the structured result. Header text is never
+/// reparsed: a MAIL FROM such as `x@dmarc=pass,header.from=victim.test`
+/// appears in it before the DMARC part.
 pub fn dmarc_domain(auth: &AuthResults) -> Option<String> {
-    let header = auth.header.to_ascii_lowercase();
-    let start = header
-        .match_indices("dmarc=")
-        .find(|(index, _)| !header[..*index].ends_with("policy."))?
-        .0;
-    let segment = header[start..].split(';').next()?;
-    let from = segment.split_once("header.from=")?.1;
-    let domain = from
-        .split(|ch: char| ch.is_ascii_whitespace())
-        .next()?
-        .trim_matches('"')
-        .trim_end_matches('.');
-    valid_host(domain).then(|| domain.to_string())
+    let domain = auth.dmarc_domain.trim_end_matches('.').to_ascii_lowercase();
+    valid_host(&domain).then_some(domain)
 }
 
 /// The published DMARC record allows BIMI: found within the tree walk,
@@ -176,11 +167,23 @@ async fn record_at_enforcement(txt: &dyn TxtLookup, domain: &str) -> bool {
 
 /// BIMI for a message whose DMARC result is already known.
 pub async fn lookup(txt: &dyn TxtLookup, auth: &AuthResults) -> Option<Bimi> {
+    fetch(txt, &eligible(auth)?).await
+}
+
+/// The domain to look BIMI up for, when this message passed DMARC at
+/// enforcement. Needs no DNS.
+pub fn eligible(auth: &AuthResults) -> Option<String> {
     let enforced = matches!(auth.dmarc_policy.as_str(), "quarantine" | "reject");
     if auth.dmarc.result != "pass" || !enforced {
         return None;
     }
-    let domain = dmarc_domain(auth)?;
+    dmarc_domain(auth)
+}
+
+/// The DNS part of BIMI for one domain. The answer depends only on the
+/// domain, so callers may cache it.
+pub async fn fetch(txt: &dyn TxtLookup, domain: &str) -> Option<Bimi> {
+    let domain = domain.to_string();
     if !record_at_enforcement(txt, &domain).await {
         return None;
     }

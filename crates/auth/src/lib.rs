@@ -17,7 +17,7 @@ use currawong_core::{AuthMethodResult, AuthResults};
 use currawong_spool::Envelope;
 use mail_auth::{
     common::{headers::HeaderWriter, parse::TxtRecordParser, verify::DomainKey},
-    dmarc::{verify::DmarcParameters, Dmarc},
+    dmarc::{verify::DmarcParameters, Dmarc, Policy},
     spf::{verify::SpfParameters, Spf},
     AuthenticatedMessage, AuthenticationResults, DkimResult, DmarcResult, MessageAuthenticator,
     Parameters, SpfResult, Txt,
@@ -127,7 +127,8 @@ impl AuthChecker {
                 result: dkim_label(arc.result()).into(),
                 detail: String::new(),
             },
-            dmarc_policy: policy_label(&built),
+            dmarc_policy: policy_label(dmarc.policy()).into(),
+            dmarc_domain: dmarc.domain().to_ascii_lowercase(),
             header: built.to_header(),
         };
         Evaluation {
@@ -150,6 +151,7 @@ fn empty(authserv_id: &str) -> AuthResults {
         dmarc: AuthMethodResult::none(),
         arc: AuthMethodResult::none(),
         dmarc_policy: String::new(),
+        dmarc_domain: String::new(),
         header: format!("Authentication-Results: {authserv_id}; none\r\n"),
     }
 }
@@ -195,16 +197,14 @@ fn dmarc_method(result: DmarcResult) -> AuthMethodResult {
     }
 }
 
-fn policy_label(header: &AuthenticationResults<'_>) -> String {
-    let text = header.to_header().to_ascii_lowercase();
-    let Some(start) = text.find("policy.dmarc=") else {
-        return String::new();
-    };
-    text[start + "policy.dmarc=".len()..]
-        .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
-        .next()
-        .unwrap_or("")
-        .to_string()
+/// Taken from the verifier, never reparsed from header text: a MAIL FROM
+/// such as `x@policy.dmarc=reject` lands in the header before the DMARC part.
+fn policy_label(policy: Policy) -> &'static str {
+    match policy {
+        Policy::Quarantine => "quarantine",
+        Policy::Reject => "reject",
+        Policy::None | Policy::Unspecified => "none",
+    }
 }
 
 pub fn seed_txt(cache: &TxtCache, name: &str, record: &str) -> Result<(), String> {

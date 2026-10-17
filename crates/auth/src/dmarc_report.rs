@@ -15,8 +15,9 @@ use mail_auth::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
@@ -27,6 +28,10 @@ pub const GRACE_SECS: u64 = 60 * 60;
 const MAX_WALK: usize = 8;
 const DNS_TIMEOUT: Duration = Duration::from_secs(10);
 const SENT_RETENTION_DAYS: u64 = 60;
+/// Failed passes before a domain-day is given up.
+pub const MAX_ATTEMPTS: u32 = 8;
+const RETRY_SECS: u64 = 5 * 60;
+const MAX_RETRY_SECS: u64 = 6 * 60 * 60;
 
 /// One DMARC evaluation, kept until its day has been reported.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,10 +75,28 @@ pub struct OutgoingReport {
 #[derive(Clone)]
 pub struct DmarcEventStore {
     conn: Arc<Mutex<Connection>>,
-    max_rua: usize,
-    max_domains: usize,
-    max_rows: usize,
+    limits: Limits,
+    /// (day, key) pairs already warned about, so a flood logs once.
+    warned: Arc<Mutex<HashSet<(i64, String)>>>,
+}
+
+#[derive(Clone)]
+struct Limits {
+    rua: usize,
+    domains: usize,
+    per_org: usize,
+    events: usize,
+    rows: usize,
     retention_days: u64,
+}
+
+/// Why a due domain-day was not finished on this pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// Will be tried again after a backoff.
+    Retry,
+    /// Given up after [`MAX_ATTEMPTS`]; the rows are gone.
+    Dropped,
 }
 
 impl DmarcEventStore {
@@ -95,6 +118,7 @@ impl DmarcEventStore {
                 message_id TEXT NOT NULL UNIQUE,
                 tenant_id TEXT,
                 policy_domain TEXT NOT NULL,
+                org TEXT NOT NULL,
                 day INTEGER NOT NULL,
                 received_at INTEGER NOT NULL,
                 policy_json TEXT NOT NULL,
@@ -102,76 +126,128 @@ impl DmarcEventStore {
                 record_json TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS dmarc_events_day ON dmarc_events (day, policy_domain);
+            CREATE INDEX IF NOT EXISTS dmarc_events_org ON dmarc_events (day, org);
             CREATE TABLE IF NOT EXISTS dmarc_reports_sent (
                 day INTEGER NOT NULL,
                 policy_domain TEXT NOT NULL,
                 spool_id TEXT,
                 done INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt INTEGER NOT NULL DEFAULT 0,
+                dropped INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (day, policy_domain)
             );",
         )
         .map_err(|err| err.to_string())?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            max_rua: cfg.max_rua_per_record,
-            max_domains: cfg.max_domains_per_day,
-            max_rows: cfg.max_rows_per_report,
-            retention_days: cfg.retention_days,
+            limits: Limits {
+                rua: cfg.max_rua_per_record,
+                domains: cfg.max_domains_per_day,
+                per_org: cfg.max_domains_per_org,
+                events: cfg.max_events_per_domain_day,
+                rows: cfg.max_rows_per_report,
+                retention_days: cfg.retention_days,
+            },
+            warned: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
     /// Store an evaluation. A message is recorded once, however often it is
-    /// classified. Returns false when the row was dropped: already recorded,
-    /// its day already reported for that domain, or the daily domain cap.
+    /// classified. Returns false when the row was dropped: no usable `rua`,
+    /// already recorded, its domain-day already claimed for a report, or a cap.
+    ///
+    /// Caps are fair per organisational domain: one registrable domain cannot
+    /// hold more than `max_domains_per_org` policy domains a day, and when the
+    /// daily total is full the lowest-volume domain of the largest
+    /// organisation makes way for a domain from a smaller one.
     pub fn record(&self, event: &DmarcEvent) -> Result<bool, String> {
+        let rua: Vec<&URI> = event
+            .rua
+            .iter()
+            .take(self.limits.rua)
+            .filter(|uri| valid_address(uri.uri()))
+            .collect();
+        // Nobody to send the report to: nothing worth keeping.
+        if rua.is_empty() {
+            return Ok(false);
+        }
         let mut policy = serde_json::to_value(&event.policy).map_err(|err| err.to_string())?;
         let mut record = serde_json::to_value(&event.record).map_err(|err| err.to_string())?;
         sanitise_json(&mut policy);
         sanitise_json(&mut record);
-        let rua: Vec<&URI> = event
-            .rua
-            .iter()
-            .take(self.max_rua)
-            .filter(|uri| valid_address(uri.uri()))
-            .collect();
         let rua = serde_json::to_string(&rua).map_err(|err| err.to_string())?;
-        let domain = xml_safe(&event.policy_domain);
+        let domain = xml_safe(&event.policy_domain).to_ascii_lowercase();
+        let org = org_domain(&domain);
         let day = (event.received_at / DAY_SECS) as i64;
-        self.with_tx(|tx| {
-            let reported: Option<i64> = tx
+        let limits = self.limits.clone();
+        let outcome = self.with_tx(|tx| {
+            let claimed: Option<i64> = tx
                 .query_row(
                     "SELECT 1 FROM dmarc_reports_sent WHERE day = ?1 AND policy_domain = ?2",
                     params![day, domain],
                     |row| row.get(0),
                 )
                 .optional()?;
-            if reported.is_some() {
-                return Ok(false);
+            if claimed.is_some() {
+                return Ok(Recorded::Late);
             }
-            let known: Option<i64> = tx
-                .query_row(
-                    "SELECT 1 FROM dmarc_events WHERE day = ?1 AND policy_domain = ?2 LIMIT 1",
-                    params![day, domain],
+            let rows: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM dmarc_events WHERE day = ?1 AND policy_domain = ?2",
+                params![day, domain],
+                |row| row.get(0),
+            )?;
+            if rows as usize >= limits.events {
+                return Ok(Recorded::Capped(format!("events for {domain}")));
+            }
+            if rows == 0 {
+                let in_org: i64 = tx.query_row(
+                    "SELECT COUNT(DISTINCT policy_domain) FROM dmarc_events WHERE day = ?1 AND org = ?2",
+                    params![day, org],
                     |row| row.get(0),
-                )
-                .optional()?;
-            if known.is_none() {
-                let domains: i64 = tx.query_row(
+                )?;
+                if in_org as usize >= limits.per_org {
+                    return Ok(Recorded::Capped(format!("policy domains under {org}")));
+                }
+                let total: i64 = tx.query_row(
                     "SELECT COUNT(DISTINCT policy_domain) FROM dmarc_events WHERE day = ?1",
                     params![day],
                     |row| row.get(0),
                 )?;
-                if domains as usize >= self.max_domains {
-                    return Ok(false);
+                if total as usize >= limits.domains {
+                    let largest: Option<(String, i64)> = tx
+                        .query_row(
+                            "SELECT org, COUNT(DISTINCT policy_domain) AS n FROM dmarc_events
+                             WHERE day = ?1 GROUP BY org ORDER BY n DESC, org LIMIT 1",
+                            params![day],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )
+                        .optional()?;
+                    match largest {
+                        Some((big, count)) if big != org && count > in_org + 1 => {
+                            let victim: String = tx.query_row(
+                                "SELECT policy_domain FROM dmarc_events WHERE day = ?1 AND org = ?2
+                                 GROUP BY policy_domain ORDER BY COUNT(*), policy_domain LIMIT 1",
+                                params![day, big],
+                                |row| row.get(0),
+                            )?;
+                            tx.execute(
+                                "DELETE FROM dmarc_events WHERE day = ?1 AND policy_domain = ?2",
+                                params![day, victim],
+                            )?;
+                        }
+                        _ => return Ok(Recorded::Capped("policy domains for the day".into())),
+                    }
                 }
             }
             let inserted = tx.execute(
-                "INSERT OR IGNORE INTO dmarc_events (message_id, tenant_id, policy_domain, day, received_at, policy_json, rua_json, record_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT OR IGNORE INTO dmarc_events (message_id, tenant_id, policy_domain, org, day, received_at, policy_json, rua_json, record_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     event.message_id,
                     event.tenant_id,
                     domain,
+                    org,
                     day,
                     event.received_at as i64,
                     policy.to_string(),
@@ -179,15 +255,40 @@ impl DmarcEventStore {
                     record.to_string()
                 ],
             )?;
-            Ok(inserted == 1)
+            Ok(if inserted == 1 {
+                Recorded::Stored
+            } else {
+                Recorded::Duplicate
+            })
+        })?;
+        Ok(match outcome {
+            Recorded::Stored => true,
+            Recorded::Duplicate | Recorded::Late => false,
+            Recorded::Capped(what) => {
+                if self.first_warning(day, &what) {
+                    tracing::warn!(day, cap = %what, "dmarc event cap reached, events dropped");
+                }
+                false
+            }
         })
     }
 
-    /// Days whose reports are due: ended at least [`GRACE_SECS`] ago, still
-    /// holding events. Events past the retention period are dropped first.
-    pub fn pending_days(&self, now: u64) -> Result<Vec<u64>, String> {
+    fn first_warning(&self, day: i64, key: &str) -> bool {
+        let mut warned = self.warned.lock().unwrap_or_else(PoisonError::into_inner);
+        if warned.len() > 10_000 {
+            warned.clear();
+        }
+        warned.insert((day, key.to_string()))
+    }
+
+    /// Domain-days whose reports are due: the day ended at least
+    /// [`GRACE_SECS`] ago, the domain is not finished and not backing off.
+    /// Fresh work comes first, repeatedly failing domains last. Old events,
+    /// old ledger rows and rows left behind by finished domain-days are
+    /// dropped first.
+    pub fn due(&self, now: u64) -> Result<Vec<(u64, String)>, String> {
         let today = now / DAY_SECS;
-        let oldest = today.saturating_sub(self.retention_days) as i64;
+        let oldest = today.saturating_sub(self.limits.retention_days) as i64;
         let sent_oldest = today.saturating_sub(SENT_RETENTION_DAYS) as i64;
         let due = (now.saturating_sub(GRACE_SECS) / DAY_SECS) as i64;
         self.with_tx(|tx| {
@@ -196,13 +297,34 @@ impl DmarcEventStore {
                 "DELETE FROM dmarc_reports_sent WHERE day < ?1",
                 params![sent_oldest],
             )?;
-            let mut stmt =
-                tx.prepare("SELECT DISTINCT day FROM dmarc_events WHERE day < ?1 ORDER BY day")?;
-            let days = stmt
-                .query_map(params![due], |row| row.get::<_, i64>(0))?
+            tx.execute(
+                "DELETE FROM dmarc_events WHERE EXISTS (
+                    SELECT 1 FROM dmarc_reports_sent s WHERE s.done = 1
+                    AND s.day = dmarc_events.day AND s.policy_domain = dmarc_events.policy_domain)",
+                [],
+            )?;
+            let mut stmt = tx.prepare(
+                "SELECT e.day, e.policy_domain, COALESCE(MAX(s.attempts), 0) AS attempts
+                 FROM dmarc_events e LEFT JOIN dmarc_reports_sent s
+                   ON s.day = e.day AND s.policy_domain = e.policy_domain
+                 WHERE e.day < ?1 AND COALESCE(s.done, 0) = 0 AND COALESCE(s.next_attempt, 0) <= ?2
+                 GROUP BY e.day, e.policy_domain
+                 ORDER BY attempts, e.day, e.policy_domain",
+            )?;
+            let due = stmt
+                .query_map(params![due, now as i64], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get::<_, String>(1)?))
+                })?
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(days.into_iter().map(|day| day as u64).collect())
+            Ok(due)
         })
+    }
+
+    /// Distinct days in [`DmarcEventStore::due`].
+    pub fn pending_days(&self, now: u64) -> Result<Vec<u64>, String> {
+        let mut days: Vec<u64> = self.due(now)?.into_iter().map(|(day, _)| day).collect();
+        days.dedup();
+        Ok(days)
     }
 
     /// Policy domains with unreported events on `day`.
@@ -265,7 +387,7 @@ impl DmarcEventStore {
         let mut omitted_rows = 0;
         let mut included = 0;
         for (json, count) in rows {
-            if parsed.len() >= self.max_rows {
+            if parsed.len() >= self.limits.rows {
                 omitted_rows += 1;
                 continue;
             }
@@ -288,21 +410,83 @@ impl DmarcEventStore {
         }))
     }
 
-    /// The spool id for this domain-day's report, created once. Retrying
-    /// after a crash reuses it, so a report already spooled is not queued again.
-    pub fn spool_id(&self, day: u64, domain: &str, fresh: &str) -> Result<String, String> {
+    /// Claim a domain-day before loading it. From here on no new rows are
+    /// recorded for it, so what is loaded is what gets finished. Returns the
+    /// report's spool id, created once: retrying after a crash reuses it, so
+    /// a report already spooled is not queued again.
+    pub fn claim(&self, day: u64, domain: &str, fresh: &str) -> Result<String, String> {
         self.with_tx(|tx| {
             tx.execute(
                 "INSERT OR IGNORE INTO dmarc_reports_sent (day, policy_domain, spool_id, done)
                  VALUES (?1, ?2, ?3, 0)",
                 params![day as i64, domain, fresh],
             )?;
+            tx.execute(
+                "UPDATE dmarc_reports_sent SET spool_id = ?3
+                 WHERE day = ?1 AND policy_domain = ?2 AND spool_id IS NULL",
+                params![day as i64, domain, fresh],
+            )?;
             tx.query_row(
                 "SELECT spool_id FROM dmarc_reports_sent WHERE day = ?1 AND policy_domain = ?2",
                 params![day as i64, domain],
-                |row| row.get::<_, Option<String>>(0),
+                |row| row.get::<_, String>(0),
             )
-            .map(|id| id.unwrap_or_else(|| fresh.to_string()))
+        })
+    }
+
+    /// A pass could not finish this domain-day. Back off exponentially; after
+    /// [`MAX_ATTEMPTS`] give up, drop the rows and record that in the ledger.
+    pub fn note_failure(&self, day: u64, domain: &str, now: u64) -> Result<Failure, String> {
+        self.with_tx(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO dmarc_reports_sent (day, policy_domain, spool_id, done)
+                 VALUES (?1, ?2, NULL, 0)",
+                params![day as i64, domain],
+            )?;
+            let attempts: i64 = tx.query_row(
+                "UPDATE dmarc_reports_sent SET attempts = attempts + 1
+                 WHERE day = ?1 AND policy_domain = ?2 RETURNING attempts",
+                params![day as i64, domain],
+                |row| row.get(0),
+            )?;
+            if attempts as u32 >= MAX_ATTEMPTS {
+                tx.execute(
+                    "UPDATE dmarc_reports_sent SET done = 1, dropped = 1
+                     WHERE day = ?1 AND policy_domain = ?2",
+                    params![day as i64, domain],
+                )?;
+                tx.execute(
+                    "DELETE FROM dmarc_events WHERE day = ?1 AND policy_domain = ?2",
+                    params![day as i64, domain],
+                )?;
+                return Ok(Failure::Dropped);
+            }
+            let backoff = (RETRY_SECS << (attempts - 1).min(16) as u32).min(MAX_RETRY_SECS);
+            tx.execute(
+                "UPDATE dmarc_reports_sent SET next_attempt = ?3
+                 WHERE day = ?1 AND policy_domain = ?2",
+                params![day as i64, domain, (now + backoff) as i64],
+            )?;
+            Ok(Failure::Retry)
+        })
+    }
+
+    /// Ledger state for a domain-day: (attempts, done, dropped).
+    pub fn ledger(&self, day: u64, domain: &str) -> Result<Option<(u32, bool, bool)>, String> {
+        self.with_tx(|tx| {
+            tx.query_row(
+                "SELECT attempts, done, dropped FROM dmarc_reports_sent
+                 WHERE day = ?1 AND policy_domain = ?2",
+                params![day as i64, domain],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u32,
+                        row.get::<_, i64>(1)? == 1,
+                        row.get::<_, i64>(2)? == 1,
+                    ))
+                },
+            )
+            .optional()
         })
     }
 
@@ -328,15 +512,42 @@ impl DmarcEventStore {
         &self,
         f: impl FnOnce(&rusqlite::Transaction<'_>) -> rusqlite::Result<T>,
     ) -> Result<T, String> {
-        let mut conn = self
-            .conn
-            .lock()
-            .map_err(|_| "dmarc store lock poisoned".to_string())?;
+        // A panic elsewhere while holding the lock leaves SQLite consistent:
+        // the open transaction was rolled back when it was dropped.
+        let mut conn = self.conn.lock().unwrap_or_else(PoisonError::into_inner);
         let tx = conn.transaction().map_err(|err| err.to_string())?;
         let value = f(&tx).map_err(|err| err.to_string())?;
         tx.commit().map_err(|err| err.to_string())?;
         Ok(value)
     }
+}
+
+enum Recorded {
+    Stored,
+    Duplicate,
+    Late,
+    Capped(String),
+}
+
+/// Registrable domain without the Public Suffix List: the last two labels,
+/// or three under a two-letter country code's common second level, such as
+/// `example.com.au`. Close enough to keep one organisation's subdomains in
+/// one bucket for the daily caps.
+pub fn org_domain(domain: &str) -> String {
+    const SECOND_LEVEL: &[&str] = &[
+        "com", "net", "org", "edu", "gov", "asn", "id", "co", "ac", "ltd", "plc", "nsw", "vic",
+        "qld",
+    ];
+    let labels: Vec<&str> = domain.trim_end_matches('.').split('.').collect();
+    let take = match labels.as_slice() {
+        [.., second, tld]
+            if labels.len() >= 3 && tld.len() == 2 && SECOND_LEVEL.contains(second) =>
+        {
+            3
+        }
+        _ => 2,
+    };
+    labels[labels.len().saturating_sub(take)..].join(".")
 }
 
 /// Replace characters outside the XML 1.0 `Char` production. mail-auth
@@ -437,22 +648,24 @@ pub fn build_report(cfg: &DmarcReportConfig, data: &DomainDay) -> Report {
     report
 }
 
-/// Render the report for `to`. Addresses whose `!size` limit is below the
-/// rendered size are dropped and the message is rendered again, so the To
-/// header always matches the envelope. `None` when nothing is left.
+/// Render the report for `to`. Over `max_report_bytes`, the smallest rows
+/// are dropped (and counted in the report's `error`) until it fits.
+/// Addresses whose `!size` limit is below the rendered size are dropped and
+/// the message is rendered again, so the To header always matches the
+/// envelope. `None` when nothing is left.
 pub fn render_report(
     cfg: &DmarcReportConfig,
     data: &DomainDay,
     to: &[URI],
 ) -> Result<Option<OutgoingReport>, String> {
-    let report = build_report(cfg, data);
+    let mut data = data.clone();
     let mut to: Vec<&URI> = to.iter().collect();
     loop {
         if to.is_empty() {
             return Ok(None);
         }
         let mut message = Vec::new();
-        report
+        build_report(cfg, &data)
             .write_rfc5322(
                 submitter(cfg),
                 cfg.email.as_str(),
@@ -461,8 +674,17 @@ pub fn render_report(
             )
             .map_err(|err| err.to_string())?;
         if message.len() > cfg.max_report_bytes {
-            tracing::warn!(domain = %data.domain, bytes = message.len(), "dmarc report over max_report_bytes, not sent");
-            return Ok(None);
+            if data.rows.len() <= 1 {
+                tracing::warn!(domain = %data.domain, bytes = message.len(), "dmarc report over max_report_bytes, not sent");
+                return Ok(None);
+            }
+            // Rows are sorted largest first, so the tail is the least volume.
+            let keep = data.rows.len() / 2;
+            for (_, count) in data.rows.drain(keep..) {
+                data.omitted_rows += 1;
+                data.omitted_messages += u64::from(count);
+            }
+            continue;
         }
         // A `!0` limit parses as 0, the same as no limit.
         let fits = |uri: &&URI| uri.max_size() == 0 || message.len() <= uri.max_size();

@@ -1,5 +1,8 @@
 use currawong_auth::{
-    dmarc_report::{build_report, render_report, valid_address, DAY_SECS, GRACE_SECS},
+    dmarc_report::{
+        build_report, org_domain, render_report, valid_address, Failure, DAY_SECS, GRACE_SECS,
+        MAX_ATTEMPTS,
+    },
     ed25519_key, seed_txt, seed_txt_error, sign_message, AuthChecker, DmarcEvent, DmarcEventStore,
 };
 use currawong_core::{config::DmarcReportConfig, Direction, MessageId};
@@ -501,8 +504,8 @@ async fn dmarc_report_corrupt_row_is_skipped() {
         .unwrap();
     let conn = rusqlite::Connection::open(dir.path().join("dmarc.sqlite")).unwrap();
     conn.execute(
-        "INSERT INTO dmarc_events (message_id, policy_domain, day, received_at, policy_json, rua_json, record_json)
-         VALUES ('bad', 'example.test', ?1, ?2, '{}', '[]', 'not json')",
+        "INSERT INTO dmarc_events (message_id, policy_domain, org, day, received_at, policy_json, rua_json, record_json)
+         VALUES ('bad', 'example.test', 'example.test', ?1, ?2, '{}', '[]', 'not json')",
         rusqlite::params![DAY as i64, RECEIVED],
     )
     .unwrap();
@@ -512,13 +515,13 @@ async fn dmarc_report_corrupt_row_is_skipped() {
 }
 
 #[tokio::test]
-async fn dmarc_report_spool_id_is_stable() {
+async fn dmarc_report_claim_is_stable() {
     let (_dir, store) = store();
     let first = store
-        .spool_id(DAY, "example.test", "01ARZ3NDEKTSV4RRFFQ69G5FA1")
+        .claim(DAY, "example.test", "01ARZ3NDEKTSV4RRFFQ69G5FA1")
         .unwrap();
     let again = store
-        .spool_id(DAY, "example.test", "01ARZ3NDEKTSV4RRFFQ69G5FA2")
+        .claim(DAY, "example.test", "01ARZ3NDEKTSV4RRFFQ69G5FA2")
         .unwrap();
     assert_eq!(first, again);
 }
@@ -583,4 +586,266 @@ async fn dmarc_report_envelope_from_never_leaks_a_local_part() {
     )
     .await;
     assert_eq!(event.record.identifiers.envelope_from, "example.test");
+}
+
+#[tokio::test]
+async fn dmarc_report_record_without_usable_rua_is_not_kept() {
+    let (_dir, store) = store();
+    let mut none = event(
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "example.test",
+        1,
+        RECEIVED as u64,
+    );
+    none.rua.clear();
+    assert!(!store.record(&none).unwrap());
+    let mut bad = event(
+        "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+        "example.test",
+        1,
+        RECEIVED as u64,
+    );
+    bad.rua = vec![uri("agg@[10.0.0.1]", 0)];
+    assert!(!store.record(&bad).unwrap());
+    assert!(store.domains(DAY).unwrap().is_empty());
+}
+
+#[test]
+fn dmarc_report_org_domain_buckets() {
+    assert_eq!(org_domain("x1.attacker.test"), "attacker.test");
+    assert_eq!(org_domain("attacker.test"), "attacker.test");
+    assert_eq!(org_domain("mail.example.com.au"), "example.com.au");
+    assert_eq!(org_domain("example.com.au"), "example.com.au");
+    assert_eq!(org_domain("a.b.example.co.uk"), "example.co.uk");
+}
+
+#[tokio::test]
+async fn dmarc_report_domain_cap_is_fair_per_organisation() {
+    let cfg = DmarcReportConfig {
+        max_domains_per_day: 4,
+        max_domains_per_org: 3,
+        ..settings()
+    };
+    let (_dir, store) = store_with(&cfg);
+    let at = RECEIVED as u64;
+    // Wildcard _dmarc subdomains of one organisation: only three get in.
+    for (n, sub) in ["x1", "x2", "x3", "x4"].iter().enumerate() {
+        let id = format!("01ARZ3NDEKTSV4RRFFQ69G5FB{n}");
+        let kept = store
+            .record(&event(&id, &format!("{sub}.attacker.test"), 1, at))
+            .unwrap();
+        assert_eq!(kept, n < 3, "{sub}");
+    }
+    // A second message for x1 makes x2 and x3 the lowest-volume domains.
+    assert!(store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FC1",
+            "x1.attacker.test",
+            2,
+            at
+        ))
+        .unwrap());
+    assert!(store
+        .record(&event("01ARZ3NDEKTSV4RRFFQ69G5FC2", "legit.test", 1, at))
+        .unwrap());
+    // The daily total is now full. Another organisation still gets in: the
+    // largest one gives up its lowest-volume domain.
+    assert!(store
+        .record(&event("01ARZ3NDEKTSV4RRFFQ69G5FC3", "other.test", 1, at))
+        .unwrap());
+    let domains = store.domains(DAY).unwrap();
+    assert_eq!(domains.len(), 4, "{domains:?}");
+    assert!(domains.contains(&"legit.test".to_string()));
+    assert!(domains.contains(&"other.test".to_string()));
+    assert!(domains.contains(&"x1.attacker.test".to_string()));
+    // The attacker cannot evict the smaller organisations in return.
+    assert!(!store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FC4",
+            "x5.attacker.test",
+            1,
+            at
+        ))
+        .unwrap());
+    assert!(store
+        .domains(DAY)
+        .unwrap()
+        .contains(&"legit.test".to_string()));
+}
+
+#[tokio::test]
+async fn dmarc_report_events_per_domain_day_are_capped() {
+    let cfg = DmarcReportConfig {
+        max_events_per_domain_day: 2,
+        ..settings()
+    };
+    let (_dir, store) = store_with(&cfg);
+    for n in 0..3u8 {
+        let id = format!("01ARZ3NDEKTSV4RRFFQ69G5FA{n}");
+        let kept = store
+            .record(&event(&id, "example.test", n, RECEIVED as u64))
+            .unwrap();
+        assert_eq!(kept, n < 2);
+    }
+}
+
+#[tokio::test]
+async fn dmarc_report_failures_back_off_then_drop() {
+    let (_dir, store) = store();
+    store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+            "slow.test",
+            1,
+            RECEIVED as u64,
+        ))
+        .unwrap();
+    store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "fast.test",
+            1,
+            RECEIVED as u64,
+        ))
+        .unwrap();
+    assert_eq!(
+        store.note_failure(DAY, "slow.test", NEXT_DAY).unwrap(),
+        Failure::Retry
+    );
+    // Backing off: only the healthy domain is due now.
+    let due: Vec<String> = store
+        .due(NEXT_DAY)
+        .unwrap()
+        .into_iter()
+        .map(|(_, domain)| domain)
+        .collect();
+    assert_eq!(due, vec!["fast.test"]);
+    // Once due again, the failing domain comes after fresh work.
+    let later = NEXT_DAY + 600;
+    let due: Vec<String> = store
+        .due(later)
+        .unwrap()
+        .into_iter()
+        .map(|(_, domain)| domain)
+        .collect();
+    assert_eq!(due, vec!["fast.test", "slow.test"]);
+    let mut now = later;
+    for _ in 1..MAX_ATTEMPTS - 1 {
+        assert_eq!(
+            store.note_failure(DAY, "slow.test", now).unwrap(),
+            Failure::Retry
+        );
+        now += 7 * 60 * 60;
+    }
+    assert_eq!(
+        store.note_failure(DAY, "slow.test", now).unwrap(),
+        Failure::Dropped
+    );
+    assert_eq!(
+        store.ledger(DAY, "slow.test").unwrap(),
+        Some((MAX_ATTEMPTS, true, true))
+    );
+    assert!(store.load(DAY, "slow.test").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn dmarc_report_retention_prunes_events_and_ledger() {
+    let (_dir, store) = store();
+    store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+            "old.test",
+            1,
+            RECEIVED as u64,
+        ))
+        .unwrap();
+    store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "sent.test",
+            1,
+            RECEIVED as u64,
+        ))
+        .unwrap();
+    store.finish(DAY, "sent.test").unwrap();
+    // Eight days on, past the seven-day retention: the unsent day is gone.
+    assert!(store.due(NEXT_DAY + 8 * DAY_SECS).unwrap().is_empty());
+    assert!(store.load(DAY, "old.test").unwrap().is_none());
+    assert!(store.ledger(DAY, "sent.test").unwrap().is_some());
+    // Ledger rows go after sixty days.
+    store.due(NEXT_DAY + 61 * DAY_SECS).unwrap();
+    assert!(store.ledger(DAY, "sent.test").unwrap().is_none());
+}
+
+#[tokio::test]
+async fn dmarc_report_claimed_day_takes_no_new_rows() {
+    let (_dir, store) = store();
+    store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+            "example.test",
+            1,
+            RECEIVED as u64,
+        ))
+        .unwrap();
+    store
+        .claim(DAY, "example.test", "01ARZ3NDEKTSV4RRFFQ69G5FZZ")
+        .unwrap();
+    assert!(!store
+        .record(&event(
+            "01ARZ3NDEKTSV4RRFFQ69G5FA2",
+            "example.test",
+            2,
+            RECEIVED as u64
+        ))
+        .unwrap());
+    assert_eq!(
+        store.load(DAY, "example.test").unwrap().unwrap().rows.len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn dmarc_report_rows_are_trimmed_to_fit_max_report_bytes() {
+    let (_dir, store) = store();
+    for n in 0..60u8 {
+        let id = format!("01ARZ3NDEKTSV4RRFFQ69G5F{n:02}");
+        store
+            .record(&event(&id, "example.test", n, RECEIVED as u64))
+            .unwrap();
+    }
+    let data = store.load(DAY, "example.test").unwrap().unwrap();
+    assert_eq!(data.rows.len(), 60);
+    let full = render_report(&settings(), &data, &[uri("agg@example.test", 0)])
+        .unwrap()
+        .unwrap();
+    let limited = DmarcReportConfig {
+        max_report_bytes: full.message.len() - 200,
+        ..settings()
+    };
+    let trimmed = render_report(&limited, &data, &[uri("agg@example.test", 0)])
+        .unwrap()
+        .unwrap();
+    assert!(trimmed.message.len() <= limited.max_report_bytes);
+    let (_, xml) = attachment_xml(&trimmed.message);
+    assert!(xml.contains("omitted by the report size limit"), "{xml}");
+    assert_valid_xml(&xml);
+}
+
+#[tokio::test]
+async fn dmarc_report_structured_domain_resists_mail_from_spoofing() {
+    let (checker, signed) = checker_with_records("v=DMARC1; p=reject; rua=mailto:agg@example.test");
+    let env = envelope(
+        "01ARZ3NDEKTSV4RRFFQ69G5FA1",
+        "x@dmarc=pass,header.from=victim.test",
+    );
+    let results = checker.evaluate(&signed, &env, false).await.results;
+    assert_eq!(results.dmarc.result, "pass", "{}", results.header);
+    assert!(results.header.contains("victim.test"), "{}", results.header);
+    assert_eq!(results.dmarc_domain, "example.test");
+    assert_eq!(results.dmarc_policy, "reject");
+    assert_eq!(
+        currawong_auth::bimi::eligible(&results).as_deref(),
+        Some("example.test")
+    );
 }

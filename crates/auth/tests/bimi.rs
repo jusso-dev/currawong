@@ -15,6 +15,7 @@ fn auth(dmarc: &str, policy: &str) -> AuthResults {
         },
         arc: AuthMethodResult::none(),
         dmarc_policy: policy.into(),
+        dmarc_domain: "example.test".into(),
         header: format!(
             "Authentication-Results: gateway.test;\r\n\tdkim=none header.from=other.test;\r\n\tdmarc={dmarc} header.from=example.test policy.dmarc={policy}\r\n"
         ),
@@ -94,12 +95,23 @@ async fn bimi_pct_below_100_or_sp_none_means_no_logo() {
 }
 
 #[tokio::test]
-async fn bimi_uses_the_dmarc_domain_not_another_header() {
-    let auth = auth("pass", "reject");
-    assert_eq!(dmarc_domain(&auth).as_deref(), Some("example.test"));
-    let mut forged = auth.clone();
-    forged.header = "Authentication-Results: gateway.test; dkim=none".into();
-    assert_eq!(dmarc_domain(&forged), None);
+async fn bimi_uses_the_structured_dmarc_domain_not_header_text() {
+    // The exact MAIL FROM an attacker would use to plant a fake DMARC part
+    // ahead of the real one in our Authentication-Results header.
+    let mut spoofed = auth("pass", "reject");
+    spoofed.dmarc_domain = "attacker.test".into();
+    spoofed.header = "Authentication-Results: gateway.test;\r\n\tspf=pass smtp.mailfrom=x@dmarc=pass,header.from=victim.test;\r\n\tdmarc=pass header.from=attacker.test policy.dmarc=reject\r\n".into();
+    assert_eq!(dmarc_domain(&spoofed).as_deref(), Some("attacker.test"));
+    let mut txt = dns(REJECT, &["v=BIMI1; l=https://example.test/logo.svg"]);
+    txt.insert("_dmarc.victim.test".into(), vec![REJECT.to_string()]);
+    txt.insert(
+        "default._bimi.victim.test".into(),
+        vec!["v=BIMI1; l=https://victim.test/logo.svg".to_string()],
+    );
+    assert!(lookup(&txt, &spoofed).await.is_none());
+    let mut missing = auth("pass", "reject");
+    missing.dmarc_domain.clear();
+    assert_eq!(dmarc_domain(&missing), None);
 }
 
 #[tokio::test]

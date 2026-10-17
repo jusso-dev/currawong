@@ -20,6 +20,8 @@ pub struct Pipeline {
     pub pool: Option<WorkerPool>,
     /// Where inbound DMARC results go for aggregate reports.
     pub dmarc_events: Option<DmarcEventStore>,
+    /// Quarantined mail waiting for a BIMI lookup on the background worker.
+    pub bimi_jobs: Option<tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
 }
@@ -39,6 +41,7 @@ impl Pipeline {
             auth,
             pool,
             dmarc_events: None,
+            bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
         }
@@ -47,6 +50,22 @@ impl Pipeline {
     pub fn with_dmarc_events(mut self, store: DmarcEventStore) -> Self {
         self.dmarc_events = Some(store);
         self
+    }
+
+    pub fn with_bimi(mut self, jobs: tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>) -> Self {
+        self.bimi_jobs = Some(jobs);
+        self
+    }
+
+    /// Hand a quarantined message to the BIMI worker without waiting. When
+    /// the queue is full the lookup is skipped: a logo is a nicety.
+    pub fn queue_bimi(&self, id: currawong_core::MessageId, auth: AuthResults) {
+        let Some(jobs) = &self.bimi_jobs else {
+            return;
+        };
+        if jobs.try_send(crate::dmarc::BimiJob { id, auth }).is_err() {
+            tracing::debug!("BIMI queue full, lookup skipped");
+        }
     }
 
     pub fn with_policies(mut self, policies: PolicySet) -> Self {

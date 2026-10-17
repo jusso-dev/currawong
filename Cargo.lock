@@ -810,6 +810,7 @@ dependencies = [
  "currawong-scan",
  "currawong-smtp",
  "currawong-spool",
+ "futures",
  "hex",
  "serde",
  "serde_json",
