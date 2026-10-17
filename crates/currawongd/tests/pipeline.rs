@@ -10,6 +10,7 @@ fn envelope(from: &str) -> Envelope {
     Envelope {
         id: currawong_core::MessageId("01ARZ3NDEKTSV4RRFFQ69G5FAV".into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: from.into(),
         rcpt_to: vec!["dest@example.test".into()],
         received_at: OffsetDateTime::now_utc(),
@@ -133,6 +134,68 @@ content_endpoints = ["https://mail.s3.us-east-1.amazonaws.com/box"]
     assert!(
         err.contains("Australia") || err.contains("us-east-1") || err.contains("not an allowed"),
         "{err}"
+    );
+}
+
+#[tokio::test]
+async fn verdicts_feed_reputation_and_dmarc_pass_skips_greylisting() {
+    use currawong_smtp::{
+        checks::{CheckStack, GreylistDecision},
+        dns::MapDns,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.checks.dnsbl_enabled = false;
+    cfg.checks.ratelimit_enabled = false;
+    cfg.checks.greylist_enabled = true;
+    cfg.checks.reputation_enabled = true;
+    cfg.checks.greylist_database = dir.path().join("grey.sqlite");
+    let checks = Arc::new(CheckStack::from_checks(&cfg.checks, Arc::new(MapDns::new())).unwrap());
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    seed_txt(auth.cache(), "attacker.test", "v=spf1 -all").unwrap();
+    seed_txt(auth.cache(), "_dmarc.example.test", "v=DMARC1; p=reject").unwrap();
+    seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth).with_checks(Arc::clone(&checks));
+
+    let spoof = envelope("spoof@attacker.test");
+    let (_, verdict) = pipeline.evaluate(&spoof, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+    let reputation = checks.reputation.as_ref().unwrap();
+    assert_eq!(
+        reputation.score(spoof.remote_ip),
+        0.0,
+        "a DMARC quarantine says nothing about the connecting host"
+    );
+
+    let mut clean = envelope("user@example.test");
+    clean.remote_ip = "198.51.100.30".parse().unwrap();
+    let (report, verdict) = pipeline.evaluate(&clean, &text_message(), None).await;
+    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    assert_eq!(report.auth.unwrap().dmarc.result, "pass");
+    let greylist = checks.greylist.as_ref().unwrap();
+    assert_eq!(
+        greylist
+            .decide(
+                "198.51.100.31".parse().unwrap(),
+                "other@example.test",
+                "x@example.test"
+            )
+            .unwrap(),
+        GreylistDecision::Pass,
+        "aligned DMARC pass lets the domain skip greylisting from that network"
+    );
+    assert_eq!(
+        greylist
+            .decide(
+                "203.0.113.200".parse().unwrap(),
+                "other@example.test",
+                "x@example.test"
+            )
+            .unwrap(),
+        GreylistDecision::Delay
     );
 }
 
@@ -274,4 +337,58 @@ async fn yara_rules_that_cannot_load_fail_closed() {
         "{report:?}"
     );
     assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+}
+
+/// An outbound user-scoped policy follows the SMTP AUTH login recorded on the
+/// envelope, not the MAIL FROM, and never matches unauthenticated relay.
+#[tokio::test]
+async fn outbound_user_policy_matches_only_the_logged_in_user() {
+    use currawong_policy::{Action, Policy, PolicySet, Scope};
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.relay.tenants = vec![currawong_core::config::TenantConfig {
+        id: "t1".into(),
+        domains: vec!["acme.test".into()],
+        trusted_cidrs: Vec::new(),
+    }];
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    pipeline.policies = PolicySet {
+        policies: vec![Policy {
+            id: "hold-ada".into(),
+            tenant_id: Some("t1".into()),
+            scope: Scope::User("ada@acme.test".into()),
+            priority: 10,
+            enabled: true,
+            dry_run: false,
+            mandatory: false,
+            override_floor: Vec::new(),
+            conditions: Vec::new(),
+            actions: vec![Action::Quarantine("held".into())],
+        }],
+        ..Default::default()
+    };
+    let mut hits = Vec::new();
+    for login in [Some("ada@acme.test"), Some("bob@acme.test"), None] {
+        let mut env = envelope("ada@acme.test");
+        env.tenant_id = Some("t1".into());
+        env.direction = Direction::Outbound;
+        env.rcpt_to = vec!["someone@outside.test".into()];
+        env.authenticated_as = login.map(str::to_string);
+        let (_, decision) = pipeline.assess(&env, &text_message(), None).await;
+        hits.push(
+            decision.decisions[0]
+                .matched
+                .iter()
+                .any(|m| m.id == "hold-ada"),
+        );
+    }
+    assert_eq!(
+        hits,
+        vec![true, false, false],
+        "only ada's login matches; bob sending as ada and trusted relay do not"
+    );
 }

@@ -14,6 +14,7 @@ use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool, YaraEngine,
 };
+use currawong_smtp::checks::{CheckStack, VerdictSignal};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 
@@ -21,6 +22,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// Connection checks that learn from verdicts (reputation, greylist DMARC pass).
+    pub checks: Option<Arc<CheckStack>>,
     pub yara: Option<Arc<YaraEngine>>,
     /// YARA is configured but its rules could not be loaded: fail closed.
     pub yara_error: Option<String>,
@@ -72,7 +75,34 @@ impl Pipeline {
             bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
+            checks: None,
         }
+    }
+
+    pub fn with_checks(mut self, checks: Arc<CheckStack>) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// Feed an inbound verdict back to the SMTP connection checks.
+    fn feedback(&self, env: &Envelope, report: &ScanReport, verdict: &Verdict) {
+        let Some(checks) = &self.checks else {
+            return;
+        };
+        if env.tenant_id.is_some() {
+            return;
+        }
+        let signal = match verdict {
+            Verdict::Deliver => VerdictSignal::Delivered {
+                dmarc_pass: report
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.dmarc.result == "pass"),
+            },
+            _ if report.malware => VerdictSignal::Malware,
+            _ => VerdictSignal::Neutral,
+        };
+        checks.record_verdict(env.remote_ip, &env.mail_from, signal);
     }
 
     pub fn with_keys(mut self, keys: KeyStore) -> Self {
@@ -271,6 +301,7 @@ impl Pipeline {
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             let decision = self.decide(env, &report);
+            self.feedback(env, &report, &decision.verdict());
             return (report, decision);
         }
         let rules = self.yara.as_ref().map(|engine| engine.current());
@@ -349,6 +380,7 @@ impl Pipeline {
             });
         }
         let decision = self.decide(env, &report);
+        self.feedback(env, &report, &decision.verdict());
         (report, decision)
     }
 
@@ -396,9 +428,9 @@ impl Pipeline {
                     },
                     direction,
                     sender: &env.mail_from,
-                    // The SMTP session does not record the login on the envelope yet,
-                    // so outbound user and group scopes do not match.
-                    sender_identity: None,
+                    // The SMTP AUTH login, recorded by the session. Trusted-network
+                    // relay and inbound mail have none, so user scopes never match them.
+                    sender_identity: env.authenticated_as.as_deref(),
                     recipient: rcpt,
                 }
             })

@@ -68,6 +68,13 @@ yara-x = { version = "1.21", default-features = false, features = ["constant-fol
 notify = "8"
 proptest = "1"
 
+# Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
+
 # RSA-2048 key generation is very slow unoptimised, and tests generate keys.
 [profile.dev.package.rsa]
 opt-level = 3

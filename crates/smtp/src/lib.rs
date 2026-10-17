@@ -7,6 +7,7 @@ pub mod delivery;
 pub mod dns;
 pub mod fuzz;
 pub mod limits;
+pub mod line;
 pub mod relay;
 pub mod server;
 pub mod session;

@@ -64,6 +64,12 @@ pub struct LimitsConfig {
     pub max_connections: usize,
     pub max_line_bytes: usize,
     pub max_connections_per_ip: usize,
+    /// Implicit TLS and STARTTLS handshakes that take longer are dropped.
+    pub tls_handshake_timeout_secs: u64,
+    /// Longest a whole DATA transfer may take, however steadily lines arrive.
+    pub data_timeout_secs: u64,
+    /// DATA is answered 452 4.3.1 when the spool file system has less free.
+    pub spool_min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +242,7 @@ pub struct ChecksConfig {
     pub greylist_delay_secs: u64,
     pub greylist_database: PathBuf,
     pub dnsbl: Vec<DnsblZone>,
-    /// Connection checks skip DNSBL, greylisting and reputation for these CIDRs.
+    /// Connection checks (rate limits, DNSBL, greylisting, reputation) skip these CIDRs.
     /// Use this for published Microsoft and Google outbound ranges.
     pub allow_cidrs: Vec<String>,
     pub rate_per_minute_ip: u32,
@@ -378,6 +384,9 @@ impl Default for LimitsConfig {
             max_connections: 1000,
             max_line_bytes: 1000,
             max_connections_per_ip: 20,
+            tls_handshake_timeout_secs: 30,
+            data_timeout_secs: 600,
+            spool_min_free_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -662,12 +671,14 @@ impl Config {
                 "max_recipients must be at least 1".into(),
             ));
         }
-        if needs_tls
-            && (self.tls.cert.is_none() || self.tls.key.is_none())
-            && self.tls.acme.is_none()
-        {
+        if self.tls.acme.is_some() {
             return Err(ConfigError::Invalid(
-                "STARTTLS or implicit TLS requires tls.cert and tls.key, or tls.acme".into(),
+                "tls.acme is not implemented yet: set tls.cert and tls.key".into(),
+            ));
+        }
+        if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
+            return Err(ConfigError::Invalid(
+                "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
             ));
         }
         if self.residency.mode != "au" && self.residency.mode != "off" {
@@ -842,6 +853,21 @@ mod tests {
             }
         }
         assert_eq!(cfg.limits.max_recipients, 5);
+    }
+
+    #[test]
+    fn acme_is_refused_until_implemented() {
+        let mut cfg = Config::default();
+        cfg.tls.cert = None;
+        cfg.tls.key = None;
+        cfg.tls.acme = Some(AcmeConfig {
+            directory_url: "https://acme.example.test/directory".into(),
+            domains: vec!["mx.example.test".into()],
+            contact: "mailto:ops@example.test".into(),
+            cache_dir: PathBuf::from("/var/lib/currawong/acme"),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("tls.acme"), "{err}");
     }
 
     #[test]

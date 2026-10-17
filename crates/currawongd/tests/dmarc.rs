@@ -29,6 +29,7 @@ fn envelope(id: &str, direction: Direction) -> Envelope {
     Envelope {
         id: MessageId(id.into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: "user@example.test".into(),
         rcpt_to: vec!["dest@gateway.test".into()],
         received_at: OffsetDateTime::from_unix_timestamp(RECEIVED).unwrap(),
