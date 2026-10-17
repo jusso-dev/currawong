@@ -27,12 +27,12 @@ docker run -d --name currawong -p 25:25 -p 587:587 -p 465:465 -p 127.0.0.1:9090:
 ## Debian package
 
 ```bash
-cargo build --release --locked -p currawongd -p currawong-parser-worker
+cargo build --release --locked -p currawongd -p currawong-parser-worker -p currawong-setup-tui
 cargo deb -p currawongd --no-build
 sudo apt install ./target/debian/currawong_*_amd64.deb
 ```
 
-Build on Debian 12 (or in `rust:1-bookworm`) so the binaries link against bookworm's glibc. `--no-build` is needed because `cargo deb` alone only builds `currawongd`, not the worker binary from the other crate.
+Build on Debian 12 (or in `rust:1-bookworm`) so the binaries link against bookworm's glibc. `--no-build` is needed because `cargo deb` alone only builds `currawongd`, not the worker and wizard binaries from the other crates.
 
 The package (`[package.metadata.deb]` in `crates/currawongd/Cargo.toml`):
 
@@ -47,9 +47,11 @@ Then run `sudo currawong-setup` to write a real config.
 
 ## Setup wizard
 
-`currawong-setup` (`packaging/setup/currawong-setup`) is a `whiptail` wizard. It asks for the gateway hostname, accepted domains, the next hop (Microsoft 365, Google Workspace or Exchange), the networks allowed to relay, and whether to use the local clamd. It writes a short `/etc/currawong/currawong.toml` (everything else keeps its default), rejects it if `currawongd --check-config` fails, optionally issues a new self-signed certificate for the hostname, and restarts `currawongd`. Inputs are matched against strict patterns before they are written into TOML.
+`currawong-setup` (`crates/setup-tui`, ratatui) is a one-screen terminal form. It asks for the gateway hostname, accepted domains, the next hop (Microsoft 365, Google Workspace or Exchange), the networks allowed to relay, whether to use the local clamd, and whether to write a new self-signed certificate. Tab or the arrows move, Space toggles, Enter on Save writes.
 
-With `--firstboot` (the appliance) it also sets the system hostname and the root password, and writes `/var/lib/currawong/.setup-complete` when done.
+On Save it validates every field, renders a short `/etc/currawong/currawong.toml` through the TOML serialiser (so input cannot add keys; everything else keeps its default), writes it to a temporary file created 0640 and owned by group `currawong`, runs `currawongd --check-config` on that file, and only then renames it over the old config. The certificate and key are generated in-process (rcgen, P-256, 825 days) and written the same way, so neither is ever world-readable. It then enables and restarts `currawongd`.
+
+With `--firstboot --tty NAME` (the appliance) it also sets the system hostname and the root password (passed to `chpasswd` on stdin), writes `/var/lib/currawong/.setup-complete`, and stops the wizard on the other console. Esc does not leave the wizard on first boot. A serial console reports a 0x0 window, so the wizard falls back to 80x24 there.
 
 ## Appliance image
 
@@ -64,7 +66,7 @@ qemu-img convert -O vmdk -o subformat=streamOptimized "$raw" currawong-appliance
 qemu-img convert -O vhdx "$raw" currawong-appliance.vhdx                          # Hyper-V (Gen 2)
 ```
 
-On first boot `currawong-firstboot.service` runs `currawong-setup --firstboot` on tty1 before the login prompt, and runs it again if it is cancelled. `currawongd` stays disabled until the wizard has written a config. ClamAV signatures are downloaded by freshclam on first boot. If clamd was enabled in the wizard, mail is deferred until the signatures arrive and clamd is running, not delivered unscanned.
+On first boot `currawong-firstboot@tty1.service` and `currawong-firstboot@ttyS0.service` run `currawong-setup --firstboot` on the VGA console and the serial console, before the login prompts. Whichever console saves first wins; a lock stops two saves at once, and the other console is then released to its login prompt. The serial instance also serves the EC2 serial console and the CI boot test (`packaging/appliance/serial-expect.py`). `currawongd` stays disabled until the wizard has written a config. ClamAV signatures are downloaded by freshclam on first boot. If clamd was enabled in the wizard, mail is deferred until the signatures arrive and clamd is running, not delivered unscanned.
 
 ### AMI (ap-southeast-2)
 
@@ -79,7 +81,7 @@ aws ec2 register-image --region ap-southeast-2 --name currawong-appliance \
   --block-device-mappings "DeviceName=/dev/xvda,Ebs={SnapshotId=SNAPSHOT_ID}"
 ```
 
-EC2 has no interactive console for the wizard. Use the EC2 serial console, or pre-seed `/etc/currawong/currawong.toml`, `cert.pem`, `key.pem` and `/var/lib/currawong/.setup-complete` in the image and enable `currawongd.service`.
+EC2 has no VGA console. Run the wizard on the EC2 serial console (ttyS0), or pre-seed `/etc/currawong/currawong.toml`, `cert.pem`, `key.pem` and `/var/lib/currawong/.setup-complete` in the image and enable `currawongd.service`.
 
 ## Helm chart
 

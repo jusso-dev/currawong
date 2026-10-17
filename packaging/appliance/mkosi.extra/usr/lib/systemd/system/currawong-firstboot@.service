@@ -1,0 +1,26 @@
+[Unit]
+Description=Currawong first-boot setup on %I
+Documentation=https://github.com/jusso-dev/currawong
+# Enabled for tty1 (VGA console) and ttyS0 (serial console, EC2 serial
+# console, CI). Runs before the login prompt until setup is complete; the
+# instance that saves first stops the others.
+ConditionPathExists=!/var/lib/currawong/.setup-complete
+After=network-online.target systemd-user-sessions.service
+Wants=network-online.target
+Before=getty@%i.service serial-getty@%i.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/currawong-setup --firstboot --tty %i
+# No CURRAWONG_* variables here: currawongd reads those as config overrides.
+Environment=TERM=linux
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+
+[Install]
+WantedBy=multi-user.target

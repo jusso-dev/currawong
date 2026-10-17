@@ -57,6 +57,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/quarantine` | Quarantine store and digests |
 | `crates/admin` | axum admin API and UI |
 | `crates/currawongd` | The daemon binary |
+| `crates/setup-tui` | `currawong-setup`, the first-run wizard |
 
 ## Roadmap
 

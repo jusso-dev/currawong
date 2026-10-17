@@ -7,8 +7,10 @@ set -e
 systemctl disable currawongd.service
 rm -f /etc/currawong/cert.pem /etc/currawong/key.pem
 
-systemctl enable currawong-firstboot.service systemd-networkd.service \
-    systemd-resolved.service systemd-timesyncd.service nftables.service
+# The wizard runs on the VGA console and the serial console.
+systemctl enable currawong-firstboot@tty1.service currawong-firstboot@ttyS0.service
+systemctl enable systemd-networkd.service systemd-resolved.service \
+    systemd-timesyncd.service nftables.service
 
 # No password logins until the wizard sets one. No SSH server is installed.
 passwd -l root
