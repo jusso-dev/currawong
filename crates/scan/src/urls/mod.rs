@@ -7,7 +7,7 @@ pub mod token;
 mod transfer;
 
 pub use reputation::{LocalBlocklist, Reputation, UrlReputation};
-pub use rewrite::{RewriteError, Rewritten, UrlRewriter};
+pub use rewrite::{Delivery, RewriteError, Rewritten, UrlRewriter};
 pub use token::{Claims, TokenError, UrlSigner};
 
 /// Fuzz entry: arbitrary bytes as a message must never panic.
@@ -22,7 +22,12 @@ pub fn fuzz(data: &[u8]) {
         64 * 1024,
     )
     .expect("fixed base");
-    if let Ok(out) = rewriter.rewrite_message(data, "fuzz", 0) {
+    let delivery = Delivery {
+        message_id: "fuzz",
+        recipient: "fuzz@example.test",
+        issued_at: 0,
+    };
+    if let Ok(out) = rewriter.rewrite_message(data, &delivery) {
         assert!(out.links > 0 || out.message == data);
     }
 }

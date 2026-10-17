@@ -1,11 +1,19 @@
 //! The click service over a real socket: round trip, tampering, and a link
 //! blocked after delivery.
 use currawong_admin::routes::click::{serve, ClickAction, ClickEvent, ClickLog, ClickState};
-use currawong_scan::urls::{LocalBlocklist, UrlRewriter, UrlSigner};
+use currawong_scan::urls::{Claims, Delivery, LocalBlocklist, UrlRewriter, UrlSigner};
 use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const BASE: &str = "https://links.example.com.au";
+
+fn at(message_id: &str, issued_at: u64) -> Delivery<'_> {
+    Delivery {
+        message_id,
+        recipient: "dest@example.test",
+        issued_at,
+    }
+}
 
 struct Reply {
     status: u16,
@@ -14,14 +22,19 @@ struct Reply {
 }
 
 async fn get(addr: SocketAddr, path: &str) -> Reply {
+    request(addr, "GET", path).await
+}
+
+async fn request(addr: SocketAddr, method: &str, path: &str) -> Reply {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let request =
-        format!("GET {path} HTTP/1.1\r\nHost: links.example.com.au\r\nConnection: close\r\n\r\n");
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: links.example.com.au\r\nConnection: close\r\n\r\n"
+    );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).await.unwrap();
     let text = String::from_utf8_lossy(&raw).into_owned();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
     let status = head.split(' ').nth(1).unwrap().parse().unwrap();
     let location = head
         .lines()
@@ -50,15 +63,31 @@ fn rewriter() -> UrlRewriter {
 }
 
 async fn start(dir: &Path) -> SocketAddr {
+    start_with(dir, false, 1 << 20).await
+}
+
+async fn start_with(dir: &Path, warn_unknown: bool, log_bytes: u64) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let state = ClickState {
-        signer: signer(),
-        reputation: Arc::new(LocalBlocklist::from_file(&dir.join("blocklist.txt"))),
-        log: Arc::new(ClickLog::open(&dir.join("clicks.jsonl")).unwrap()),
-    };
+    let list =
+        LocalBlocklist::from_file(&dir.join("blocklist.txt")).with_warn_unknown(warn_unknown);
+    let state = ClickState::new(
+        signer(),
+        Arc::new(list),
+        ClickLog::open(&dir.join("clicks.jsonl"), log_bytes).unwrap(),
+    );
     tokio::spawn(serve(listener, state));
     addr
+}
+
+fn claims(url: &str) -> Claims {
+    Claims {
+        u: url.into(),
+        m: "m".into(),
+        r: "dest@example.test".into(),
+        t: 0,
+        e: u64::MAX,
+    }
 }
 
 fn events(dir: &Path) -> Vec<ClickEvent> {
@@ -114,7 +143,7 @@ async fn urls_every_fixture_link_round_trips_through_the_click_service() {
         .unwrap()
         .as_secs();
     let out = rewriter()
-        .rewrite_message(&fixture(), "01ARZ3NDEKTSV4RRFFQ69G5FAV", now)
+        .rewrite_message(&fixture(), &at("01ARZ3NDEKTSV4RRFFQ69G5FAV", now))
         .unwrap();
     let paths = click_paths(&out.message);
     assert_eq!(paths.len(), out.links);
@@ -147,11 +176,7 @@ async fn urls_every_fixture_link_round_trips_through_the_click_service() {
 async fn urls_tampered_tokens_return_400() {
     let dir = tempfile::tempdir().unwrap();
     let addr = start(dir.path()).await;
-    let claims = currawong_scan::urls::Claims {
-        u: "https://shop.example.net/".into(),
-        m: "m1".into(),
-        e: u64::MAX,
-    };
+    let claims = claims("https://shop.example.net/");
     let token = signer().sign(&claims);
     assert_eq!(get(addr, &format!("/u/{token}")).await.status, 302);
     let (payload, tag) = token.split_once('.').unwrap();
@@ -176,7 +201,7 @@ async fn urls_tampered_tokens_return_400() {
         assert_eq!(reply.status, 400, "{token}");
         assert!(reply.location.is_none());
     }
-    let expired = signer().sign(&currawong_scan::urls::Claims { e: 1, ..claims });
+    let expired = signer().sign(&Claims { e: 1, ..claims });
     assert_eq!(get(addr, &format!("/u/{expired}")).await.status, 410);
     // Only verified clicks are recorded.
     assert_eq!(events(dir.path()).len(), 1);
@@ -191,7 +216,9 @@ async fn urls_link_blocked_after_delivery_shows_the_block_page() {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let delivered = rewriter().rewrite_message(raw, "m-blocked", now).unwrap();
+    let delivered = rewriter()
+        .rewrite_message(raw, &at("m-blocked", now))
+        .unwrap();
     let paths = click_paths(&delivered.message);
     assert_eq!(paths.len(), 1);
     // Clean at delivery and at the first click.
@@ -235,13 +262,86 @@ async fn urls_block_page_escapes_the_link() {
     let dir = tempfile::tempdir().unwrap();
     let addr = start(dir.path()).await;
     std::fs::write(dir.path().join("blocklist.txt"), "evil.test\n").unwrap();
-    let token = signer().sign(&currawong_scan::urls::Claims {
-        u: "https://evil.test/?q=<script>alert(1)</script>\"".into(),
-        m: "m".into(),
-        e: u64::MAX,
-    });
+    let token = signer().sign(&claims("https://evil.test/?q=<script>alert(1)</script>\""));
     let reply = get(addr, &format!("/u/{token}")).await;
     assert_eq!(reply.status, 403);
     assert!(!reply.body.contains("<script>"), "{}", reply.body);
     assert!(reply.body.contains("&lt;script&gt;"));
+}
+
+#[tokio::test]
+async fn urls_warning_page_lets_the_user_continue() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("blocklist.txt"),
+        "allow known.example\nwarn odd.example\n",
+    )
+    .unwrap();
+    let addr = start_with(dir.path(), true, 1 << 20).await;
+    let known = signer().sign(&claims("https://known.example/a"));
+    assert_eq!(get(addr, &format!("/u/{known}")).await.status, 302);
+    for url in ["https://odd.example/b", "https://unknown.example/c"] {
+        let token = signer().sign(&claims(url));
+        let reply = get(addr, &format!("/u/{token}")).await;
+        assert_eq!(reply.status, 200, "{url}");
+        assert!(reply.body.contains("Check this link before you continue"));
+        assert!(reply.body.contains(&format!("/u/{token}?proceed=1")));
+        let reply = get(addr, &format!("/u/{token}?proceed=1")).await;
+        assert_eq!(reply.status, 302);
+        assert_eq!(reply.location.as_deref(), Some(url));
+    }
+    std::fs::write(dir.path().join("blocklist.txt"), "odd.example\n").unwrap();
+    let token = signer().sign(&claims("https://odd.example/b"));
+    // A block wins over a click-through.
+    assert_eq!(
+        get(addr, &format!("/u/{token}?proceed=1")).await.status,
+        403
+    );
+    let actions: Vec<ClickAction> = events(dir.path()).iter().map(|e| e.action).collect();
+    use ClickAction::*;
+    assert_eq!(
+        actions,
+        [Redirected, Warned, Redirected, Warned, Redirected, Blocked]
+    );
+    assert!(events(dir.path())
+        .iter()
+        .all(|e| e.recipient == "dest@example.test"));
+}
+
+#[tokio::test]
+async fn urls_head_previews_are_not_clicks_and_clicks_are_rate_limited() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start(dir.path()).await;
+    let token = signer().sign(&claims("https://shop.example.net/x"));
+    let path = format!("/u/{token}");
+    assert_eq!(request(addr, "HEAD", &path).await.status, 200);
+    assert!(events(dir.path()).is_empty());
+    let mut statuses = Vec::new();
+    for _ in 0..31 {
+        statuses.push(get(addr, &path).await.status);
+    }
+    assert!(statuses[..30].iter().all(|s| *s == 302), "{statuses:?}");
+    assert_eq!(statuses[30], 429);
+    // Other links are not held back by this one.
+    let other = signer().sign(&claims("https://shop.example.net/y"));
+    assert_eq!(get(addr, &format!("/u/{other}")).await.status, 302);
+}
+
+#[tokio::test]
+async fn urls_click_log_is_private_and_rotates() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr = start_with(dir.path(), false, 600).await;
+    for n in 0..6 {
+        let token = signer().sign(&claims(&format!("https://shop.example.net/{n}")));
+        assert_eq!(get(addr, &format!("/u/{token}")).await.status, 302);
+    }
+    let log = dir.path().join("clicks.jsonl");
+    assert!(std::fs::metadata(&log).unwrap().len() <= 600);
+    assert!(dir.path().join("clicks.jsonl.1").exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&log).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
 }

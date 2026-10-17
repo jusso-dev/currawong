@@ -1,8 +1,16 @@
-use currawong_scan::urls::{Claims, UrlRewriter, UrlSigner};
+use currawong_scan::urls::{Claims, Delivery, UrlRewriter, UrlSigner};
 use mail_parser::{MessageParser, MimeHeaders};
 use std::collections::BTreeSet;
 
 const BASE: &str = "https://links.example.com.au";
+
+fn at(message_id: &str, issued_at: u64) -> Delivery<'_> {
+    Delivery {
+        message_id,
+        recipient: "dest@example.test",
+        issued_at,
+    }
+}
 
 fn fixture() -> Vec<u8> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/urls/links.eml");
@@ -75,9 +83,11 @@ fn urls_every_http_link_in_the_fixture_round_trips() {
     let raw = fixture();
     let rewriter = rewriter();
     let out = rewriter
-        .rewrite_message(&raw, "01ARZ3NDEKTSV4RRFFQ69G5FAV", 1_000)
+        .rewrite_message(&raw, &at("01ARZ3NDEKTSV4RRFFQ69G5FAV", 1_000))
         .unwrap();
     assert_eq!(out.links, LINKS.len(), "{:?}", out.notes);
+    // The S/MIME signed part keeps its link and is counted for policy.
+    assert_eq!(out.skipped, 1, "{:?}", out.notes);
     let joined: String = bodies(&out.message)
         .iter()
         .map(|body| String::from_utf8_lossy(body).into_owned())
@@ -86,6 +96,8 @@ fn urls_every_http_link_in_the_fixture_round_trips() {
     for token in tokens(&joined) {
         let claims: Claims = rewriter.signer().verify(&token, 1_000).unwrap();
         assert_eq!(claims.m, "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        assert_eq!(claims.r, "dest@example.test");
+        assert_eq!(claims.t, 1_000);
         assert_eq!(claims.e, 1_000 + 30 * 86_400);
         found.insert(claims.u);
     }
@@ -102,7 +114,10 @@ fn urls_every_http_link_in_the_fixture_round_trips() {
 #[test]
 fn urls_rewrite_keeps_mime_structure_encodings_and_charsets() {
     let raw = fixture();
-    let out = rewriter().rewrite_message(&raw, "m", 0).unwrap().message;
+    let out = rewriter()
+        .rewrite_message(&raw, &at("m", 0))
+        .unwrap()
+        .message;
     let before = MessageParser::default().parse(&raw).unwrap();
     let after = MessageParser::default().parse(&out).unwrap();
     assert_eq!(before.parts.len(), after.parts.len());
@@ -145,10 +160,12 @@ fn urls_rewrite_keeps_mime_structure_encodings_and_charsets() {
 fn urls_rewrite_is_deterministic_and_idempotent() {
     let raw = fixture();
     let rewriter = rewriter();
-    let first = rewriter.rewrite_message(&raw, "m", 5).unwrap();
-    let second = rewriter.rewrite_message(&raw, "m", 5).unwrap();
+    let first = rewriter.rewrite_message(&raw, &at("m", 5)).unwrap();
+    let second = rewriter.rewrite_message(&raw, &at("m", 5)).unwrap();
     assert_eq!(first.message, second.message);
-    let again = rewriter.rewrite_message(&first.message, "m", 5).unwrap();
+    let again = rewriter
+        .rewrite_message(&first.message, &at("m", 5))
+        .unwrap();
     assert_eq!(again.links, 0);
     assert_eq!(again.message, first.message);
 }
@@ -159,7 +176,9 @@ fn urls_long_link_in_a_7bit_part_moves_to_quoted_printable() {
     let raw = format!(
         "From: a@example.org\r\nTo: b@example.test\r\nSubject: long\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: 7bit\r\n\r\nGo {link} now\r\n"
     );
-    let out = rewriter().rewrite_message(raw.as_bytes(), "m", 0).unwrap();
+    let out = rewriter()
+        .rewrite_message(raw.as_bytes(), &at("m", 0))
+        .unwrap();
     assert_eq!(out.links, 1);
     let text = String::from_utf8(out.message.clone()).unwrap();
     assert!(text.contains("Content-Transfer-Encoding: quoted-printable\r\n\r\n"));
@@ -203,12 +222,12 @@ fn urls_hostile_input_never_panics_and_is_bounded() {
             .into_bytes(),
     ];
     for input in &inputs {
-        if let Ok(out) = rewriter.rewrite_message(input, "m", 0) {
+        if let Ok(out) = rewriter.rewrite_message(input, &at("m", 0)) {
             assert!(out.message.len() <= input.len() * 4 + 4096);
         }
     }
     let big = vec![b'a'; 64 * 1024 + 1];
-    assert!(rewriter.rewrite_message(&big, "m", 0).is_err());
+    assert!(rewriter.rewrite_message(&big, &at("m", 0)).is_err());
     let many = format!(
         "Content-Type: text/plain\r\n\r\n{}",
         "https://x.test/ ".repeat(currawong_scan::urls::rewrite::MAX_LINKS + 1)
@@ -221,5 +240,79 @@ fn urls_hostile_input_never_panics_and_is_bounded() {
         usize::MAX,
     )
     .unwrap();
-    assert!(roomy.rewrite_message(many.as_bytes(), "m", 0).is_err());
+    assert!(roomy.rewrite_message(many.as_bytes(), &at("m", 0)).is_err());
+}
+
+fn message(content_type: &str, body: &str) -> Vec<u8> {
+    format!("From: a@example.org\r\nTo: b@example.test\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{body}").into_bytes()
+}
+
+#[test]
+fn urls_bogus_signed_wrappers_do_not_exempt_links() {
+    let rewriter = rewriter();
+    let inner = "--s\r\nContent-Type: text/plain\r\n\r\nhttps://evil.test/a\r\n--s\r\nContent-Type: application/octet-stream\r\n\r\nAAAA\r\n--s--\r\n";
+    for content_type in [
+        "multipart/signed; boundary=s",
+        "multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=s",
+        "multipart/signed; protocol=\"text/plain\"; boundary=s",
+    ] {
+        let out = rewriter
+            .rewrite_message(&message(content_type, inner), &at("m", 0))
+            .unwrap();
+        assert_eq!(out.links, 1, "{content_type}");
+        assert_eq!(out.skipped, 0);
+    }
+    let fake_pgp = "-----BEGIN PGP SIGNED MESSAGE-----\r\nhttps://evil.test/b\r\n";
+    let out = rewriter
+        .rewrite_message(&message("text/plain", fake_pgp), &at("m", 0))
+        .unwrap();
+    assert_eq!(out.links, 1);
+    let real_pgp = "-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nhttps://evil.test/c\r\n-----BEGIN PGP SIGNATURE-----\r\nabc\r\n-----END PGP SIGNATURE-----\r\n";
+    let out = rewriter
+        .rewrite_message(&message("text/plain", real_pgp), &at("m", 0))
+        .unwrap();
+    assert_eq!((out.links, out.skipped), (0, 1), "{:?}", out.notes);
+}
+
+#[test]
+fn urls_unreadable_charsets_are_counted_and_amp_html_is_rewritten() {
+    let rewriter = rewriter();
+    let out = rewriter
+        .rewrite_message(
+            &message("text/html; charset=utf-16le", "<\0a\0"),
+            &at("m", 0),
+        )
+        .unwrap();
+    assert_eq!((out.links, out.skipped), (0, 1));
+    let amp = message(
+        "multipart/alternative; boundary=b",
+        "--b\r\nContent-Type: text/x-amp-html; charset=utf-8\r\n\r\n<a href=\"https://evil.test/\">x</a>\r\n--b--\r\n",
+    );
+    assert_eq!(
+        rewriter.rewrite_message(&amp, &at("m", 0)).unwrap().links,
+        1
+    );
+}
+
+#[test]
+fn urls_lf_only_messages_keep_lf_line_endings() {
+    let html = format!(
+        "<p>{}<a href=\"https://evil.test/x\">x</a></p>\n",
+        "y".repeat(300)
+    );
+    for cte in ["base64", "quoted-printable"] {
+        let body = if cte == "base64" {
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &html)
+        } else {
+            html.clone()
+        };
+        let raw = format!(
+            "From: a@example.org\nTo: b@example.test\nSubject: x\nMIME-Version: 1.0\nContent-Type: text/html\nContent-Transfer-Encoding: {cte}\n\n{body}\n"
+        );
+        let out = rewriter()
+            .rewrite_message(raw.as_bytes(), &at("m", 0))
+            .unwrap();
+        assert_eq!(out.links, 1, "{cte}");
+        assert!(!out.message.contains(&b'\r'), "{cte}");
+    }
 }

@@ -1,24 +1,32 @@
 //! Rewrite http(s) links in the text and HTML parts of a message to
 //! `<base_url>/u/<token>`. Only the bytes of rewritten parts change: other
 //! parts, boundaries, headers, charsets and transfer encodings are kept.
-//! Signed (S/MIME, PGP) and encrypted parts, attachments and attached
-//! messages are left alone.
+//! Attachments and attached messages are left alone. Signed parts are left
+//! alone too, and so are parts this code cannot read: each such part that
+//! holds a link is counted in `Rewritten::skipped` so policy can act.
 use super::{
-    reputation::host_matches,
+    reputation::{host_matches, normalise_domain},
     token::{Claims, UrlSigner},
     transfer,
 };
 use encoding_rs::Encoding;
 use lol_html::{element, html_content::Element, AsciiCompatibleEncoding, HtmlRewriter};
-use mail_parser::{MessageParser, MimeHeaders, PartType};
+use mail_parser::{MessageParser, MessagePart, MimeHeaders, PartType};
 use std::cell::RefCell;
+use url::Url;
 
 /// More links than this in one message and the message is left unchanged.
 pub const MAX_LINKS: usize = 10_000;
-/// Longer links are not rewritten (and counted in a note).
+/// Longer links are not rewritten (and counted as skipped).
 pub const MAX_URL_BYTES: usize = 8 * 1024;
 /// Memory the HTML rewriter may use for one part.
 const HTML_MEMORY: usize = 32 * 1024 * 1024;
+/// `multipart/signed` protocols whose second part is a detached signature.
+const SIGNATURE_PROTOCOLS: &[&str] = &[
+    "application/pkcs7-signature",
+    "application/x-pkcs7-signature",
+    "application/pgp-signature",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RewriteError {
@@ -35,7 +43,20 @@ pub struct Rewritten {
     pub message: Vec<u8>,
     /// Links replaced. Zero means `message` equals the input.
     pub links: usize,
+    /// Parts with links left as they were (signed, unreadable charset or
+    /// encoding, HTML the rewriter gave up on) plus over-long links.
+    pub skipped: usize,
     pub notes: Vec<String>,
+}
+
+/// Who and when the tokens in one message are for.
+#[derive(Debug, Clone, Copy)]
+pub struct Delivery<'a> {
+    pub message_id: &'a str,
+    /// The recipients of this copy, comma separated. May be empty.
+    pub recipient: &'a str,
+    /// Arrival time, Unix seconds. Tokens expire `ttl_secs` later.
+    pub issued_at: u64,
 }
 
 pub struct UrlRewriter {
@@ -49,10 +70,17 @@ pub struct UrlRewriter {
 
 /// One message's token claims and counters.
 struct Ctx<'a> {
-    message_id: &'a str,
+    delivery: Delivery<'a>,
     expires: u64,
     links: usize,
     too_long: usize,
+}
+
+/// What happened to one part.
+enum Part {
+    Unchanged,
+    /// Replace the body (`false`) or the header block and body (`true`).
+    Replace(bool, Vec<u8>),
 }
 
 impl UrlRewriter {
@@ -66,7 +94,7 @@ impl UrlRewriter {
         ttl_secs: u64,
         max_bytes: usize,
     ) -> Result<Self, String> {
-        let parsed = url::Url::parse(base_url).map_err(|err| format!("base_url: {err}"))?;
+        let parsed = Url::parse(base_url).map_err(|err| format!("base_url: {err}"))?;
         let base_host = parsed
             .host_str()
             .ok_or("base_url has no host")?
@@ -75,11 +103,7 @@ impl UrlRewriter {
             signer,
             base: base_url.trim_end_matches('/').to_string(),
             base_host,
-            allow: allow
-                .iter()
-                .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
-                .filter(|d| !d.is_empty())
-                .collect(),
+            allow: allow.iter().filter_map(|d| normalise_domain(d)).collect(),
             ttl_secs,
             max_bytes,
         })
@@ -89,13 +113,11 @@ impl UrlRewriter {
         &self.signer
     }
 
-    /// Tokens expire `ttl_secs` after `issued_at` (Unix seconds). The same
-    /// input, id and time always give the same bytes.
+    /// The same input and delivery always give the same bytes.
     pub fn rewrite_message(
         &self,
         raw: &[u8],
-        message_id: &str,
-        issued_at: u64,
+        delivery: &Delivery,
     ) -> Result<Rewritten, RewriteError> {
         if raw.len() > self.max_bytes {
             return Err(RewriteError::TooLarge);
@@ -104,12 +126,12 @@ impl UrlRewriter {
             .parse(raw)
             .ok_or(RewriteError::Unparsable)?;
         let mut ctx = Ctx {
-            message_id,
-            expires: issued_at.saturating_add(self.ttl_secs),
+            delivery: *delivery,
+            expires: delivery.issued_at.saturating_add(self.ttl_secs),
             links: 0,
             too_long: 0,
         };
-        let mut notes = Vec::new();
+        let mut out = Rewritten::default();
         let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
         let parts = &message.parts;
         let mut seen = vec![false; parts.len()];
@@ -121,30 +143,25 @@ impl UrlRewriter {
             if std::mem::replace(&mut seen[idx], true) {
                 continue;
             }
-            let (ctype, subtype) = part
+            let subtype = part
                 .content_type()
-                .map(|ct| {
-                    (
-                        ct.ctype().to_ascii_lowercase(),
-                        ct.subtype().unwrap_or("").to_ascii_lowercase(),
-                    )
-                })
-                .unwrap_or_else(|| ("text".into(), "plain".into()));
+                .and_then(|ct| ct.subtype())
+                .unwrap_or("plain")
+                .to_ascii_lowercase();
             let html = match &part.body {
                 PartType::Multipart(children) => {
-                    let protected =
-                        ctype == "multipart" && matches!(subtype.as_str(), "signed" | "encrypted");
+                    let protected = is_signed(part, children, parts);
                     stack.extend(children.iter().map(|&c| (c as usize, signed || protected)));
                     continue;
                 }
                 PartType::Html(_) => true,
+                PartType::Text(_) if subtype == "x-amp-html" => true,
                 PartType::Text(_) if subtype == "plain" => false,
                 _ => continue,
             };
-            if signed
-                || part
-                    .content_disposition()
-                    .is_some_and(|d| d.is_attachment())
+            if part
+                .content_disposition()
+                .is_some_and(|d| d.is_attachment())
             {
                 continue;
             }
@@ -156,6 +173,19 @@ impl UrlRewriter {
             if !(header <= body && body <= end && end <= raw.len()) {
                 continue;
             }
+            let cte = part
+                .content_transfer_encoding()
+                .unwrap_or("7bit")
+                .trim()
+                .to_ascii_lowercase();
+            if signed {
+                if decode(&raw[body..end], &cte).is_none_or(|text| has_link(&text)) {
+                    out.skipped += 1;
+                    out.notes
+                        .push("links in a signed part not rewritten".into());
+                }
+                continue;
+            }
             let label = part
                 .content_type()
                 .and_then(|ct| ct.attribute("charset"))
@@ -163,14 +193,11 @@ impl UrlRewriter {
             let encoding =
                 Encoding::for_label(label.trim().as_bytes()).unwrap_or(encoding_rs::WINDOWS_1252);
             let Some(encoding) = AsciiCompatibleEncoding::new(encoding) else {
-                notes.push(format!("links in a {label} part not rewritten"));
+                out.skipped += 1;
+                out.notes
+                    .push(format!("links in a {label} part not rewritten"));
                 continue;
             };
-            let cte = part
-                .content_transfer_encoding()
-                .unwrap_or("7bit")
-                .trim()
-                .to_ascii_lowercase();
             match self.rewrite_part(
                 &raw[header..body],
                 &raw[body..end],
@@ -179,46 +206,45 @@ impl UrlRewriter {
                 encoding,
                 &mut ctx,
             ) {
-                Ok(Some((true, replacement))) => edits.push((header, end, replacement)),
-                Ok(Some((false, replacement))) => edits.push((body, end, replacement)),
-                Ok(None) => {}
-                Err(note) => notes.push(note),
+                Ok(Part::Replace(true, bytes)) => edits.push((header, end, bytes)),
+                Ok(Part::Replace(false, bytes)) => edits.push((body, end, bytes)),
+                Ok(Part::Unchanged) => {}
+                Err(note) => {
+                    out.skipped += 1;
+                    out.notes.push(note);
+                }
             }
             if ctx.links > MAX_LINKS {
                 return Err(RewriteError::TooManyLinks);
             }
         }
         if ctx.too_long > 0 {
-            notes.push(format!("{} links too long to rewrite", ctx.too_long));
+            out.skipped += ctx.too_long;
+            out.notes
+                .push(format!("{} links too long to rewrite", ctx.too_long));
         }
         if edits.is_empty() {
-            return Ok(Rewritten {
-                message: raw.to_vec(),
-                links: 0,
-                notes,
-            });
+            out.message = raw.to_vec();
+            return Ok(out);
         }
         edits.sort_by_key(|edit| edit.0);
-        let mut out = Vec::with_capacity(raw.len() + raw.len() / 2);
+        let mut message = Vec::with_capacity(raw.len() + raw.len() / 2);
         let mut at = 0;
         for (start, end, bytes) in edits {
             if start < at {
                 continue;
             }
-            out.extend_from_slice(&raw[at..start]);
-            out.extend_from_slice(&bytes);
+            message.extend_from_slice(&raw[at..start]);
+            message.extend_from_slice(&bytes);
             at = end;
         }
-        out.extend_from_slice(&raw[at..]);
-        Ok(Rewritten {
-            message: out,
-            links: ctx.links,
-            notes,
-        })
+        message.extend_from_slice(&raw[at..]);
+        out.message = message;
+        out.links = ctx.links;
+        Ok(out)
     }
 
-    /// The new body, or the new header block and body when the part had to
-    /// move to quoted-printable (`true`). `None` when no link changed.
+    /// `Err` with a note when the part has links that could not be rewritten.
     fn rewrite_part(
         &self,
         headers: &[u8],
@@ -227,16 +253,22 @@ impl UrlRewriter {
         html: bool,
         encoding: AsciiCompatibleEncoding,
         ctx: &mut Ctx,
-    ) -> Result<Option<(bool, Vec<u8>)>, String> {
+    ) -> Result<Part, String> {
         let before = ctx.links;
+        let eol: &[u8] = if body.contains(&b'\r') || headers.ends_with(b"\r\n\r\n") {
+            b"\r\n"
+        } else {
+            b"\n"
+        };
         let rewrite = |decoded: &[u8], ctx: &mut Ctx| {
             if html {
                 self.rewrite_html(decoded, encoding, ctx)
-            } else if decoded
-                .windows(34)
-                .any(|w| w == b"-----BEGIN PGP SIGNED MESSAGE-----")
-            {
-                Ok(decoded.to_vec())
+            } else if pgp_signed(decoded) {
+                if has_link(decoded) {
+                    Err("links in a PGP signed part not rewritten".to_string())
+                } else {
+                    Ok(decoded.to_vec())
+                }
             } else {
                 Ok(self.rewrite_text(decoded, ctx))
             }
@@ -246,30 +278,37 @@ impl UrlRewriter {
                 let trimmed = body.trim_ascii_end();
                 let decoded = transfer::decode_base64(trimmed)
                     .ok_or("undecodable base64 part, links not rewritten")?;
-                let mut out = transfer::encode_base64(&rewrite(&decoded, ctx)?);
+                let mut out = transfer::encode_base64(&rewrite(&decoded, ctx)?, eol);
                 out.extend_from_slice(&body[trimmed.len()..]);
-                (false, out)
+                Part::Replace(false, out)
             }
-            "quoted-printable" => (
+            "quoted-printable" => Part::Replace(
                 false,
-                transfer::encode_qp(&rewrite(&transfer::decode_qp(body), ctx)?),
+                transfer::encode_qp(&rewrite(&transfer::decode_qp(body), ctx)?, eol),
             ),
             _ => {
                 let rewritten = rewrite(body, ctx)?;
                 if transfer::longest_line(&rewritten) <= transfer::MAX_LINE {
-                    (false, rewritten)
+                    Part::Replace(false, rewritten)
                 } else {
                     // A long link made a line SMTP cannot carry.
                     let mut out = qp_headers(headers)
                         .ok_or("part headers not understood, links not rewritten")?;
-                    out.extend_from_slice(&transfer::encode_qp(&rewritten));
-                    (true, out)
+                    out.extend_from_slice(&transfer::encode_qp(&rewritten, eol));
+                    Part::Replace(true, out)
                 }
             }
         };
-        Ok((ctx.links > before).then_some(out))
+        Ok(if ctx.links > before {
+            out
+        } else {
+            Part::Unchanged
+        })
     }
 
+    /// Rewrites `href` on `<a>` (and SVG `xlink:href`) and `<area>`, and
+    /// `<form action>`. Relative links are resolved against `<base href>`;
+    /// protocol-relative ones (`//host/`) as https.
     fn rewrite_html(
         &self,
         html: &[u8],
@@ -277,18 +316,37 @@ impl UrlRewriter {
         ctx: &mut Ctx,
     ) -> Result<Vec<u8>, String> {
         let ctx = RefCell::new(ctx);
+        let base: RefCell<Option<Url>> = RefCell::new(None);
         let mut out = Vec::with_capacity(html.len() + html.len() / 4);
-        let handle = |el: &mut Element| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            if let Some(href) = el.get_attribute("href") {
-                if let Some(link) = self.link(&decode_entities(&href), &mut ctx.borrow_mut()) {
-                    el.set_attribute("href", &link)?;
-                }
+        let attr = |el: &mut Element,
+                    name: &str|
+         -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let Some(value) = el.get_attribute(name) else {
+                return Ok(());
+            };
+            let url = resolve(&decode_entities(&value), base.borrow().as_ref());
+            if let Some(link) = url.and_then(|url| self.link(url, &mut ctx.borrow_mut())) {
+                el.set_attribute(name, &link)?;
             }
             Ok(())
         };
         let settings = lol_html::Settings::new()
-            .append_element_content_handler(element!("a[href]", handle))
-            .append_element_content_handler(element!("area[href]", handle))
+            .append_element_content_handler(element!("base[href]", |el| {
+                let mut base = base.borrow_mut();
+                if base.is_none() {
+                    let href = decode_entities(&el.get_attribute("href").unwrap_or_default());
+                    *base = Url::parse(&href)
+                        .ok()
+                        .filter(|url| matches!(url.scheme(), "http" | "https"));
+                }
+                Ok(())
+            }))
+            .append_element_content_handler(element!("a", |el| {
+                attr(el, "href")?;
+                attr(el, "xlink:href")
+            }))
+            .append_element_content_handler(element!("area[href]", |el| attr(el, "href")))
+            .append_element_content_handler(element!("form[action]", |el| attr(el, "action")))
             .with_encoding(encoding)
             .with_strict(false)
             .with_memory_settings(
@@ -312,7 +370,9 @@ impl UrlRewriter {
                 i += 1;
                 continue;
             };
-            let found = std::str::from_utf8(&text[i..end]).ok();
+            let found = std::str::from_utf8(&text[i..end])
+                .ok()
+                .and_then(|url| Url::parse(url).ok());
             if let Some(link) = found.and_then(|url| self.link(url, ctx)) {
                 out.extend_from_slice(&text[copied..i]);
                 out.extend_from_slice(link.as_bytes());
@@ -324,11 +384,8 @@ impl UrlRewriter {
         out
     }
 
-    /// The rewritten link, or `None` when this link is kept. Parsing is the
-    /// WHATWG one browsers use, so tabs, newlines and case tricks in the
-    /// scheme cannot hide a link.
-    fn link(&self, href: &str, ctx: &mut Ctx) -> Option<String> {
-        let url = url::Url::parse(href).ok()?;
+    /// The rewritten link, or `None` when this link is kept.
+    fn link(&self, url: Url, ctx: &mut Ctx) -> Option<String> {
         if !matches!(url.scheme(), "http" | "https") {
             return None;
         }
@@ -346,11 +403,91 @@ impl UrlRewriter {
         }
         let token = self.signer.sign(&Claims {
             u: url.as_str().to_string(),
-            m: ctx.message_id.to_string(),
+            m: ctx.delivery.message_id.to_string(),
+            r: ctx.delivery.recipient.to_string(),
+            t: ctx.delivery.issued_at,
             e: ctx.expires,
         });
         Some(format!("{}/u/{token}", self.base))
     }
+}
+
+/// The URL a browser opens for `href`. Parsing is the WHATWG one, so tabs,
+/// newlines, backslashes and case tricks in the scheme cannot hide a link.
+/// A relative link is resolved against `base`, or dropped without one; a
+/// protocol-relative one without a base is taken as https.
+fn resolve(href: &str, base: Option<&Url>) -> Option<Url> {
+    match Url::parse(href) {
+        Ok(url) => Some(url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => match base {
+            Some(base) => base.join(href).ok(),
+            None => {
+                let probe = Url::parse("https://relative.invalid/").ok()?;
+                let url = probe.join(href).ok()?;
+                (url.host_str() != Some("relative.invalid")).then_some(url)
+            }
+        },
+        Err(_) => None,
+    }
+}
+
+/// A `multipart/signed` whose protocol names a detached signature and whose
+/// second part is that signature. A bare `multipart/signed` wrapper does not
+/// exempt its links.
+fn is_signed(part: &MessagePart, children: &[u32], parts: &[MessagePart]) -> bool {
+    let Some(ct) = part.content_type() else {
+        return false;
+    };
+    let signed = ct.ctype().eq_ignore_ascii_case("multipart")
+        && ct
+            .subtype()
+            .is_some_and(|s| s.eq_ignore_ascii_case("signed"));
+    let protocol = ct
+        .attribute("protocol")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !signed || !SIGNATURE_PROTOCOLS.contains(&protocol.as_str()) || children.len() != 2 {
+        return false;
+    }
+    parts
+        .get(children[1] as usize)
+        .and_then(|sig| sig.content_type())
+        .is_some_and(|sig| {
+            format!("{}/{}", sig.ctype(), sig.subtype().unwrap_or(""))
+                .eq_ignore_ascii_case(&protocol)
+        })
+}
+
+/// Clear-signed PGP text: the header, a signature block and its end.
+fn pgp_signed(text: &[u8]) -> bool {
+    let find = |needle: &[u8], from: usize| {
+        text.get(from..)?
+            .windows(needle.len())
+            .position(|w| w == needle)
+            .map(|at| at + from)
+    };
+    let Some(start) = find(b"-----BEGIN PGP SIGNED MESSAGE-----", 0) else {
+        return false;
+    };
+    let line_start = start == 0 || text[start - 1] == b'\n';
+    let signature = find(b"-----BEGIN PGP SIGNATURE-----", start);
+    line_start && signature.is_some_and(|at| find(b"-----END PGP SIGNATURE-----", at).is_some())
+}
+
+fn decode(body: &[u8], cte: &str) -> Option<Vec<u8>> {
+    match cte {
+        "base64" => transfer::decode_base64(body.trim_ascii_end()),
+        "quoted-printable" => Some(transfer::decode_qp(body)),
+        _ => Some(body.to_vec()),
+    }
+}
+
+/// Anything that could be a web link, in text or markup.
+fn has_link(text: &[u8]) -> bool {
+    text.windows(5).any(|w| w.eq_ignore_ascii_case(b"http:"))
+        || text.windows(6).any(|w| w.eq_ignore_ascii_case(b"https:"))
+        || text.windows(2).any(|w| w == b"//")
 }
 
 /// End of a bare `http://` or `https://` link starting at `i`, without
@@ -430,8 +567,11 @@ fn qp_headers(block: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Character references in an attribute value: named ones a link uses and
-/// numeric ones. Anything else is kept as written.
+/// Character references in an attribute value, decoded as a browser does
+/// for the ones a link can use: numeric references with or without `;`,
+/// `&amp;` `&lt;` `&gt;` `&quot;` (also without `;` unless `=` or a letter
+/// follows, the legacy rule) and a few named ones that need `;`. Anything
+/// else is kept as written.
 fn decode_entities(value: &str) -> String {
     if !value.contains('&') {
         return value.to_string();
@@ -440,40 +580,62 @@ fn decode_entities(value: &str) -> String {
     let mut rest = value;
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
-        rest = &rest[at..];
-        let end = rest[1..]
-            .find(|c: char| !c.is_ascii_alphanumeric() && c != '#')
-            .map(|n| n + 1)
-            .unwrap_or(rest.len());
-        let name = &rest[1..end];
-        let decoded = match name {
-            "amp" => Some('&'),
-            "lt" => Some('<'),
-            "gt" => Some('>'),
-            "quot" => Some('"'),
-            "apos" => Some('\''),
-            "colon" => Some(':'),
-            "sol" => Some('/'),
-            "Tab" => Some('\t'),
-            "NewLine" => Some('\n'),
-            _ => name.strip_prefix('#').and_then(|n| {
-                let code = match n.strip_prefix(['x', 'X']) {
-                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
-                    None => n.parse().ok(),
-                };
-                code.and_then(char::from_u32)
-            }),
+        rest = &rest[at + 1..];
+        let (decoded, used) = if let Some(num) = rest.strip_prefix('#') {
+            let (hex, digits) = match num.strip_prefix(['x', 'X']) {
+                Some(hex) => (true, hex),
+                None => (false, num),
+            };
+            let len = digits
+                .find(|c: char| {
+                    !(if hex {
+                        c.is_ascii_hexdigit()
+                    } else {
+                        c.is_ascii_digit()
+                    })
+                })
+                .unwrap_or(digits.len());
+            let code = match len {
+                0 => None,
+                // Overlong references are U+FFFD in a browser too.
+                _ => Some(
+                    u32::from_str_radix(&digits[..len], if hex { 16 } else { 10 })
+                        .ok()
+                        .and_then(char::from_u32)
+                        .filter(|c| *c != '\0')
+                        .unwrap_or('\u{FFFD}'),
+                ),
+            };
+            (code, num.len() - digits.len() + 1 + len)
+        } else {
+            let len = rest
+                .find(|c: char| !c.is_ascii_alphanumeric())
+                .unwrap_or(rest.len());
+            let name = &rest[..len];
+            let semicolon = rest[len..].starts_with(';');
+            let legacy_ok = semicolon || !rest[len..].starts_with('=');
+            let c = match name {
+                "amp" if legacy_ok => Some('&'),
+                "lt" if legacy_ok => Some('<'),
+                "gt" if legacy_ok => Some('>'),
+                "quot" if legacy_ok => Some('"'),
+                "apos" if semicolon => Some('\''),
+                "colon" if semicolon => Some(':'),
+                "sol" if semicolon => Some('/'),
+                "period" if semicolon => Some('.'),
+                "Tab" if semicolon => Some('\t'),
+                "NewLine" if semicolon => Some('\n'),
+                _ => None,
+            };
+            (c, len)
         };
         match decoded {
             Some(c) => {
                 out.push(c);
-                rest = &rest[end..];
+                rest = &rest[used..];
                 rest = rest.strip_prefix(';').unwrap_or(rest);
             }
-            None => {
-                out.push('&');
-                rest = &rest[1..];
-            }
+            None => out.push('&'),
         }
     }
     out.push_str(rest);
@@ -497,11 +659,27 @@ mod tests {
 
     fn ctx() -> Ctx<'static> {
         Ctx {
-            message_id: "m1",
+            delivery: Delivery {
+                message_id: "m1",
+                recipient: "r@example.test",
+                issued_at: 0,
+            },
             expires: 10,
             links: 0,
             too_long: 0,
         }
+    }
+
+    fn html(input: &[u8]) -> (String, usize) {
+        let mut c = ctx();
+        let out = rewriter()
+            .rewrite_html(
+                input,
+                AsciiCompatibleEncoding::new(encoding_rs::UTF_8).unwrap(),
+                &mut c,
+            )
+            .unwrap();
+        (String::from_utf8(out).unwrap(), c.links)
     }
 
     #[test]
@@ -527,29 +705,47 @@ mod tests {
 
     #[test]
     fn urls_html_obfuscated_schemes_are_still_rewritten() {
-        let html = br#"<a href=" ht&#9;tps://evil.test/a?b=1&amp;c=2 ">x</a><a href="javascript:alert(1)">j</a><a href="https://www.trusted.example/">t</a><AREA HREF='HTTP://Evil.test'>"#;
-        let mut c = ctx();
-        let out = rewriter()
-            .rewrite_html(
-                html,
-                AsciiCompatibleEncoding::new(encoding_rs::UTF_8).unwrap(),
-                &mut c,
-            )
-            .unwrap();
-        let out = String::from_utf8(out).unwrap();
-        assert_eq!(c.links, 2, "{out}");
+        let (out, links) = html(
+            br#"<a href=" ht&#9;tps://evil.test/a?b=1&amp;c=2 ">x</a><a href="javascript:alert(1)">j</a><a href="https://www.trusted.example/">t</a><AREA HREF='HTTP://Evil.test'><a href="&#104ttps://evil.test/">n</a><a href="&#x68;ttps&#58//evil.test/">h</a>"#,
+        );
+        assert_eq!(links, 4, "{out}");
         assert!(out.contains("javascript:alert(1)"));
         assert!(out.contains("https://www.trusted.example/"));
-        assert!(!out.contains("evil.test"));
+        assert!(!out.contains("evil.test"), "{out}");
     }
 
     #[test]
-    fn urls_entities_decode() {
+    fn urls_html_relative_base_form_and_svg_links_are_rewritten() {
+        let (out, links) = html(
+            br#"<a href="//evil.test/a">p</a><a href="\\evil.test\b">b</a><a href="/local">l</a><form action="https://evil.test/post"></form><svg><a xlink:href="https://evil.test/svg"><text>s</text></a></svg>"#,
+        );
+        assert_eq!(links, 4, "{out}");
+        assert!(out.contains(r#"href="/local""#), "{out}");
+        assert!(!out.contains("evil.test"), "{out}");
+        let (out, links) = html(
+            br##"<head><base href="https://evil.test/dir/"></head><a href="page">r</a><a href="#top">t</a>"##,
+        );
+        assert_eq!(links, 2, "{out}");
+        assert_eq!(out.matches("links.example.com.au/u/").count(), 2);
+    }
+
+    #[test]
+    fn urls_entities_decode_like_a_browser() {
         assert_eq!(
             decode_entities("a&amp;b&#38;c&#x26;d&bogus;e&"),
             "a&b&c&d&bogus;e&"
         );
         assert_eq!(decode_entities("https&colon;&sol;&sol;x"), "https://x");
+        assert_eq!(decode_entities("&#104ttp&#x3a//a&#46b"), "http://a.b");
+        // The legacy rule: no `;` and a letter or `=` next means no reference.
+        assert_eq!(
+            decode_entities("?a=1&ampb=2&amp=3&amp x"),
+            "?a=1&ampb=2&amp=3& x"
+        );
+        assert_eq!(
+            decode_entities("&#0;&#99999999;&#x;"),
+            "\u{FFFD}\u{FFFD}&#x;"
+        );
     }
 
     #[test]
@@ -561,5 +757,15 @@ mod tests {
             b"Content-Type: text/plain\r\nX-A: b\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n"
         );
         assert!(qp_headers(b"Content-Type: text/plain\r\n").is_none());
+    }
+
+    #[test]
+    fn urls_inline_pgp_needs_a_signature_block() {
+        let signed = b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhi\n-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n";
+        assert!(pgp_signed(signed));
+        assert!(!pgp_signed(
+            b"-----BEGIN PGP SIGNED MESSAGE-----\nhttps://evil.test/\n"
+        ));
+        assert!(!pgp_signed(b"x -----BEGIN PGP SIGNED MESSAGE----- -----BEGIN PGP SIGNATURE----- -----END PGP SIGNATURE-----"));
     }
 }

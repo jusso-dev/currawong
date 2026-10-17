@@ -77,6 +77,20 @@ async fn classify_one(
         .await
         .map_err(|err| err.to_string())?;
     let body_path = spool_body(spool, &env);
+    // A copy of the arrival bytes outlives a crash between storing
+    // rewritten links and marking the message for delivery: put it back and
+    // classify what arrived, not our own output.
+    let original = original_path(spool, &env.id);
+    let raw = match (tokio::fs::read(&original).await, body_path.as_deref()) {
+        (Ok(saved), Some(path)) => {
+            crate::pipeline::rewrite_body(path, &saved)
+                .await
+                .map_err(|err| format!("could not restore the original body: {err}"))?;
+            let _ = tokio::fs::remove_file(&original).await;
+            saved
+        }
+        _ => raw,
+    };
     let raw = pipeline.strip_spooled(&raw, body_path.as_deref()).await?;
     let plan_path = plan_path(spool, &env.id);
     let mut bimi_auth = None;
@@ -93,7 +107,9 @@ async fn classify_one(
             plan
         }
         Err(_) => {
-            let (mut report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            let (report, decision, rewritten) = pipeline
+                .assess_for_delivery(&env, &raw, body_path.as_deref())
+                .await;
             bimi_auth = report.auth.clone();
             let mut groups: Vec<Vec<Decision>> = decision
                 .split()
@@ -105,13 +121,15 @@ async fn classify_one(
                 .flatten()
                 .any(|d| matches!(d.verdict, Verdict::Deliver));
             if delivers {
-                delivered = pipeline.rewrite_urls(&env, &raw, &mut report).await;
+                delivered = rewritten;
             }
             let headers = if !delivers {
                 pipeline.auth_headers(&env, &report)
             } else {
-                let body = delivered.as_deref().unwrap_or(&raw);
-                match pipeline.delivery_headers(&env, body, &report).await {
+                match pipeline
+                    .delivery_headers_for(&env, &raw, delivered.as_deref(), &report)
+                    .await
+                {
                     Ok(headers) => headers,
                     // Never send a tenant's mail unsigned when it has a key.
                     Err(reason) => {
@@ -225,8 +243,10 @@ async fn act(
     };
     match &decision.verdict {
         Verdict::Deliver => {
+            let original = original_path(spool, &env.id);
             if let Some(body) = rewritten {
                 let path = spool_body(spool, &env).ok_or("spool body missing")?;
+                write_atomic(&original, raw).await?;
                 crate::pipeline::rewrite_body(&path, body)
                     .await
                     .map_err(|err| format!("could not store rewritten links: {err}"))?;
@@ -234,6 +254,9 @@ async fn act(
             apply_actions(&mut env, decision, cfg, raw);
             env.pipeline = "deliver".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
+            if rewritten.is_some() {
+                let _ = tokio::fs::remove_file(&original).await;
+            }
         }
         Verdict::Defer { reason } => {
             env.pipeline = "scan_defer".into();
@@ -363,6 +386,11 @@ fn derived_id(id: &MessageId, salt: &str) -> MessageId {
     MessageId(hex::encode_upper(digest)[..26].to_string())
 }
 
+/// The arrival bytes of a message whose rewritten body is being stored.
+fn original_path(spool: &Spool, id: &MessageId) -> PathBuf {
+    spool.root().join("rewrite").join(format!("{id}.eml"))
+}
+
 fn plan_path(spool: &Spool, id: &MessageId) -> PathBuf {
     spool.root().join("split").join(format!("{id}.json"))
 }
@@ -381,6 +409,9 @@ async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
         .map_err(|err| err.to_string())?;
     file.sync_all().await.map_err(|err| err.to_string())?;
     tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|err| err.to_string())?;
+    crate::pipeline::sync_dir(dir)
         .await
         .map_err(|err| err.to_string())
 }

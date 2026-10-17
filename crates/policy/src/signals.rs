@@ -10,7 +10,8 @@
 //!   `dlp.incomplete` when some text could not be scanned for identifiers.
 //!   Classify adds `lookalike` when a sender or link domain imitates a
 //!   protected one, and passes on report flags such as `classify_skipped`
-//!   and `link_scan_truncated`.
+//!   and `link_scan_truncated`. Link rewriting adds `url_rewrite.skipped`
+//!   when some links were left without a click-time check.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).

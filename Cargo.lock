@@ -1068,10 +1068,13 @@ version = "0.0.1"
 dependencies = [
  "axum",
  "currawong-core",
+ "currawong-integrations",
  "currawong-scan",
+ "governor",
  "mail-parser",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tracing",

@@ -377,10 +377,15 @@ pub struct UrlRewriteConfig {
     pub ttl_days: u64,
     /// Links to these domains and their subdomains are not rewritten.
     pub allow_domains: Vec<String>,
-    /// Domains or URL prefixes blocked at click time, one per line. Read again when it changes.
+    /// Domains or URL prefixes blocked at click time, one per line (`warn <entry>`
+    /// warns, `allow <entry>` marks a known site). Read again when it changes.
     pub blocklist: Option<PathBuf>,
-    /// Click events, one JSON object per line.
+    /// Links to sites not on an `allow` line of the block list get the warning page.
+    pub warn_unknown: bool,
+    /// Click events, one JSON object per line, mode 0600.
     pub click_log: PathBuf,
+    /// The click log is rotated to `<click_log>.1` past this size.
+    pub click_log_max_bytes: u64,
     /// Larger messages are delivered without rewriting.
     pub max_message_bytes: usize,
 }
@@ -392,10 +397,12 @@ impl Default for UrlRewriteConfig {
             base_url: String::new(),
             listen: "127.0.0.1:8090".into(),
             key_file: PathBuf::from("/etc/currawong/url.key"),
-            ttl_days: 30,
+            ttl_days: 7,
             allow_domains: Vec::new(),
             blocklist: None,
+            warn_unknown: false,
             click_log: PathBuf::from("/var/lib/currawong/clicks.jsonl"),
+            click_log_max_bytes: 64 * 1024 * 1024,
             max_message_bytes: 10 * 1024 * 1024,
         }
     }

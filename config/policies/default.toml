@@ -79,3 +79,14 @@ id = "spam-tag"
 priority = 70
 conditions = [{ score = { name = "spam", at_least = 5.0, below = 8.0 } }]
 actions = [{ add_header = { name = "X-Currawong-Spam", value = "[SPAM]" } }]
+
+# Link rewriting (`[url_rewrite]`) left some links as they were: a signed
+# part, a charset or encoding it cannot read, an over-long link, or a whole
+# message over the size or link limits. Those links get no click-time check.
+# Tagged by default so signed mail still arrives; change the action to
+# quarantine where unprotected links must not reach mailboxes.
+[[policy]]
+id = "url-rewrite-skipped"
+priority = 80
+conditions = [{ direction = "inbound" }, { flag = "url_rewrite.skipped" }]
+actions = [{ add_header = { name = "X-Currawong-Links", value = "not-rewritten" } }]

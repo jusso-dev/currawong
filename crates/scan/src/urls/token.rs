@@ -1,7 +1,8 @@
 //! Signed click tokens: `base64url(json).base64url(hmac-sha256)`.
 //!
-//! The MAC covers the encoded claims (URL, message id, expiry) and is
-//! checked in constant time before anything in the token is decoded.
+//! The MAC covers the encoded claims (URL, message id, recipient, issue
+//! time and expiry) and is checked in constant time before anything in the
+//! token is decoded.
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use currawong_core::Secret;
 use hmac::{Hmac, Mac};
@@ -25,6 +26,12 @@ pub struct Claims {
     pub u: String,
     /// Message id the link was delivered in.
     pub m: String,
+    /// Recipients of the copy, comma separated. Empty when unknown.
+    #[serde(default)]
+    pub r: String,
+    /// Issued (message arrival), Unix seconds.
+    #[serde(default)]
+    pub t: u64,
     /// Expiry, Unix seconds.
     pub e: u64,
 }
@@ -113,6 +120,8 @@ mod tests {
         Claims {
             u: "https://example.com/a?b=c".into(),
             m: "01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            r: "dest@example.test".into(),
+            t: 500,
             e: 2_000,
         }
     }

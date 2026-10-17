@@ -69,20 +69,14 @@ pub fn url_protection(cfg: &CoreConfig) -> Result<(UrlRewriter, ClickState), Str
     let urls = &cfg.url_rewrite;
     let rewriter = url_rewriter(cfg)?;
     let signer = rewriter.signer().clone();
-    let reputation: Arc<dyn UrlReputation> = match &urls.blocklist {
-        Some(path) => Arc::new(LocalBlocklist::from_file(path)),
-        None => Arc::new(LocalBlocklist::from_entries("")),
+    let list = match &urls.blocklist {
+        Some(path) => LocalBlocklist::from_file(path),
+        None => LocalBlocklist::from_entries(""),
     };
-    let log = ClickLog::open(&urls.click_log)
+    let reputation: Arc<dyn UrlReputation> = Arc::new(list.with_warn_unknown(urls.warn_unknown));
+    let log = ClickLog::open(&urls.click_log, urls.click_log_max_bytes)
         .map_err(|err| format!("click log {}: {err}", urls.click_log.display()))?;
-    Ok((
-        rewriter,
-        ClickState {
-            signer,
-            reputation,
-            log: Arc::new(log),
-        },
-    ))
+    Ok((rewriter, ClickState::new(signer, reputation, log)))
 }
 
 /// Compile the configured YARA rules. `--check-config` prints the summary:

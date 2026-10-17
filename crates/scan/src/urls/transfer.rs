@@ -42,7 +42,8 @@ fn hex(c: u8) -> Option<u8> {
     (c as char).to_digit(16).map(|d| d as u8)
 }
 
-pub fn encode_qp(input: &[u8]) -> Vec<u8> {
+/// Soft line breaks use `eol`, the line ending of the part.
+pub fn encode_qp(input: &[u8], eol: &[u8]) -> Vec<u8> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut out = Vec::with_capacity(input.len() + input.len() / 8);
     let mut col = 0;
@@ -61,7 +62,8 @@ pub fn encode_qp(input: &[u8]) -> Vec<u8> {
         let literal = matches!(b, 33..=60 | 62..=126) || (matches!(b, b' ' | b'\t') && !at_eol);
         let width = if literal { 1 } else { 3 };
         if col + width > 75 {
-            out.extend_from_slice(b"=\r\n");
+            out.push(b'=');
+            out.extend_from_slice(eol);
             col = 0;
         }
         if literal {
@@ -84,13 +86,13 @@ pub fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
     STANDARD.decode(clean).ok()
 }
 
-/// 76-character lines separated by CRLF, no trailing line break.
-pub fn encode_base64(input: &[u8]) -> Vec<u8> {
+/// 76-character lines separated by `eol`, no trailing line break.
+pub fn encode_base64(input: &[u8], eol: &[u8]) -> Vec<u8> {
     let text = STANDARD.encode(input);
     let mut out = Vec::with_capacity(text.len() + text.len() / 38);
     for (n, line) in text.as_bytes().chunks(76).enumerate() {
         if n > 0 {
-            out.extend_from_slice(b"\r\n");
+            out.extend_from_slice(eol);
         }
         out.extend_from_slice(line);
     }
@@ -112,7 +114,7 @@ mod tests {
     #[test]
     fn urls_qp_round_trips_long_lines_and_trailing_space() {
         let text = format!("caf\u{e9} = {} end \r\nline two\t\r\n", "x".repeat(200));
-        let encoded = encode_qp(text.as_bytes());
+        let encoded = encode_qp(text.as_bytes(), b"\r\n");
         assert!(
             longest_line(&encoded) <= 76,
             "{}",
@@ -126,8 +128,10 @@ mod tests {
     #[test]
     fn urls_base64_round_trips_with_folded_lines() {
         let data = vec![0xAB; 500];
-        let encoded = encode_base64(&data);
+        let encoded = encode_base64(&data, b"\r\n");
         assert!(longest_line(&encoded) <= 76);
+        assert!(!encode_base64(&data, b"\n").contains(&b'\r'));
+        assert!(!encode_qp("x".repeat(200).as_bytes(), b"\n").contains(&b'\r'));
         assert_eq!(decode_base64(&encoded).unwrap(), data);
         assert!(decode_base64(b"!!!").is_none());
     }
