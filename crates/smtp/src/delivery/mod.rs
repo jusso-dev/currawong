@@ -189,6 +189,7 @@ impl<D: DnsLookup> Deliverer<D> {
             let dsn_env = Envelope {
                 id: Envelope::new_id(),
                 tenant_id: env.tenant_id.clone(),
+                authenticated_as: None,
                 mail_from: String::new(),
                 rcpt_to: vec![env.mail_from.clone()],
                 received_at: self.clock.now(),

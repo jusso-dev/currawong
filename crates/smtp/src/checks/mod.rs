@@ -1,4 +1,6 @@
 //! Cheap pre-DATA checks. Each one can be left unset to disable it.
+//! The session skips them for trusted tenant networks and authenticated
+//! submission; `allow_cidrs` skips them for listed networks.
 mod dnsbl;
 mod greylist;
 mod ratelimit;
@@ -13,7 +15,33 @@ use crate::dns::DnsLookup;
 use async_trait::async_trait;
 use currawong_core::config::{ChecksConfig, Config};
 use ipnet::IpNet;
-use std::{net::IpAddr, sync::Arc};
+use std::{
+    net::{IpAddr, Ipv6Addr},
+    sync::Arc,
+    time::Duration,
+};
+
+/// How often in-memory limiter keys, reputation entries and old greylist rows are pruned.
+const HOUSEKEEPING_EVERY: Duration = Duration::from_secs(60);
+/// Reputation changes fed back from pipeline verdicts. Only malware and spam
+/// count against a sender: DMARC failures and policy quarantines are common
+/// for forwarders and mailing lists and say little about the connecting host.
+const SCORE_DELIVERED: f32 = -2.0;
+const SCORE_SPAM: f32 = 5.0;
+const SCORE_MALWARE: f32 = 10.0;
+
+/// What a pipeline verdict says about the host that sent the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictSignal {
+    /// Delivered. `dmarc_pass` is an aligned DMARC pass.
+    Delivered {
+        dmarc_pass: bool,
+    },
+    Malware,
+    Spam,
+    /// Blocked or deferred for a reason that does not reflect on the sender.
+    Neutral,
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnCtx {
@@ -119,18 +147,19 @@ impl CheckStack {
     }
 
     fn allowed(&self, ip: IpAddr) -> bool {
+        let ip = ip.to_canonical();
         self.allow.iter().any(|net| net.contains(&ip))
     }
 
     pub async fn on_connect(&self, ctx: &ConnCtx) -> CheckResult {
+        if self.allowed(ctx.ip) {
+            return CheckResult::Pass;
+        }
         if let Some(rate) = &self.rate {
             let result = rate.on_connect(ctx).await;
             if blocking(&result) {
                 return result;
             }
-        }
-        if self.allowed(ctx.ip) {
-            return CheckResult::Pass;
         }
         if let Some(rep) = &self.reputation {
             let result = rep.on_connect(ctx).await;
@@ -148,6 +177,9 @@ impl CheckStack {
     }
 
     pub async fn on_mail(&self, ctx: &MailCtx) -> CheckResult {
+        if self.allowed(ctx.ip) {
+            return CheckResult::Pass;
+        }
         if let Some(rate) = &self.rate {
             return rate.on_mail(ctx).await;
         }
@@ -163,8 +195,93 @@ impl CheckStack {
         }
         CheckResult::Pass
     }
+
+    /// Feed a pipeline verdict back. Blocked mail raises the sending address's
+    /// reputation score and delivered mail lowers it. A delivered message that
+    /// passed aligned DMARC lets that sender domain skip greylisting from the
+    /// same network.
+    pub fn record_verdict(&self, ip: IpAddr, mail_from: &str, signal: VerdictSignal) {
+        let delta = match signal {
+            VerdictSignal::Delivered { .. } => SCORE_DELIVERED,
+            VerdictSignal::Malware => SCORE_MALWARE,
+            VerdictSignal::Spam => SCORE_SPAM,
+            VerdictSignal::Neutral => 0.0,
+        };
+        if let Some(rep) = &self.reputation {
+            if delta != 0.0 {
+                rep.record(ip, delta);
+            }
+        }
+        if let (Some(greylist), VerdictSignal::Delivered { dmarc_pass: true }) =
+            (&self.greylist, signal)
+        {
+            if let Some((_, domain)) = mail_from.rsplit_once('@') {
+                if let Err(err) = greylist.allow_aligned_dmarc(domain, ip) {
+                    tracing::warn!(%err, "greylist DMARC allow-list update failed");
+                }
+            }
+        }
+    }
+
+    /// Run `housekeeping` every minute on its own task until the stack is
+    /// dropped, so the connect path never pays for it.
+    pub fn spawn_housekeeping(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let stack = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(HOUSEKEEPING_EVERY);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(stack) = stack.upgrade() else {
+                    return;
+                };
+                stack.housekeeping();
+            }
+        })
+    }
+
+    /// Drop limiter keys whose buckets have refilled, reputation entries that
+    /// have decayed to nothing, and expired greylist rows. Attacker-chosen
+    /// addresses would otherwise grow these without bound.
+    pub fn housekeeping(&self) {
+        if let Some(rate) = &self.rate {
+            rate.housekeeping();
+        }
+        if let Some(rep) = &self.reputation {
+            rep.prune();
+        }
+        if let Some(greylist) = &self.greylist {
+            let greylist = greylist.clone();
+            let run = move || {
+                if let Err(err) = greylist.expire() {
+                    tracing::warn!(%err, "greylist expiry failed");
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.spawn_blocking(run);
+                }
+                Err(_) => run(),
+            }
+        }
+    }
 }
 
 fn blocking(result: &CheckResult) -> bool {
     matches!(result, CheckResult::Reject(_) | CheckResult::TempFail(_))
+}
+
+/// IPv4 /24 or IPv6 /64. IPv4-mapped IPv6 addresses count as IPv4.
+pub(crate) fn net_key(ip: IpAddr) -> String {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            let prefix = Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0);
+            format!("{prefix}/64")
+        }
+    }
 }

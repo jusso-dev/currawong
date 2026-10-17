@@ -1,11 +1,16 @@
-//! Auth, parse, scan and the policy decision.
+//! Auth, parse, scan, DLP, classify and the policy decision.
 use currawong_auth::{
     strip_forged, AuthChecker, DmarcEventStore, KeyStore, StoredKey, GATEWAY_TENANT,
 };
-use currawong_core::{
-    config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+use currawong_classify::{
+    message::{too_nested, MAX_RAW_BYTES},
+    Classifier, TenantContext,
 };
-use currawong_parser::ParseResponse;
+use currawong_core::{
+    config::{Config, TenantConfig},
+    AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+};
+use currawong_parser::{text::DlpText, ParseResponse};
 use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
 };
@@ -14,6 +19,7 @@ use currawong_scan::pool::{display_name, sweep};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, ScanOutcome, WorkerPool, YaraEngine,
 };
+use currawong_smtp::checks::{CheckStack, VerdictSignal};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 
@@ -21,6 +27,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// Connection checks that learn from verdicts (reputation, greylist DMARC pass).
+    pub checks: Option<Arc<CheckStack>>,
     pub yara: Option<Arc<YaraEngine>>,
     /// YARA is configured but its rules could not be loaded: fail closed.
     pub yara_error: Option<String>,
@@ -33,6 +41,10 @@ pub struct Pipeline {
     pub bimi_jobs: Option<tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
+    /// Spam and lookalike scoring. `None` when `classify.enabled` is off or
+    /// the classifier failed to load (`classify_error`, noted on each report).
+    pub classifier: Option<Arc<Classifier>>,
+    pub classify_error: Option<String>,
 }
 
 impl Pipeline {
@@ -60,6 +72,17 @@ impl Pipeline {
                 None
             }
         });
+        // `--check-config` has already loaded the rules and brands, so a
+        // failure here is logged rather than stopping the daemon.
+        let (classifier, classify_error) =
+            match cfg.classify.enabled.then(|| Classifier::from_config(&cfg)) {
+                Some(Ok(classifier)) => (Some(Arc::new(classifier)), None),
+                Some(Err(err)) => {
+                    tracing::error!(%err, "classifier disabled");
+                    (None, Some(err.to_string()))
+                }
+                None => (None, None),
+            };
         Self {
             cfg,
             auth,
@@ -72,7 +95,36 @@ impl Pipeline {
             bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
+            checks: None,
+            classifier,
+            classify_error,
         }
+    }
+
+    pub fn with_checks(mut self, checks: Arc<CheckStack>) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// Feed an inbound verdict back to the SMTP connection checks.
+    fn feedback(&self, env: &Envelope, report: &ScanReport, verdict: &Verdict) {
+        let Some(checks) = &self.checks else {
+            return;
+        };
+        if env.tenant_id.is_some() {
+            return;
+        }
+        let signal = match verdict {
+            Verdict::Deliver => VerdictSignal::Delivered {
+                dmarc_pass: report
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.dmarc.result == "pass"),
+            },
+            _ if report.malware => VerdictSignal::Malware,
+            _ => VerdictSignal::Neutral,
+        };
+        checks.record_verdict(env.remote_ip, &env.mail_from, signal);
     }
 
     pub fn with_keys(mut self, keys: KeyStore) -> Self {
@@ -270,7 +322,21 @@ impl Pipeline {
         }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
+            // No worker: decoded text bodies only; documents mark it incomplete.
+            // In-process mail-parser would overflow the stack on a deeply nested
+            // message, so that one is scanned as raw text and marked incomplete.
+            let text = if too_nested(raw) {
+                DlpText {
+                    text: String::from_utf8_lossy(raw).into_owned(),
+                    incomplete: true,
+                }
+            } else {
+                currawong_parser::text::body_text(raw)
+            };
+            self.scan_dlp(env, &text, &mut report);
+            self.classify(env, raw, &mut report).await;
             let decision = self.decide(env, &report);
+            self.feedback(env, &report, &decision.verdict());
             return (report, decision);
         }
         let rules = self.yara.as_ref().map(|engine| engine.current());
@@ -294,6 +360,7 @@ impl Pipeline {
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
         report.yara = parsed.yara.clone();
+        self.scan_dlp(env, &parsed.dlp, &mut report);
         if let Some(err) = parsed.error.filter(|_| parser_failed) {
             report.notes.push(err);
         }
@@ -355,7 +422,9 @@ impl Pipeline {
                 detail: String::new(),
             });
         }
+        self.classify(env, raw, &mut report).await;
         let decision = self.decide(env, &report);
+        self.feedback(env, &report, &decision.verdict());
         (report, decision)
     }
 
@@ -363,12 +432,7 @@ impl Pipeline {
     /// and submitted mail to a local mailbox is decided for that mailbox.
     fn decide(&self, env: &Envelope, report: &ScanReport) -> MessageDecision {
         let tenants = &self.cfg.relay.tenants;
-        let tenant_of = |domain: &str| {
-            tenants
-                .iter()
-                .find(|t| t.domains.iter().any(|d| canonical_domain(d) == domain))
-                .map(|t| t.id.as_str())
-        };
+        let tenant_of = |domain: &str| tenant_owning(tenants, domain).map(|t| t.id.as_str());
         let is_local = |domain: &str| {
             tenant_of(domain).is_some()
                 || self
@@ -403,9 +467,9 @@ impl Pipeline {
                     },
                     direction,
                     sender: &env.mail_from,
-                    // The SMTP session does not record the login on the envelope yet,
-                    // so outbound user and group scopes do not match.
-                    sender_identity: None,
+                    // The SMTP AUTH login, recorded by the session. Trusted-network
+                    // relay and inbound mail have none, so user scopes never match them.
+                    sender_identity: env.authenticated_as.as_deref(),
                     recipient: rcpt,
                 }
             })
@@ -423,6 +487,52 @@ impl Pipeline {
             }
         }
         decision
+    }
+
+    /// Outbound mail, and inbound when configured. Logs counts only.
+    fn scan_dlp(&self, env: &Envelope, text: &DlpText, report: &mut ScanReport) {
+        let profile = &self.cfg.dlp;
+        if !profile.enabled || (env.direction == Direction::Inbound && !profile.scan_inbound) {
+            return;
+        }
+        let mut dlp = currawong_dlp::scan(&text.text, profile);
+        dlp.incomplete |= text.incomplete;
+        if !dlp.counts.is_empty() || dlp.incomplete {
+            tracing::info!(id = %env.id, counts = ?dlp.counts, incomplete = dlp.incomplete, "dlp findings");
+        }
+        report.dlp = Some(dlp);
+    }
+
+    /// Classification is CPU and SQLite work, so it runs off the async workers.
+    async fn classify(&self, env: &Envelope, raw: &[u8], report: &mut ScanReport) {
+        let Some(classifier) = self.classifier.clone() else {
+            if let Some(err) = &self.classify_error {
+                report.notes.push(format!("classifier unavailable: {err}"));
+            }
+            return;
+        };
+        let tenant = tenant_context(&self.cfg, env);
+        // One byte past the cap so the classifier still notes the truncation.
+        let raw = raw[..raw.len().min(MAX_RAW_BYTES + 1)].to_vec();
+        let sender = env.mail_from.clone();
+        let urls = report.urls.clone();
+        match tokio::task::spawn_blocking(move || {
+            classifier.classify(&tenant, &raw, &sender, &urls)
+        })
+        .await
+        {
+            Ok(result) => {
+                // A message too nested to parse safely is held, not delivered unscored.
+                if result.flags.iter().any(|flag| flag == "classify_skipped") {
+                    report.fail_closed = true;
+                }
+                report.spam = result.spam;
+                report.lookalikes = result.lookalikes;
+                report.flags.extend(result.flags);
+                report.notes.extend(result.notes);
+            }
+            Err(err) => report.notes.push(format!("classifier failed: {err}")),
+        }
     }
 
     /// Part flags from the parser worker become the M1 verdict inputs.
@@ -543,6 +653,47 @@ fn blocked_extension(filename: Option<&str>, blocked: &[String]) -> bool {
         return false;
     };
     blocked.iter().any(|b| b.eq_ignore_ascii_case(&ext))
+}
+
+/// The tenant a message is classified for: the relay tenant that submitted
+/// it, else the tenant owning the first recipient domain that one claims,
+/// else the first recipient domain on its own. Per-recipient tenancy belongs
+/// to the policy engine; this only picks the Bayes store and protected domains.
+fn tenant_context(cfg: &Config, env: &Envelope) -> TenantContext {
+    let tenants = &cfg.relay.tenants;
+    if let Some(id) = &env.tenant_id {
+        let domains = tenants
+            .iter()
+            .find(|tenant| &tenant.id == id)
+            .map(|tenant| tenant.domains.clone())
+            .unwrap_or_default();
+        return TenantContext::tenant(id, &domains);
+    }
+    let recipient_domains: Vec<String> = env
+        .rcpt_to
+        .iter()
+        .filter_map(|rcpt| rcpt.rsplit_once('@'))
+        .map(|(_, domain)| canonical_domain(domain.trim_end_matches('>')))
+        .collect();
+    for domain in &recipient_domains {
+        if let Some(tenant) = tenant_owning(tenants, domain) {
+            return TenantContext::tenant(&tenant.id, &tenant.domains);
+        }
+    }
+    TenantContext::domain(
+        recipient_domains
+            .first()
+            .map(String::as_str)
+            .unwrap_or("unknown"),
+    )
+}
+
+/// The relay tenant that owns `domain` (already canonical). Policy decisions
+/// and classification both resolve tenants through this.
+fn tenant_owning<'a>(tenants: &'a [TenantConfig], domain: &str) -> Option<&'a TenantConfig> {
+    tenants
+        .iter()
+        .find(|t| t.domains.iter().any(|d| canonical_domain(d) == domain))
 }
 
 fn finding(name: &str, result: &currawong_scan::EngineResult) -> EngineOutput {

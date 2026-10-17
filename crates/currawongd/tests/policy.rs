@@ -19,6 +19,7 @@ fn envelope(id: &str, rcpt: &[&str]) -> Envelope {
     Envelope {
         id: MessageId(id.into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: "sender@sender.test".into(),
         rcpt_to: rcpt.iter().map(|r| r.to_string()).collect(),
         received_at: OffsetDateTime::now_utc(),

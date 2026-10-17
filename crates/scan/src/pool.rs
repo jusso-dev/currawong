@@ -73,6 +73,7 @@ struct Worker {
 }
 
 const INPUT_NAME: &str = "message.eml";
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 /// Parts beyond `max_files` the worker may add (attached messages, the
 /// limit marker).
 const PART_SLACK: usize = 16;
@@ -397,7 +398,8 @@ impl WorkerPool {
             dir,
         };
         // The worker sends `ready` once its sandbox is in place.
-        let ready = timeout(self.timeout, worker.stdout.next())
+        // Start-up gets a few seconds even when the job timeout is shorter.
+        let ready = timeout(self.timeout.max(STARTUP_TIMEOUT), worker.stdout.next())
             .await
             .map_err(|_| unavailable("parser worker did not start in time".into()))?
             .ok_or_else(|| unavailable("parser worker exited during startup".into()))?

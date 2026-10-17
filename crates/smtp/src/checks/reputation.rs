@@ -1,4 +1,5 @@
-//! Local reputation with exponential decay. Higher scores are worse.
+//! Local reputation with exponential decay. Higher scores are worse. Scores
+//! come from pipeline verdicts (`CheckStack::record_verdict`).
 use super::{CheckResult, ConnCtx, ConnectionCheck, RcptCtx};
 use async_trait::async_trait;
 use dashmap::DashMap;
@@ -37,20 +38,38 @@ impl Reputation {
     pub fn score(&self, ip: IpAddr) -> f32 {
         let now = self.now();
         self.scores
-            .get(&ip)
+            .get(&ip.to_canonical())
             .map(|entry| decay(entry.0, entry.1, now, self.half_life_secs))
             .unwrap_or(0.0)
     }
 
+    /// Add `delta` to the decayed score. Scores stay between zero and twice
+    /// the reject threshold, and a good result for an unknown address does
+    /// not create an entry.
     pub fn record(&self, ip: IpAddr, delta: f32) {
+        let ip = ip.to_canonical();
+        let now = self.now();
+        let cap = self.threshold * 2.0;
+        if let Some(mut entry) = self.scores.get_mut(&ip) {
+            entry.0 = (decay(entry.0, entry.1, now, self.half_life_secs) + delta).clamp(0.0, cap);
+            entry.1 = now;
+            return;
+        }
+        if delta > 0.0 {
+            self.scores.insert(ip, (delta.min(cap), now));
+        }
+    }
+
+    /// Drop entries that have decayed below one point.
+    pub fn prune(&self) {
         let now = self.now();
         self.scores
-            .entry(ip)
-            .and_modify(|entry| {
-                entry.0 = decay(entry.0, entry.1, now, self.half_life_secs) + delta;
-                entry.1 = now;
-            })
-            .or_insert((delta.max(0.0), now));
+            .retain(|_, entry| decay(entry.0, entry.1, now, self.half_life_secs) >= 1.0);
+        self.scores.shrink_to_fit();
+    }
+
+    pub fn tracked(&self) -> usize {
+        self.scores.len()
     }
 }
 

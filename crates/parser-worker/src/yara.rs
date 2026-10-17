@@ -38,6 +38,7 @@ impl RulesCache {
                     error: None,
                     warnings: Vec::new(),
                     yara: Vec::new(),
+                    dlp: Default::default(),
                 }
             }
             Err(err) => ParseResponse::failed(LoadRules::REPLY_ID, err),

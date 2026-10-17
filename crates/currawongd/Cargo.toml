@@ -10,9 +10,11 @@ currawong-smtp = { path = "../smtp" }
 currawong-spool = { path = "../spool" }
 currawong-auth = { path = "../auth" }
 currawong-scan = { path = "../scan" }
+currawong-classify = { path = "../classify" }
 currawong-parser-worker = { path = "../parser-worker" }
 currawong-policy = { path = "../policy" }
 currawong-quarantine = { path = "../quarantine" }
+currawong-dlp = { path = "../dlp" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

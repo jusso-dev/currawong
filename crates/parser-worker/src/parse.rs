@@ -32,26 +32,35 @@ pub fn parse_request(req: &ParseRequest, cache: &mut RulesCache) -> ParseRespons
         None => None,
     };
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        parse_full(&req.id, &raw, &req.limits, req.out_dir.as_deref(), rules)
+        parse_full(
+            &req.id,
+            &raw,
+            &req.limits,
+            req.out_dir.as_deref(),
+            rules,
+            true,
+        )
     })) {
         Ok(response) => response,
         Err(_) => ParseResponse::failed(&req.id, "parser panicked"),
     }
 }
 
+/// In-process parse. PDF and Office text extraction only runs in the
+/// worker (`parse_request`), so documents here mark DLP text incomplete.
 pub fn parse_bytes(id: &str, raw: &[u8], limits: &ExtractLimits) -> ParseResponse {
     parse_with(id, raw, limits, None)
 }
 
-/// Parse, and match YARA rules against the raw message, every MIME part and
-/// every archive member.
+/// In-process parse with YARA rules matched against the raw message, every
+/// MIME part and every archive member. Documents mark DLP text incomplete.
 pub fn parse_bytes_with(
     id: &str,
     raw: &[u8],
     limits: &ExtractLimits,
     rules: Option<&Rules>,
 ) -> ParseResponse {
-    parse_full(id, raw, limits, None, rules)
+    parse_full(id, raw, limits, None, rules, false)
 }
 
 /// Parses `raw`. Limits apply to the whole message, not to each attachment.
@@ -62,15 +71,18 @@ pub fn parse_with(
     limits: &ExtractLimits,
     out_dir: Option<&Path>,
 ) -> ParseResponse {
-    parse_full(id, raw, limits, out_dir, None)
+    parse_full(id, raw, limits, out_dir, None, false)
 }
 
+/// `documents` is true only in the worker: PDF and Office text extraction
+/// for DLP never runs in the supervisor.
 pub fn parse_full(
     id: &str,
     raw: &[u8],
     limits: &ExtractLimits,
     out_dir: Option<&Path>,
     rules: Option<&Rules>,
+    documents: bool,
 ) -> ParseResponse {
     if let Some(reason) = nesting_limit(raw) {
         return ParseResponse::failed(id, reason);
@@ -121,6 +133,7 @@ pub fn parse_full(
         error,
         warnings: Vec::new(),
         yara,
+        dlp: crate::text::message_text(&message, documents),
     }
 }
 

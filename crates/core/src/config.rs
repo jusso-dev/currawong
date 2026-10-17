@@ -37,7 +37,9 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
+    pub dlp: DlpProfile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,6 +66,12 @@ pub struct LimitsConfig {
     pub max_connections: usize,
     pub max_line_bytes: usize,
     pub max_connections_per_ip: usize,
+    /// Implicit TLS and STARTTLS handshakes that take longer are dropped.
+    pub tls_handshake_timeout_secs: u64,
+    /// Longest a whole DATA transfer may take, however steadily lines arrive.
+    pub data_timeout_secs: u64,
+    /// DATA is answered 452 4.3.1 when the spool file system has less free.
+    pub spool_min_free_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,7 +254,7 @@ pub struct ChecksConfig {
     pub greylist_delay_secs: u64,
     pub greylist_database: PathBuf,
     pub dnsbl: Vec<DnsblZone>,
-    /// Connection checks skip DNSBL, greylisting and reputation for these CIDRs.
+    /// Connection checks (rate limits, DNSBL, greylisting, reputation) skip these CIDRs.
     /// Use this for published Microsoft and Google outbound ranges.
     pub allow_cidrs: Vec<String>,
     pub rate_per_minute_ip: u32,
@@ -350,6 +358,37 @@ impl Default for DmarcReportConfig {
     }
 }
 
+/// `[dlp]`: Australian identifier detection on outbound mail, and inbound
+/// mail when `scan_inbound` is set. What happens to a message with findings
+/// is set by policy (`dlp.<kind>` counts and the `dlp.incomplete` flag).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DlpProfile {
+    pub enabled: bool,
+    pub scan_inbound: bool,
+    /// Matches below this confidence (0 to 100) are not counted.
+    pub min_confidence: u8,
+}
+
+/// Spam scoring and lookalike domains. Scores go on the report; policy decides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClassifyConfig {
+    pub enabled: bool,
+    /// SQLite file holding per-tenant Bayes token counts.
+    pub bayes_database: PathBuf,
+    /// Directory of `*.toml` spam rules. Unset uses the built-in rules.
+    pub spam_rules_dir: Option<PathBuf>,
+    /// Brand list, `Name: domain ...` per line. Unset uses the built-in Australian list.
+    pub brands_file: Option<PathBuf>,
+    /// More domains to protect in every tenant's mail. A tenant's own domains
+    /// are protected in its own mail.
+    pub protected_domains: Vec<String>,
+    /// Domains never flagged as lookalikes, such as partners or vendors whose
+    /// names resemble a tenant's.
+    pub allowed_domains: Vec<String>,
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -388,6 +427,9 @@ impl Default for LimitsConfig {
             max_connections: 1000,
             max_line_bytes: 1000,
             max_connections_per_ip: 20,
+            tls_handshake_timeout_secs: 30,
+            data_timeout_secs: 600,
+            spool_min_free_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -539,6 +581,29 @@ impl Default for AuthConfig {
     }
 }
 
+impl Default for DlpProfile {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            scan_inbound: false,
+            min_confidence: 50,
+        }
+    }
+}
+
+impl Default for ClassifyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bayes_database: PathBuf::from("/var/lib/currawong/bayes.sqlite"),
+            spam_rules_dir: None,
+            brands_file: None,
+            protected_domains: Vec::new(),
+            allowed_domains: Vec::new(),
+        }
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -582,7 +647,9 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
+            dlp: DlpProfile::default(),
         }
     }
 }
@@ -676,12 +743,14 @@ impl Config {
                 "max_recipients must be at least 1".into(),
             ));
         }
-        if needs_tls
-            && (self.tls.cert.is_none() || self.tls.key.is_none())
-            && self.tls.acme.is_none()
-        {
+        if self.tls.acme.is_some() {
             return Err(ConfigError::Invalid(
-                "STARTTLS or implicit TLS requires tls.cert and tls.key, or tls.acme".into(),
+                "tls.acme is not implemented yet: set tls.cert and tls.key".into(),
+            ));
+        }
+        if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
+            return Err(ConfigError::Invalid(
+                "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
             ));
         }
         if self.residency.mode != "au" && self.residency.mode != "off" {
@@ -883,6 +952,21 @@ mod tests {
             }
         }
         assert_eq!(cfg.limits.max_recipients, 5);
+    }
+
+    #[test]
+    fn acme_is_refused_until_implemented() {
+        let mut cfg = Config::default();
+        cfg.tls.cert = None;
+        cfg.tls.key = None;
+        cfg.tls.acme = Some(AcmeConfig {
+            directory_url: "https://acme.example.test/directory".into(),
+            domains: vec!["mx.example.test".into()],
+            contact: "mailto:ops@example.test".into(),
+            cache_dir: PathBuf::from("/var/lib/currawong/acme"),
+        });
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("tls.acme"), "{err}");
     }
 
     #[test]

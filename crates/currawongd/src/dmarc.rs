@@ -145,6 +145,7 @@ async fn report_domain(
         let env = Envelope {
             id: id.clone(),
             tenant_id: None,
+            authenticated_as: None,
             mail_from: report.from.clone(),
             rcpt_to,
             received_at: now,

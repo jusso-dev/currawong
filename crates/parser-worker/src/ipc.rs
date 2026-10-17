@@ -1,4 +1,5 @@
 //! Length-prefixed JSON frames shared by the worker and the supervisor.
+use crate::text::DlpText;
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartInfo, YaraMatch};
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,9 @@ pub struct ParseResponse {
     /// Sandbox warnings, sent once in the `ready` frame.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Extracted text for DLP, bounded by `text::MAX_TEXT_BYTES`.
+    #[serde(default)]
+    pub dlp: DlpText,
     #[serde(default)]
     pub yara: Vec<YaraMatch>,
 }
@@ -74,6 +78,7 @@ impl ParseResponse {
             urls: Vec::new(),
             error: Some(reason.into()),
             warnings: Vec::new(),
+            dlp: DlpText::default(),
             yara: Vec::new(),
         }
     }

@@ -304,6 +304,8 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     let mut dsn = env.clone();
     dsn.id = derived_id(&env.id, "dsn");
     dsn.mail_from = String::new();
+    // The gateway sends the bounce; it is not the submitting user's mail.
+    dsn.authenticated_as = None;
     dsn.rcpt_to = vec![env.mail_from.clone()];
     dsn.received_at = OffsetDateTime::now_utc();
     dsn.remote_ip = std::net::Ipv4Addr::LOCALHOST.into();

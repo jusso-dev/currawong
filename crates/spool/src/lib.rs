@@ -86,6 +86,10 @@ pub struct RcptStatus {
 pub struct Envelope {
     pub id: MessageId,
     pub tenant_id: Option<String>,
+    /// SMTP AUTH login that submitted the message. `None` for inbound mail
+    /// and trusted-network relay. Policy can scope user and group rules by it.
+    #[serde(default)]
+    pub authenticated_as: Option<String>,
     pub mail_from: String,
     pub rcpt_to: Vec<String>,
     #[serde(with = "time::serde::rfc3339")]
@@ -124,9 +128,52 @@ impl Envelope {
     }
 }
 
+/// A body being streamed into `incoming/`. Until `Spool::commit` succeeds,
+/// dropping it removes the temporary file, so an abandoned transaction leaves
+/// nothing behind. After a real crash `recover` deletes the `.eml.tmp`.
+pub struct PendingBody {
+    id: MessageId,
+    dir: PathBuf,
+    file: Option<tokio::io::BufWriter<tokio::fs::File>>,
+    armed: bool,
+}
+
+impl PendingBody {
+    pub fn id(&self) -> &MessageId {
+        &self.id
+    }
+
+    pub async fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(file) = self.file.as_mut() {
+            file.write_all(bytes).await?;
+        }
+        Ok(())
+    }
+
+    fn tmp_path(&self) -> PathBuf {
+        self.dir.join(format!("{}.eml.tmp", self.id))
+    }
+}
+
+impl Drop for PendingBody {
+    fn drop(&mut self) {
+        // Crash tests panic to stop dead; a real crash runs no cleanup either.
+        #[cfg(test)]
+        if std::thread::panicking() {
+            return;
+        }
+        if self.armed {
+            let _ = std::fs::remove_file(self.tmp_path());
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Spool {
     root: PathBuf,
+    /// fsyncs made while committing new messages; lets tests check that the
+    /// SMTP layer only replies 250 after them.
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Test-only crash injection: number of durable steps left before a panic.
     #[cfg(test)]
     crash_after: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
@@ -150,6 +197,7 @@ impl Spool {
         }
         Ok(Self {
             root,
+            syncs: Default::default(),
             #[cfg(test)]
             crash_after: None,
         })
@@ -159,18 +207,56 @@ impl Spool {
         &self.root
     }
 
+    /// File and directory fsyncs made by `commit` so far.
+    pub fn commit_syncs(&self) -> u64 {
+        self.syncs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn note_sync(&self) {
+        self.syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub async fn accept(
         &self,
-        mut env: Envelope,
-        body: impl AsyncRead + Unpin,
+        env: Envelope,
+        mut body: impl AsyncRead + Unpin,
     ) -> Result<MessageId> {
-        if !is_safe_id(env.id.as_str()) {
-            return Err(SpoolError::UnsafeId(env.id.as_str().to_string()));
+        let mut pending = self.begin(&env.id).await?;
+        if let Some(file) = pending.file.as_mut() {
+            if let Err(err) = tokio::io::copy(&mut body, file).await {
+                // Dropping `pending` removes the partial body.
+                return Err(err.into());
+            }
         }
-        env.state = SpoolState::Incoming;
+        self.commit(pending, env).await
+    }
+
+    /// Start streaming a body to `incoming/<id>.eml.tmp`. Nothing is visible
+    /// to the queue until `commit`, and recovery deletes a stray `.eml.tmp`.
+    pub async fn begin(&self, id: &MessageId) -> Result<PendingBody> {
+        if !is_safe_id(id.as_str()) {
+            return Err(SpoolError::UnsafeId(id.as_str().to_string()));
+        }
         let dir = self.state_dir(SpoolState::Incoming);
+        let tmp = dir.join(format!("{id}.eml.tmp"));
+        let file = create_private_file(&tmp).await?;
+        self.step();
+        Ok(PendingBody {
+            id: id.clone(),
+            dir,
+            file: Some(tokio::io::BufWriter::new(file)),
+            armed: true,
+        })
+    }
+
+    /// Make a streamed body durable and visible: fsync it, write the JSON,
+    /// rename the eml into place, sync the directory. Only after `Ok` may the
+    /// caller reply 250. On error nothing of the message is left behind.
+    pub async fn commit(&self, mut pending: PendingBody, mut env: Envelope) -> Result<MessageId> {
+        env.id = pending.id.clone();
+        env.state = SpoolState::Incoming;
         let mut placed = false;
-        if let Err(err) = self.accept_files(&dir, &env, body, &mut placed).await {
+        if let Err(err) = self.commit_files(&mut pending, &env, &mut placed).await {
             // The caller replies 451, so nothing may stay behind to be
             // delivered twice when the client retries. The eml goes first so a
             // crash here leaves at most a JSON with no eml, which recovery drops.
@@ -180,36 +266,40 @@ impl Spool {
                 names.splice(0..0, [format!("{id}.eml"), format!("{id}.json")]);
             }
             for name in names {
-                let _ = tokio::fs::remove_file(dir.join(name)).await;
+                let _ = tokio::fs::remove_file(pending.dir.join(name)).await;
             }
-            let _ = sync_dir(&dir).await;
+            let _ = sync_dir(&pending.dir).await;
+            pending.armed = false;
             return Err(err);
         }
+        pending.armed = false;
         Ok(env.id)
     }
 
-    async fn accept_files(
+    async fn commit_files(
         &self,
-        dir: &Path,
+        pending: &mut PendingBody,
         env: &Envelope,
-        mut body: impl AsyncRead + Unpin,
         placed: &mut bool,
     ) -> Result<()> {
-        let eml_tmp = dir.join(format!("{}.eml.tmp", env.id));
+        let dir = pending.dir.clone();
+        let eml_tmp = pending.tmp_path();
         let eml = dir.join(format!("{}.eml", env.id));
-        {
-            let mut file = create_private_file(&eml_tmp).await?;
-            self.step();
-            tokio::io::copy(&mut body, &mut file).await?;
-            file.sync_all().await?;
-            self.step();
+        if let Some(file) = pending.file.as_mut() {
+            file.flush().await?;
+            file.get_mut().sync_all().await?;
+            self.note_sync();
         }
+        pending.file = None;
+        self.step();
         // JSON before eml: an eml in a state directory always has its envelope.
         *placed = true;
-        self.write_json(dir, env).await?;
+        self.write_json(&dir, env).await?;
+        self.note_sync();
         tokio::fs::rename(&eml_tmp, &eml).await?;
         self.step();
-        sync_dir(dir).await?;
+        sync_dir(&dir).await?;
+        self.note_sync();
         self.step();
         Ok(())
     }

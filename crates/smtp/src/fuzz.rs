@@ -2,9 +2,12 @@
 use crate::{command::parse_command, data::decode_data};
 
 pub fn command(data: &[u8]) {
-    let line = String::from_utf8_lossy(data);
-    let end = line.find(['\n', '\r']).unwrap_or(line.len()).min(4096);
-    let _ = parse_command(&line[..end]);
+    let end = data
+        .iter()
+        .position(|b| *b == b'\n')
+        .unwrap_or(data.len())
+        .min(4096);
+    let _ = parse_command(&data[..end]);
 }
 
 pub fn data(data: &[u8]) {
