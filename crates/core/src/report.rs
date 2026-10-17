@@ -97,6 +97,10 @@ pub struct ScanReport {
     /// Required engine configured but unreachable. Do not deliver; retry.
     pub defer: bool,
     pub notes: Vec<String>,
+    /// A stage changed the message (for example URL rewriting). Only
+    /// modified inbound mail is ARC sealed.
+    #[serde(default)]
+    pub modified: bool,
 }
 
 impl ScanReport {
@@ -113,6 +117,7 @@ impl ScanReport {
             fail_closed: false,
             defer: false,
             notes: Vec::new(),
+            modified: false,
         }
     }
 }

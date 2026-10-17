@@ -163,6 +163,37 @@ async fn session_relays_denied_and_local_mail_is_spooled() {
     assert!(body.windows(5).any(|w| w == b"hello"));
 }
 
+/// #20: the spooled copy (what is quarantined and delivered) carries no
+/// Authentication-Results claiming our authserv-id.
+#[tokio::test]
+async fn session_strips_forged_authentication_results_before_spooling() {
+    let h = await_harness().await;
+    let id = h.cfg.auth.authserv_id.clone();
+    let ctx = context(&h, ListenerRole::Inbound, None, Arc::new(Relay::empty()));
+    let data = format!(
+        "Authentication-Results : (forged) {id}.; dkim=pass\r\nAuthentication-Results: other.example; spf=pass\r\nSubject: hi\r\n\r\nhello\r\n."
+    );
+    let transcript = talk(
+        ctx,
+        peer([203, 0, 113, 10]),
+        &[
+            "EHLO client.test",
+            "MAIL FROM:<a@outside.test>",
+            "RCPT TO:<b@example.test>",
+            "DATA",
+            &data,
+            "QUIT",
+        ],
+    )
+    .await;
+    assert!(transcript.contains("250 2.0.0 OK"), "{transcript}");
+    let incoming = h.spool.list(SpoolState::Incoming).await.unwrap();
+    let body = h.spool.read_body(&incoming[0].id).await.unwrap();
+    let text = String::from_utf8(body).unwrap();
+    assert!(!text.contains("dkim=pass"), "{text}");
+    assert!(text.contains("other.example; spf=pass"), "{text}");
+}
+
 #[tokio::test]
 async fn session_1001_byte_line_is_500() {
     let h = await_harness().await;

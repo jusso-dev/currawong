@@ -34,7 +34,7 @@ url = "2"
 ipnet = "2"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
-aes-gcm = "0.10"
+aes-gcm = { version = "0.10", features = ["zeroize"] }
 argon2 = "0.5"
 rusqlite = { version = "0.32", features = ["bundled"] }
 governor = "0.8"
@@ -70,3 +70,10 @@ webpki-roots = "1"
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
 proptest = "1"
+
+# RSA-2048 key generation is very slow unoptimised, and tests generate keys.
+[profile.dev.package.rsa]
+opt-level = 3
+
+[profile.dev.package.num-bigint-dig]
+opt-level = 3

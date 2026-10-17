@@ -50,6 +50,7 @@ dependencies = [
  "ctr",
  "ghash",
  "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -1086,6 +1087,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bytes",
+ "currawong-auth",
  "currawong-core",
  "currawong-spool",
  "dashmap",
@@ -1172,6 +1174,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

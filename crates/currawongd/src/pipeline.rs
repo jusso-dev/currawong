@@ -1,5 +1,5 @@
 //! Auth, parse, scan and the policy decision.
-use currawong_auth::AuthChecker;
+use currawong_auth::{strip_forged, AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
@@ -23,6 +23,8 @@ pub struct Pipeline {
     /// YARA is configured but its rules could not be loaded: fail closed.
     pub yara_error: Option<String>,
     _yara_watch: Option<PollWatcher>,
+    /// DKIM and ARC keys. `None` means nothing is signed or sealed.
+    pub keys: Option<Arc<KeyStore>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
 }
@@ -59,8 +61,105 @@ impl Pipeline {
             yara,
             yara_error,
             _yara_watch,
+            keys: None,
             policies: default_pack().clone(),
             policy_stamp: None,
+        }
+    }
+
+    pub fn with_keys(mut self, keys: KeyStore) -> Self {
+        self.keys = Some(Arc::new(keys));
+        self
+    }
+
+    /// Forged Authentication-Results left in older spool files (accepted
+    /// before DATA stripped them) are removed from `body_path` too, so they
+    /// are never delivered. Returns the cleaned bytes.
+    pub async fn strip_spooled(
+        &self,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> Result<Vec<u8>, String> {
+        let cleaned = strip_forged(raw, self.auth.authserv_id());
+        if cleaned.len() != raw.len() {
+            if let Some(path) = body_path {
+                rewrite_body(path, &cleaned)
+                    .await
+                    .map_err(|err| format!("could not strip forged headers: {err}"))?;
+            }
+        }
+        Ok(cleaned)
+    }
+
+    /// Our Authentication-Results, for inbound mail only: on outbound mail
+    /// it would leak internal addresses and attest a meaningless SPF result.
+    pub fn auth_headers(&self, env: &Envelope, report: &ScanReport) -> Vec<String> {
+        match env.direction {
+            Direction::Inbound => report.auth.iter().map(auth_header).collect(),
+            Direction::Outbound => Vec::new(),
+        }
+    }
+
+    /// Headers the deliverer prepends. Inbound: Authentication-Results, plus
+    /// an ARC set when a stage modified the message. Outbound: DKIM
+    /// signatures with the tenant's active keys. Replaces any earlier set so
+    /// re-evaluating deferred mail never stacks. `Err` when the tenant has a
+    /// key but signing failed.
+    pub async fn delivery_headers(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &ScanReport,
+    ) -> Result<Vec<String>, String> {
+        if env.direction == Direction::Inbound {
+            if report.modified {
+                if let Some(sealer) = self.arc_sealer().await {
+                    let sealed = self.auth.check_and_seal(raw, env, Some(&sealer)).await;
+                    return Ok(vec![sealed.header]);
+                }
+            }
+            return Ok(self.auth_headers(env, report));
+        }
+        let (Some(keys), Some(tenant), true) =
+            (&self.keys, &env.tenant_id, self.cfg.dkim.sign_outbound)
+        else {
+            return Ok(Vec::new());
+        };
+        let (keys, tenant_id, owned) = (Arc::clone(keys), tenant.clone(), raw.to_vec());
+        let signed = tokio::task::spawn_blocking(move || {
+            currawong_auth::sign_outbound(&keys, &owned, &tenant_id)
+        })
+        .await
+        .map_err(|err| err.to_string())??;
+        if signed.is_empty() {
+            tracing::warn!(id = %env.id, %tenant, "no active DKIM key for sender domain");
+            return Ok(Vec::new());
+        }
+        Ok(vec![signed])
+    }
+
+    /// Active gateway key for the authserv-id domain, RSA first because
+    /// RFC 8617 verifiers are only required to support rsa-sha256.
+    async fn arc_sealer(&self) -> Option<StoredKey> {
+        if !self.cfg.dkim.seal_arc {
+            return None;
+        }
+        let keys = Arc::clone(self.keys.as_ref()?);
+        let domain = self.auth.authserv_id().to_string();
+        let found =
+            tokio::task::spawn_blocking(move || keys.signing_keys(GATEWAY_TENANT, &domain, now()))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|found| found);
+        match found {
+            Ok(mut found) => {
+                found.sort_by_key(|key| key.algorithm != "rsa-sha256");
+                found.into_iter().next()
+            }
+            Err(err) => {
+                tracing::error!(%err, "ARC key lookup failed");
+                None
+            }
         }
     }
 
@@ -123,6 +222,14 @@ impl Pipeline {
     ) -> (ScanReport, MessageDecision) {
         let mut report = ScanReport::new(env.id.clone());
         let auth = self.auth.check(raw, env).await;
+        // The DMARC record could not be fetched, so its policy is unknown:
+        // retry rather than deliver a possible p=reject spoof.
+        if auth.dmarc.result == "temperror" {
+            report.defer = true;
+            report
+                .notes
+                .push("dmarc temperror: policy DNS unreachable".into());
+        }
         report.auth = Some(auth);
         if !self.cfg.scanner.enabled {
             let decision = self.decide(env, &report);
@@ -193,7 +300,7 @@ impl Pipeline {
         let combined = combine(&outputs, parser_failed);
         report.malware = combined.malware;
         report.active_content = report.active_content || combined.active_content;
-        report.defer = combined.defer;
+        report.defer = report.defer || combined.defer;
         report.fail_closed = combined.fail_closed;
         report.notes.extend(combined.notes);
         for output in &outputs {
@@ -365,4 +472,21 @@ fn domain_of(address: &str) -> String {
 
 pub fn auth_header(auth: &AuthResults) -> String {
     auth.header.clone()
+}
+
+/// Atomically replace a spool body (write beside it, fsync, rename).
+async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let tmp = path.with_extension("eml.strip");
+    let mut file = tokio::fs::File::create(&tmp).await?;
+    file.write_all(bytes).await?;
+    file.sync_all().await?;
+    tokio::fs::rename(&tmp, path).await
+}
+
+fn now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
 }
