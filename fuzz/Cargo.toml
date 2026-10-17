@@ -1,0 +1,67 @@
+[package]
+name = "currawong-fuzz"
+version = "0.0.1"
+edition = "2021"
+publish = false
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+currawong-smtp = { path = "../crates/smtp" }
+currawong-parser-worker = { path = "../crates/parser-worker" }
+currawong-scan = { path = "../crates/scan" }
+currawong-dlp = { path = "../crates/dlp" }
+
+[[bin]]
+name = "smtp_command"
+path = "fuzz_targets/smtp_command.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smtp_data"
+path = "fuzz_targets/smtp_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mime_parse"
+path = "fuzz_targets/mime_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "archive_extract"
+path = "fuzz_targets/archive_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pspf_parse"
+path = "fuzz_targets/pspf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "url_rewrite"
+path = "fuzz_targets/url_rewrite.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dlp_scan"
+path = "fuzz_targets/dlp_scan.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

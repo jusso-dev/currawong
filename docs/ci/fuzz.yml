@@ -1,0 +1,32 @@
+# Nightly fuzz. Move to .github/workflows/fuzz.yml with the rest of CI.
+name: fuzz
+on:
+  schedule:
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - smtp_command
+          - smtp_data
+          - mime_parse
+          - archive_extract
+          - pspf_parse
+          - url_rewrite
+          - dlp_scan
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz
+      - run: ./scripts/seed-fuzz.sh
+      - working-directory: fuzz
+        run: cargo +nightly fuzz run ${{ matrix.target }} -- -max_total_time=600 -rss_limit_mb=512
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/

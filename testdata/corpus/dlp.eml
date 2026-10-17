@@ -1,0 +1,7 @@
+From: payroll@example.test
+To: b@example.test
+Subject: sample identifier
+X-Protective-Marking: OFFICIAL
+Date: Wed, 14 Oct 2026 01:00:00 +0000
+
+Published TFN checksum sample only: 123456782. DLP blocking is M2.

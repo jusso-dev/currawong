@@ -6,3 +6,39 @@ license.workspace = true
 
 [dependencies]
 currawong-core = { path = "../core" }
+currawong-spool = { path = "../spool" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+ipnet = { workspace = true }
+governor = { workspace = true }
+rusqlite = { workspace = true }
+argon2 = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+time = { workspace = true }
+mail-send = { workspace = true }
+mail-builder = { workspace = true }
+hickory-resolver = { workspace = true, features = ["tokio", "system-config"] }
+pin-project-lite = { workspace = true }
+rand = { workspace = true }
+metrics = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+currawong-core = { path = "../core" }

@@ -1,0 +1,186 @@
+# Currawong example configuration.
+# Every key is documented here. `currawongd --check-config` loads this file.
+# Australian residency is the default. Message content is not sent off-box.
+
+# log.format: "json" or "pretty".
+# log.level: tracing filter used when RUST_LOG is unset.
+[log]
+format = "json"
+level = "info"
+
+# metrics.listen: Prometheus /metrics plus /healthz and /readyz.
+[metrics]
+listen = "127.0.0.1:9090"
+
+# limits.max_message_bytes: at least 1 MiB. Default is 50 MiB.
+# limits.max_recipients: recipients accepted in one transaction.
+# limits.smtp_command_timeout_secs: idle timeout between SMTP commands.
+# limits.max_connections: process-wide connection cap.
+# limits.max_line_bytes: RFC 5321 line limit, excluding the line ending.
+# limits.max_connections_per_ip: per-address connection cap.
+[limits]
+max_message_bytes = 52428800
+max_recipients = 100
+smtp_command_timeout_secs = 300
+max_connections = 1000
+max_line_bytes = 1000
+max_connections_per_ip = 20
+
+# spool.dir: absolute path. The 250 reply is sent only after an fsync.
+[spool]
+dir = "/var/spool/currawong"
+
+# listeners.bind: host:port. Port 0 is rejected by --check-config.
+# listeners.mode: plain, starttls or implicit.
+# listeners.role: inbound (port 25) or submission (587/465).
+[[listeners]]
+name = "inbound"
+bind = "0.0.0.0:25"
+mode = "starttls"
+role = "inbound"
+
+[[listeners]]
+name = "submission"
+bind = "0.0.0.0:587"
+mode = "starttls"
+role = "submission"
+
+[[listeners]]
+name = "submissions"
+bind = "0.0.0.0:465"
+mode = "implicit"
+role = "submission"
+
+# tls.cert and tls.key: PEM paths. Reloaded on SIGHUP.
+# tls.acme is optional and is not required for M1. Leave it unset unless
+# the binary was built with the acme feature. ACME does not carry message content.
+[tls]
+cert = "/etc/currawong/cert.pem"
+key = "/etc/currawong/key.pem"
+
+# scanner.enabled: isolated parser workers and the malware engines.
+# scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
+# scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310. Empty disables ClamAV.
+# scanner.clamd.required: an unreachable required engine fails closed (defer).
+# scanner.extra_signature_dirs: on-premises supplemental signatures. Configure
+# clamd to load these as well (OfficialDatabaseOnly no). Mail stays on the box.
+# scanner.extra_database_paths: extra .cvd/.cld/.ndb files for the same purpose.
+# scanner.blocked_extensions: active content even when ClamAV is clean.
+# scanner.treat_macros_as_active / treat_executables_as_active: file-type policy.
+# scanner.extract.*: archive limits (depth, uncompressed bytes, files, ratio).
+[scanner]
+enabled = true
+worker_pool_size = 2
+max_jobs_per_worker = 500
+worker_memory_mib = 512
+worker_cpu_secs = 30
+job_timeout_secs = 30
+blocked_extensions = [
+  "exe", "scr", "js", "jse", "vbs", "vbe", "wsf", "wsh", "hta", "lnk", "iso",
+  "one", "bat", "cmd", "com", "msi", "dll", "ps1", "jar", "cpl", "msc", "reg",
+  "pif", "gadget", "application", "msp", "msix", "appx",
+]
+treat_macros_as_active = true
+treat_executables_as_active = true
+extra_signature_dirs = []
+extra_database_paths = []
+
+[scanner.clamd]
+address = ""
+required = true
+
+[scanner.extract]
+max_depth = 5
+max_uncompressed_bytes = 209715200
+max_files = 1000
+max_ratio = 100
+
+# residency.mode: "au" (default) or "off".
+# residency.allowed_host_suffixes: Sydney and Melbourne object-storage names.
+# residency.allowed_names: exact hostnames, never a GeoIP lookup.
+# residency.allowed_cidrs: on-premises ranges.
+# residency.content_endpoints: sandbox, LLM, object store and webhook URLs
+# checked at startup. A us-east-1 bucket fails in au mode.
+# residency.overrides: audited exceptions (url, reason, approved_by).
+# residency.signing_key_path: Ed25519 key for the residency report.
+# residency.report_dir: where signed monthly reports are written.
+[residency]
+mode = "au"
+allowed_host_suffixes = [
+  "s3.ap-southeast-2.amazonaws.com",
+  "s3.ap-southeast-4.amazonaws.com",
+]
+allowed_names = ["localhost"]
+allowed_cidrs = [
+  "127.0.0.0/8",
+  "::1/128",
+  "10.0.0.0/8",
+  "192.168.0.0/16",
+  "172.16.0.0/12",
+]
+content_endpoints = []
+overrides = []
+report_dir = "/var/lib/currawong/residency"
+
+# gateway.hostname: EHLO name and Received header.
+[gateway]
+hostname = "currawong.example.test"
+
+# domains.accept: recipient domains. Anything else is relaying and needs auth.
+# domains.routes: per-domain next hop, host or host:port, instead of MX.
+[domains]
+accept = ["example.test"]
+
+[[domains.routes]]
+domain = "example.test"
+next_hop = "127.0.0.1:2526"
+
+# delivery.poll_secs: how often deferred mail is retried.
+# delivery.max_age_days: then a DSN, never to the null sender.
+# delivery.require_tls: hook only. MTA-STS and DANE are not enforced in M1.
+[delivery]
+poll_secs = 30
+max_age_days = 5
+require_tls = false
+
+# checks.*_enabled: each pre-DATA check can be turned off.
+# checks.allow_cidrs: skip DNSBL, greylisting and reputation.
+# Put published Microsoft and Google outbound ranges here; do not hard-code a
+# stale copy into the binary.
+# checks.dnsbl: zone, optional dqs_key (never logged) and 127.0.0.x codes.
+[checks]
+dnsbl_enabled = false
+ratelimit_enabled = true
+greylist_enabled = true
+reputation_enabled = true
+greylist_delay_secs = 300
+greylist_database = "/var/lib/currawong/greylist.sqlite"
+allow_cidrs = []
+rate_per_minute_ip = 60
+rate_per_minute_net = 300
+rate_per_minute_sender = 120
+reputation_reject_score = 100.0
+reputation_half_life_secs = 86400
+dnsbl = []
+
+# relay.database: argon2 SMTP AUTH credentials.
+# relay.tenants: trusted CIDRs and the domains that tenant may send as.
+[relay]
+database = "/var/lib/currawong/relay.sqlite"
+
+[[relay.tenants]]
+id = "example"
+domains = ["example.test"]
+trusted_cidrs = ["10.0.0.0/8"]
+
+# dkim.kek_path: 32-byte AES-GCM key file. Private keys are encrypted at rest.
+# dkim.sign_outbound / seal_arc: outbound signing and ARC when we modify mail.
+[dkim]
+database = "/var/lib/currawong/dkim.sqlite"
+kek_path = "/etc/currawong/dkim.kek"
+sign_outbound = true
+seal_arc = true
+
+# auth.authserv_id: Authentication-Results identity. Forged copies are removed.
+[auth]
+authserv_id = "currawong.example.test"

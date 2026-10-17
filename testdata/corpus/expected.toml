@@ -1,0 +1,25 @@
+# Honest M1 verdicts. Spam, phish, BEC and DLP are not blocking decisions yet.
+
+[clean]
+file = "clean.eml"
+verdict = "deliver"
+
+[spam]
+file = "spam.eml"
+verdict = "deliver"
+
+[phish]
+file = "phish.eml"
+verdict = "deliver"
+
+[bec]
+file = "bec.eml"
+verdict = "deliver"
+
+[dlp]
+file = "dlp.eml"
+verdict = "deliver"
+
+[eicar]
+file = "generated-at-test-time"
+verdict = "quarantine"

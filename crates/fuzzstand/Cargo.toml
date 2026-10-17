@@ -1,0 +1,12 @@
+[package]
+name = "currawong-fuzzstand"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "cargo test stand-in for the cargo-fuzz targets. Does not need libfuzzer."
+
+[dependencies]
+currawong-smtp = { path = "../smtp" }
+currawong-parser-worker = { path = "../parser-worker" }
+currawong-scan = { path = "../scan" }
+currawong-dlp = { path = "../dlp" }

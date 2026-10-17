@@ -1,0 +1,12 @@
+services:
+  clamd:
+    image: clamav/clamav:stable
+    ports:
+      - "3310:3310"
+    volumes:
+      - clamav:/var/lib/clamav
+      # Mount supplemental on-premises signatures here and set
+      # OfficialDatabaseOnly no in clamd.conf. Mail is not uploaded.
+
+volumes:
+  clamav:

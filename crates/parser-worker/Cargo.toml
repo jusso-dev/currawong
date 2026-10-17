@@ -1,0 +1,42 @@
+[package]
+name = "currawong-parser-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "currawong_parser"
+path = "src/lib.rs"
+
+[[bin]]
+name = "currawong-parser-worker"
+path = "src/main.rs"
+
+[dependencies]
+currawong-core = { path = "../core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+mail-parser = { workspace = true }
+infer = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+zip = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
+cfb = { workspace = true }
+rlimit = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = "0.4"
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true }
+zip = { workspace = true }

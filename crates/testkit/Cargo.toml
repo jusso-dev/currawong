@@ -1,0 +1,19 @@
+[package]
+name = "currawong-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+currawong-core = { path = "../core" }
+currawong-smtp = { path = "../smtp" }
+currawong-spool = { path = "../spool" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+mail-send = { workspace = true }
+rustls = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
