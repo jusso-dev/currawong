@@ -1,10 +1,14 @@
 //! SPF, DKIM, DMARC and ARC. DNS answers in tests come from [`TxtCache`].
+pub mod bimi;
 mod cache;
+pub mod dmarc_report;
 mod keys;
 mod sign;
 mod strip;
 
+pub use bimi::{Bimi, TxtLookup, VmcStatus};
 pub use cache::TxtCache;
+pub use dmarc_report::{DmarcEvent, DmarcEventStore, OutgoingReport};
 pub use keys::{generate, now_secs, publishable, KeyStore, StoredKey, GATEWAY_TENANT};
 pub use sign::{sign, sign_message, sign_outbound};
 pub use strip::strip_forged;
@@ -121,9 +125,31 @@ impl AuthChecker {
         env: &Envelope,
         sealer: Option<&StoredKey>,
     ) -> AuthResults {
+        self.evaluate_and_seal(raw, env, sealer, false)
+            .await
+            .results
+    }
+
+    /// Results, plus the aggregate report row when `report` is set and the
+    /// author domain publishes DMARC.
+    pub async fn evaluate(&self, raw: &[u8], env: &Envelope, report: bool) -> Evaluation {
+        self.evaluate_and_seal(raw, env, None, report).await
+    }
+
+    /// [`Self::check_and_seal`] and [`Self::evaluate`] in one pass.
+    async fn evaluate_and_seal(
+        &self,
+        raw: &[u8],
+        env: &Envelope,
+        sealer: Option<&StoredKey>,
+        report: bool,
+    ) -> Evaluation {
         let stripped = strip_forged(raw, &self.authserv_id);
         let Some(message) = AuthenticatedMessage::parse(&stripped) else {
-            return empty(&self.authserv_id);
+            return Evaluation {
+                results: empty(&self.authserv_id),
+                dmarc_event: None,
+            };
         };
         let dkim_params = Parameters::new(&message).with_txt_cache(&self.cache.dkim);
         let dkim = self.resolver.verify_dkim(dkim_params).await;
@@ -165,7 +191,22 @@ impl AuthChecker {
                 Err(err) => tracing::warn!(%err, "ARC seal skipped"),
             }
         }
-        AuthResults {
+        // The domain only: a bare local part must not reach a report.
+        let envelope_from = if env.mail_from.is_empty() {
+            helo
+        } else {
+            env.mail_from
+                .rsplit_once('@')
+                .map(|(_, domain)| domain)
+                .unwrap_or("")
+        };
+        let dmarc_event = if report {
+            self.dmarc_event(env, envelope_from, &dkim, &spf, &dmarc)
+                .await
+        } else {
+            None
+        };
+        let results = AuthResults {
             spf: spf_method(spf.result()),
             dkim: dkim
                 .iter()
@@ -182,9 +223,20 @@ impl AuthChecker {
             // From the evaluated DMARC record, never from header text: our
             // header echoes the attacker-controlled MAIL FROM.
             dmarc_policy: policy_label(dmarc.policy()).into(),
+            dmarc_domain: dmarc.domain().to_ascii_lowercase(),
             header,
+        };
+        Evaluation {
+            results,
+            dmarc_event,
         }
     }
+}
+
+pub struct Evaluation {
+    pub results: AuthResults,
+    /// Present when the author domain publishes a DMARC record.
+    pub dmarc_event: Option<DmarcEvent>,
 }
 
 fn empty(authserv_id: &str) -> AuthResults {
@@ -194,6 +246,7 @@ fn empty(authserv_id: &str) -> AuthResults {
         dmarc: AuthMethodResult::none(),
         arc: AuthMethodResult::none(),
         dmarc_policy: String::new(),
+        dmarc_domain: String::new(),
         header: format!("Authentication-Results: {authserv_id}; none\r\n"),
     }
 }
@@ -247,6 +300,9 @@ fn public_key_tag(record: &str) -> Option<String> {
     })
 }
 
+/// Taken from the verifier, never reparsed from header text: a MAIL FROM
+/// such as `x@policy.dmarc=reject` lands in the header before the DMARC part.
+/// Empty when no record applied.
 fn policy_label(policy: Policy) -> &'static str {
     match policy {
         Policy::None => "none",
@@ -274,4 +330,9 @@ pub fn seed_txt(cache: &TxtCache, name: &str, record: &str) -> Result<(), String
     };
     cache.insert_record(name, value);
     Ok(())
+}
+
+/// Make `name` answer with a temporary DNS failure. For tests.
+pub fn seed_txt_error(cache: &TxtCache, name: &str) {
+    cache.insert_error(name);
 }

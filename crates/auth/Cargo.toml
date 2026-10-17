@@ -24,8 +24,10 @@ pkcs8 = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true }
 ed25519-dalek = { workspace = true }
+flate2 = { workspace = true }

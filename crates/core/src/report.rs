@@ -26,6 +26,10 @@ pub struct AuthResults {
     pub arc: AuthMethodResult,
     /// `p=none`, `p=quarantine` or `p=reject` when a DMARC record was found.
     pub dmarc_policy: String,
+    /// RFC 5322 From domain the DMARC result applies to, from the verifier
+    /// rather than reparsed header text. Empty when DMARC was not evaluated.
+    #[serde(default)]
+    pub dmarc_domain: String,
     pub header: String,
 }
 

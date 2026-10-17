@@ -75,10 +75,12 @@ async fn classify_one(
     let body_path = spool_body(spool, &env);
     let raw = pipeline.strip_spooled(&raw, body_path.as_deref()).await?;
     let plan_path = plan_path(spool, &env.id);
+    let mut bimi_auth = None;
     let plan = match tokio::fs::read(&plan_path).await {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
         Err(_) => {
             let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            bimi_auth = report.auth.clone();
             let mut groups: Vec<Vec<Decision>> = decision
                 .split()
                 .into_iter()
@@ -153,7 +155,13 @@ async fn classify_one(
         spool.update(&env).await.map_err(|err| err.to_string())?;
         let _ = tokio::fs::remove_file(&plan_path).await;
     }
-    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await
+    let id = env.id.clone();
+    let quarantined = matches!(plan.groups[0][0].verdict, Verdict::Quarantine { .. });
+    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await?;
+    if let (true, Some(auth)) = (quarantined, bimi_auth) {
+        pipeline.queue_bimi(id, auth);
+    }
+    Ok(())
 }
 
 async fn act(

@@ -76,6 +76,15 @@ impl TxtCache {
         };
         cache.put(canonical(name).into_boxed_str(), value, None);
     }
+
+    /// Seed a temporary DNS failure for `name` in all three caches. Only
+    /// seeding stores failures; resolver answers that fail are never cached.
+    pub(crate) fn insert_error(&self, name: &str) {
+        for cache in [&self.spf, &self.dkim, &self.dmarc] {
+            let error = Txt::Error(Error::Dns(DnsError::Resolver("timed out".into())));
+            cache.put(canonical(name).into_boxed_str(), error, None);
+        }
+    }
 }
 
 struct Slot {
@@ -145,9 +154,6 @@ impl TypedCache {
     }
 
     fn put(&self, key: Box<str>, value: Txt, expires: Option<Instant>) {
-        if !self.kind.accepts(&value) {
-            return;
-        }
         let mut lru = self.inner.lock().expect("txt cache");
         lru.remove(&*key);
         while lru.slots.len() >= self.capacity {
@@ -215,6 +221,9 @@ impl ResolverCache<Box<str>, Txt> for TypedCache {
     }
 
     fn insert(&self, key: Box<str>, value: Txt, valid_until: Instant) {
+        if !self.kind.accepts(&value) {
+            return;
+        }
         let now = Instant::now();
         let expires = valid_until.clamp(now + MIN_TTL, now + MAX_TTL);
         self.put(key, value, Some(expires));

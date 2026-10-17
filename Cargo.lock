@@ -913,6 +913,7 @@ dependencies = [
  "currawong-core",
  "currawong-spool",
  "ed25519-dalek",
+ "flate2",
  "mail-auth",
  "mail-parser",
  "pkcs8",
@@ -927,6 +928,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -1134,6 +1136,7 @@ dependencies = [
  "currawong-scan",
  "currawong-smtp",
  "currawong-spool",
+ "futures",
  "hex",
  "serde",
  "serde_json",

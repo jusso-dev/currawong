@@ -205,8 +205,31 @@ sign_outbound = true
 seal_arc = true
 
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
+# auth.bimi: look up BIMI logos (default._bimi.<domain>) for quarantined mail
+# that passes DMARC at p=quarantine or p=reject. VMC certificates are flagged,
+# not verified.
 [auth]
 authserv_id = "currawong.example.test"
+bimi = false
+
+# auth.dmarc_reports: daily DMARC aggregate (RUA) reports for each sending
+# domain, gzipped XML per RFC 9990, sent an hour after each UTC day ends. A rua
+# address outside the policy domain is only used when it publishes
+# <domain>._report._dmarc.<host>. Our own domains, IP literals and addresses
+# whose MX is internal are refused. The max_* caps bound what a hostile DMARC
+# record can make the gateway send. Failure (RUF) reports are never sent.
+[auth.dmarc_reports]
+enabled = false
+database = "/var/lib/currawong/dmarc.sqlite"
+org_name = "Example Pty Ltd"
+email = "dmarc-reports@currawong.example.test"
+max_rua_per_record = 5
+max_domains_per_day = 5000
+max_domains_per_org = 20
+max_events_per_domain_day = 100000
+max_rows_per_report = 1000
+max_report_bytes = 5242880
+retention_days = 7
 
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.

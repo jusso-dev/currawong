@@ -1,5 +1,7 @@
 //! Auth, parse, scan and the policy decision.
-use currawong_auth::{strip_forged, AuthChecker, KeyStore, StoredKey, GATEWAY_TENANT};
+use currawong_auth::{
+    strip_forged, AuthChecker, DmarcEventStore, KeyStore, StoredKey, GATEWAY_TENANT,
+};
 use currawong_core::{
     config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
 };
@@ -25,6 +27,10 @@ pub struct Pipeline {
     _yara_watch: Option<PollWatcher>,
     /// DKIM and ARC keys. `None` means nothing is signed or sealed.
     pub keys: Option<Arc<KeyStore>>,
+    /// Where inbound DMARC results go for aggregate reports.
+    pub dmarc_events: Option<DmarcEventStore>,
+    /// Quarantined mail waiting for a BIMI lookup on the background worker.
+    pub bimi_jobs: Option<tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
 }
@@ -62,6 +68,8 @@ impl Pipeline {
             yara_error,
             _yara_watch,
             keys: None,
+            dmarc_events: None,
+            bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
         }
@@ -163,6 +171,27 @@ impl Pipeline {
         }
     }
 
+    pub fn with_dmarc_events(mut self, store: DmarcEventStore) -> Self {
+        self.dmarc_events = Some(store);
+        self
+    }
+
+    pub fn with_bimi(mut self, jobs: tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>) -> Self {
+        self.bimi_jobs = Some(jobs);
+        self
+    }
+
+    /// Hand a quarantined message to the BIMI worker without waiting. When
+    /// the queue is full the lookup is skipped: a logo is a nicety.
+    pub fn queue_bimi(&self, id: currawong_core::MessageId, auth: AuthResults) {
+        let Some(jobs) = &self.bimi_jobs else {
+            return;
+        };
+        if jobs.try_send(crate::dmarc::BimiJob { id, auth }).is_err() {
+            tracing::debug!("BIMI queue full, lookup skipped");
+        }
+    }
+
     pub fn with_policies(mut self, policies: PolicySet) -> Self {
         self.policies = policies;
         self
@@ -221,7 +250,16 @@ impl Pipeline {
         body_path: Option<&Path>,
     ) -> (ScanReport, MessageDecision) {
         let mut report = ScanReport::new(env.id.clone());
-        let auth = self.auth.check(raw, env).await;
+        let wants_event = self.dmarc_events.is_some() && env.direction == Direction::Inbound;
+        let auth = self.auth.evaluate(raw, env, wants_event).await;
+        // Recorded once per message id, however often a deferred message is
+        // classified again.
+        if let (Some(store), Some(event)) = (&self.dmarc_events, &auth.dmarc_event) {
+            if let Err(err) = store.record(event) {
+                tracing::warn!(id = %env.id, %err, "dmarc event not recorded");
+            }
+        }
+        let auth = auth.results;
         // The DMARC record could not be fetched, so its policy is unknown:
         // retry rather than deliver a possible p=reject spoof.
         if auth.dmarc.result == "temperror" {

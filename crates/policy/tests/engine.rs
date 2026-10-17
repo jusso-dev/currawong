@@ -60,6 +60,7 @@ fn spoofed() -> AuthResults {
         dmarc: fail(),
         arc: AuthMethodResult::none(),
         dmarc_policy: "reject".into(),
+        dmarc_domain: "example.com.au".into(),
         header: String::new(),
     }
 }

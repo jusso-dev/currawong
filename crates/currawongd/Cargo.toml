@@ -15,6 +15,7 @@ currawong-policy = { path = "../policy" }
 currawong-quarantine = { path = "../quarantine" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
+futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { workspace = true }
