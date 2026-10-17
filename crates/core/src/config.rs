@@ -1174,6 +1174,9 @@ impl Config {
                 "user_release_queues may not include {queue:?}: only administrators release it"
             ));
         }
+        if q.digests && q.listen.is_none() {
+            return bad("listen must be set when digests are on, or the links lead nowhere".into());
+        }
         if q.digests && !q.link_base_url.starts_with("https://") {
             return bad("link_base_url must be an https:// URL when digests are on".into());
         }
@@ -1340,6 +1343,11 @@ mod tests {
         assert!(err.contains("user_release_queues"), "{err}");
         let mut cfg = Config::load(&example_path()).unwrap();
         cfg.quarantine.digests = true;
+        cfg.quarantine.link_base_url = "https://quarantine.example.test".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("listen"), "{err}");
+        cfg.quarantine.listen = Some("127.0.0.1:8025".into());
+        cfg.validate().unwrap();
         cfg.quarantine.link_base_url = "http://quarantine.example.test".into();
         assert!(cfg.validate().is_err());
         let mut cfg = Config::load(&example_path()).unwrap();

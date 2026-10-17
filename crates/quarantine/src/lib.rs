@@ -55,6 +55,10 @@ pub struct ListQuery {
     pub cursor: Option<String>,
     /// Default 100, at most 500.
     pub limit: Option<usize>,
+    /// Include released, deleted and expired items. Off by default: a list
+    /// shows what can still be acted on.
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -195,10 +199,12 @@ fn item_from_row(row: &rusqlite::Row) -> rusqlite::Result<Item> {
         score: row.get(7)?,
         reason: row.get(8)?,
         reasons: json(9)?,
-        direction: if direction == "outbound" {
-            Direction::Outbound
-        } else {
+        // Anything but "inbound" is treated as outbound, which end users
+        // can never act on.
+        direction: if direction == "inbound" {
             Direction::Inbound
+        } else {
+            Direction::Outbound
         },
         headers: json(11)?,
         created_at: row.get(12)?,
@@ -489,6 +495,15 @@ impl QuarantineStore {
                 "(created_at < {at} OR (created_at = {at} AND id < {id}))"
             ));
         }
+        if !query.all {
+            let mark = bind(
+                &mut args,
+                Value::Integer(OffsetDateTime::now_utc().unix_timestamp()),
+            );
+            clauses.push(format!(
+                "released_at IS NULL AND deleted_at IS NULL AND expires_at > {mark}"
+            ));
+        }
         let limit = query.limit.unwrap_or(100).clamp(1, 500);
         let filter = if clauses.is_empty() {
             String::new()
@@ -580,6 +595,22 @@ impl QuarantineStore {
                 detail,
             })
             .map_err(QuarantineError::Store)
+    }
+
+    /// The action has happened, so a failure here is logged, not returned:
+    /// the `_started` row already names it.
+    fn audit_done(
+        &self,
+        principal: &Principal,
+        item: &Item,
+        action: &str,
+        reason: Option<&str>,
+        detail: Option<String>,
+        now: i64,
+    ) {
+        if let Err(err) = self.audit(principal, item, action, reason, detail, now) {
+            tracing::error!(item = %item.id, %action, %err, "quarantine audit row not written");
+        }
     }
 
     /// Release or delete as `principal`. A release returns the spool id of
@@ -694,9 +725,11 @@ impl QuarantineStore {
     }
 
     /// Re-inject the original bytes for this one recipient, marked so the
-    /// scheduler delivers without policy. The audit row is written first; the
-    /// spool id derives from the item, so if a later step fails the item
-    /// stays held and a retry finishes the same release.
+    /// scheduler delivers without policy. `release_started` is audited
+    /// before anything changes and `release` once it is done. The spool id
+    /// derives from the item, so if a step fails the item stays held, the
+    /// trail shows a start without a finish, and a retry finishes the same
+    /// release.
     async fn release(
         &self,
         spool: &Spool,
@@ -707,12 +740,13 @@ impl QuarantineStore {
     ) -> Result<Option<MessageId>, QuarantineError> {
         let raw = self.blobs.get(&item.message_id).await.map_err(db)?;
         let env = release_envelope(item, now);
+        let detail = Some(env.id.to_string());
         self.audit(
             principal,
             item,
-            "release",
+            "release_started",
             reason,
-            Some(env.id.to_string()),
+            detail.clone(),
             now,
         )?;
         match spool.load(&env.id).await {
@@ -731,6 +765,7 @@ impl QuarantineStore {
                 params![item.id, now, principal.actor],
             )
             .map_err(db)?;
+        self.audit_done(principal, item, "release", reason, detail, now);
         tracing::info!(item = %item.id, released = %env.id, actor = %principal.actor, "quarantine item released");
         export::emit(export::Event::new(
             item.tenant_id.as_deref(),
@@ -744,8 +779,9 @@ impl QuarantineStore {
         Ok(Some(env.id))
     }
 
-    /// Audit first, then mark deleted. The bytes go once no recipient still
-    /// has the message held; a failed blob delete is left to the purge.
+    /// `delete_started`, mark deleted, `delete`. The bytes go once no
+    /// recipient still has the message held; a failed blob delete is left to
+    /// the purge.
     async fn delete(
         &self,
         principal: &Principal,
@@ -753,13 +789,14 @@ impl QuarantineStore {
         reason: Option<&str>,
         now: i64,
     ) -> Result<Option<MessageId>, QuarantineError> {
-        self.audit(principal, item, "delete", reason, None, now)?;
+        self.audit(principal, item, "delete_started", reason, None, now)?;
         self.conn()?
             .execute(
                 "UPDATE quarantine SET deleted_at = ?2, deleted_by = ?3 WHERE id = ?1",
                 params![item.id, now, principal.actor],
             )
             .map_err(db)?;
+        self.audit_done(principal, item, "delete", reason, None, now);
         self.drop_blob_if_done(&item.message_id).await;
         Ok(None)
     }

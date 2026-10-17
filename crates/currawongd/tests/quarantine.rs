@@ -227,8 +227,8 @@ async fn spam_released_from_a_digest_link_is_delivered_and_audited() {
     assert!(delivered.contains("buy now"), "{delivered}");
 
     let events = quarantine.audit_table().events().unwrap();
-    assert_eq!(events.len(), 1, "{events:?}");
-    assert_eq!(events[0].action, "release");
-    assert_eq!(events[0].actor, "user@example.test");
-    assert_eq!(events[0].detail.as_deref(), Some(released.id.as_str()));
+    let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(actions, ["release_started", "release"], "{events:?}");
+    assert_eq!(events[1].actor, "user@example.test");
+    assert_eq!(events[1].detail.as_deref(), Some(released.id.as_str()));
 }

@@ -13,6 +13,9 @@ use time::OffsetDateTime;
 
 const LAST_DIGEST: &str = "last_digest_at";
 
+/// Entries per digest or notice. The rest stay undigested for the next run.
+pub const MAX_ENTRIES: usize = 100;
+
 #[derive(Debug, Clone)]
 pub struct DigestSettings {
     pub from: String,
@@ -56,6 +59,8 @@ struct DigestHtml<'a> {
     recipient: &'a str,
     outbound: bool,
     entries: &'a [Entry],
+    /// Held items left for the next digest.
+    more: usize,
 }
 
 #[derive(Template)]
@@ -64,6 +69,7 @@ struct DigestText<'a> {
     recipient: &'a str,
     outbound: bool,
     entries: &'a [Entry],
+    more: usize,
 }
 
 /// At most once per `interval_hours`: one digest per recipient of held
@@ -71,8 +77,11 @@ struct DigestText<'a> {
 /// notice per internal sender of held outbound mail, without links (the
 /// external recipient must never be able to release what was held from
 /// them; an administrator decides). Ids derive from the items, so a retry
-/// after a crash finds the message instead of queueing a second one.
-/// Returns the number queued.
+/// after a crash finds the message instead of queueing a second one. Each
+/// message lists at most [`MAX_ENTRIES`]; the rest wait for the next run.
+/// Outbound holds from the null sender get no notice. A group that fails is
+/// logged and left undigested; the others still go. Returns the number
+/// queued.
 pub async fn send_digests(
     store: &QuarantineStore,
     spool: &Spool,
@@ -89,6 +98,11 @@ pub async fn send_digests(
     let mut groups: BTreeMap<(Option<String>, bool, String), Vec<Item>> = BTreeMap::new();
     for item in store.undigested(at)? {
         let key = match item.direction {
+            Direction::Outbound if null_sender(&item.sender) => {
+                // Nobody to tell; mark it so it is not looked at again.
+                store.mark_digested(std::slice::from_ref(&item.id), at)?;
+                continue;
+            }
             Direction::Outbound => (item.tenant_id.clone(), true, item.sender.clone()),
             Direction::Inbound if store.user_queue(&item.queue) => {
                 (item.tenant_id.clone(), false, item.recipient.clone())
@@ -97,70 +111,113 @@ pub async fn send_digests(
         };
         groups.entry(key).or_default().push(item);
     }
-    let ttl = i64::try_from(settings.link_ttl_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
     let mut sent = 0;
-    for ((tenant_id, outbound, recipient), items) in groups {
-        let entries: Vec<Entry> = items
-            .iter()
-            .map(|item| {
-                let url = |action| {
-                    let token = signer.sign(&Link {
-                        item_id: item.id.clone(),
-                        recipient: item.recipient.clone(),
-                        action,
-                        expires_at: at.saturating_add(ttl).min(item.expires_at),
-                    });
-                    format!("{}/quarantine/link/{token}", settings.base_url)
-                };
-                Entry {
-                    address: if outbound {
-                        item.recipient.clone()
-                    } else {
-                        item.sender.clone()
-                    },
-                    subject: item.subject.clone(),
-                    queue: item.queue.clone(),
-                    received: received(item.created_at),
-                    release: (!outbound).then(|| url(LinkAction::Release)),
-                    delete: (!outbound).then(|| url(LinkAction::Delete)),
-                }
-            })
-            .collect();
-        let ids: Vec<String> = items.iter().map(|item| item.id.clone()).collect();
-        let id = MessageId(derived_id(&ids.join("\n"), "digest"));
-        match spool.load(&id).await {
-            Ok(_) => {}
-            Err(SpoolError::NotFound(_)) => {
-                let body = render(&id, &recipient, outbound, &entries, settings, at)?;
-                let env = envelope(id.clone(), tenant_id, &recipient, settings, now);
-                spool
-                    .accept(env, Cursor::new(body))
-                    .await
-                    .map_err(|err| QuarantineError::Store(err.to_string()))?;
+    for ((tenant_id, outbound, recipient), mut items) in groups {
+        let more = items.len().saturating_sub(MAX_ENTRIES);
+        items.truncate(MAX_ENTRIES);
+        let group = Group {
+            tenant_id,
+            outbound,
+            recipient: &recipient,
+            items: &items,
+            more,
+        };
+        match send_one(store, spool, signer, settings, group, now).await {
+            Ok(id) => {
+                tracing::info!(%id, count = items.len(), more, "quarantine digest queued");
+                sent += 1;
             }
-            Err(err) => return Err(QuarantineError::Store(err.to_string())),
+            Err(err) => {
+                tracing::error!(%recipient, %err, "quarantine digest not queued, will retry")
+            }
         }
-        store.mark_digested(&ids, at)?;
-        tracing::info!(%id, count = ids.len(), "quarantine digest queued");
-        sent += 1;
     }
     store.set_meta(LAST_DIGEST, &at.to_string())?;
     Ok(sent)
 }
 
+struct Group<'a> {
+    tenant_id: Option<String>,
+    outbound: bool,
+    recipient: &'a str,
+    items: &'a [Item],
+    more: usize,
+}
+
+async fn send_one(
+    store: &QuarantineStore,
+    spool: &Spool,
+    signer: &LinkSigner,
+    settings: &DigestSettings,
+    group: Group<'_>,
+    now: OffsetDateTime,
+) -> Result<MessageId, QuarantineError> {
+    let at = now.unix_timestamp();
+    let ttl = i64::try_from(settings.link_ttl_hours.saturating_mul(3600)).unwrap_or(i64::MAX);
+    let outbound = group.outbound;
+    let entries: Vec<Entry> = group
+        .items
+        .iter()
+        .map(|item| {
+            let url = |action| {
+                let token = signer.sign(&Link {
+                    item_id: item.id.clone(),
+                    recipient: item.recipient.clone(),
+                    action,
+                    expires_at: at.saturating_add(ttl).min(item.expires_at),
+                });
+                format!("{}/quarantine/link/{token}", settings.base_url)
+            };
+            Entry {
+                address: if outbound {
+                    item.recipient.clone()
+                } else {
+                    item.sender.clone()
+                },
+                subject: item.subject.clone(),
+                queue: item.queue.clone(),
+                received: received(item.created_at),
+                release: (!outbound).then(|| url(LinkAction::Release)),
+                delete: (!outbound).then(|| url(LinkAction::Delete)),
+            }
+        })
+        .collect();
+    let ids: Vec<String> = group.items.iter().map(|item| item.id.clone()).collect();
+    let id = MessageId(derived_id(&ids.join("\n"), "digest"));
+    match spool.load(&id).await {
+        Ok(_) => {}
+        Err(SpoolError::NotFound(_)) => {
+            let body = render(&id, &group, &entries, settings, at)?;
+            let env = envelope(id.clone(), group.tenant_id, group.recipient, settings, now);
+            spool
+                .accept(env, Cursor::new(body))
+                .await
+                .map_err(|err| QuarantineError::Store(err.to_string()))?;
+        }
+        Err(err) => return Err(QuarantineError::Store(err.to_string())),
+    }
+    store.mark_digested(&ids, at)?;
+    Ok(id)
+}
+
+fn null_sender(sender: &str) -> bool {
+    matches!(sender.trim(), "" | "<>")
+}
+
 fn render(
     id: &MessageId,
-    recipient: &str,
-    outbound: bool,
+    group: &Group<'_>,
     entries: &[Entry],
     settings: &DigestSettings,
     at: i64,
 ) -> Result<Vec<u8>, QuarantineError> {
+    let (recipient, outbound, more) = (group.recipient, group.outbound, group.more);
     let template = |err: askama::Error| QuarantineError::Store(err.to_string());
     let html = DigestHtml {
         recipient,
         outbound,
         entries,
+        more,
     }
     .render()
     .map_err(template)?;
@@ -168,10 +225,11 @@ fn render(
         recipient,
         outbound,
         entries,
+        more,
     }
     .render()
     .map_err(template)?;
-    let subject = match (outbound, entries.len()) {
+    let subject = match (outbound, entries.len() + more) {
         (true, 1) => "Quarantine notice: 1 message you sent was held".to_string(),
         (true, n) => format!("Quarantine notice: {n} messages you sent were held"),
         (false, 1) => "Quarantine digest: 1 message held for you".to_string(),

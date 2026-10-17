@@ -15,6 +15,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+
+const MAX_ENTRIES: usize = currawong_quarantine::digest::MAX_ENTRIES;
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
@@ -314,6 +316,7 @@ async fn end_users_get_403_on_virus_items() {
             ("denied:delete", "end_user"),
             ("denied:release", "auditor"),
             ("denied:release", "tenant_admin"),
+            ("release_started", "tenant_admin"),
             ("release", "tenant_admin"),
         ]
     );
@@ -630,9 +633,9 @@ async fn a_failed_audit_write_leaves_the_item_held_and_a_retry_completes() {
         .unwrap();
     assert_eq!(s.spool.list(SpoolState::Incoming).await.unwrap().len(), 1);
     let events = audit.events.lock().unwrap().clone();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].action, "release");
-    assert_eq!(events[0].detail.as_deref(), Some(released.as_str()));
+    let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(actions, ["release_started", "release"]);
+    assert_eq!(events[1].detail.as_deref(), Some(released.as_str()));
 }
 
 /// File blobs whose delete fails for one key.
@@ -796,8 +799,183 @@ async fn queue_names_are_canonical_and_virus_and_pspf_need_an_admin() {
             "denied:delete",
             "denied:release",
             "denied:delete",
+            "delete_started",
             "delete",
+            "release_started",
             "release"
         ]
     );
+}
+
+fn digest_text(body: &[u8]) -> String {
+    mail_parser::MessageParser::default()
+        .parse(body)
+        .unwrap()
+        .body_text(0)
+        .unwrap()
+        .into_owned()
+}
+
+fn numbered(n: usize) -> String {
+    format!("01ARZ3NDEKTSV4RRFFQ6{n:06}")
+}
+
+#[tokio::test]
+async fn digests_are_capped_and_the_rest_wait_for_the_next_run() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    for n in 0..MAX_ENTRIES + 5 {
+        s.store
+            .hold(&hold(&numbered(n), "spam", None), RAW, now)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let first = s.spool.list(SpoolState::Incoming).await.unwrap();
+    let text = digest_text(&s.spool.read_body(&first[0].id).await.unwrap());
+    assert_eq!(text.matches("Release: ").count(), MAX_ENTRIES);
+    assert!(
+        text.contains("5 more held messages are not listed"),
+        "{text}"
+    );
+
+    let later = now + Duration::hours(25);
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), later)
+            .await
+            .unwrap(),
+        1
+    );
+    let all = s.spool.list(SpoolState::Incoming).await.unwrap();
+    let second = all.iter().find(|env| env.id != first[0].id).unwrap();
+    let text = digest_text(&s.spool.read_body(&second.id).await.unwrap());
+    assert_eq!(text.matches("Release: ").count(), 5);
+    assert!(!text.contains("more held messages"), "{text}");
+}
+
+#[tokio::test]
+async fn an_unknown_direction_is_treated_as_outbound() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let ids = s
+        .store
+        .hold(&hold(SPAM_ID, "spam", None), RAW, now)
+        .await
+        .unwrap();
+    let conn = rusqlite::Connection::open(s._dir.path().join("held/quarantine.sqlite")).unwrap();
+    conn.execute("UPDATE quarantine SET direction = 'relay'", [])
+        .unwrap();
+    assert_eq!(
+        s.store.get(&ids[0]).unwrap().unwrap().direction,
+        Direction::Outbound
+    );
+    let user = principal("user@example.test", Role::EndUser, None);
+    let err = s
+        .store
+        .act(&s.spool, &user, &ids[0], LinkAction::Release, None, now)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, QuarantineError::Forbidden), "{err:?}");
+}
+
+#[tokio::test]
+async fn null_sender_outbound_holds_get_no_notice() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    for (id, sender) in [(SPAM_ID, ""), (VIRUS_ID, "<>")] {
+        let mut out = hold(id, "spam", Some("t1"));
+        out.direction = Direction::Outbound;
+        out.sender = sender.into();
+        s.store.hold(&out, RAW, now).await.unwrap();
+    }
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), now)
+            .await
+            .unwrap(),
+        0
+    );
+    let later = now + Duration::hours(25);
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), later)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(s.spool.list(SpoolState::Incoming).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn one_failing_digest_does_not_stop_the_others() {
+    use sha2::Digest;
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let broken = s
+        .store
+        .hold(&hold(SPAM_ID, "spam", Some("a-tenant")), RAW, now)
+        .await
+        .unwrap();
+    let mut other = hold(VIRUS_ID, "spam", Some("b-tenant"));
+    other.recipients = vec!["other@example.test".into()];
+    s.store.hold(&other, RAW, now).await.unwrap();
+    // A corrupt spool envelope under the first group's digest id makes that
+    // group fail.
+    let id =
+        hex::encode_upper(sha2::Sha256::digest(format!("{}\ndigest", broken[0])))[..26].to_string();
+    let incoming = s.spool.root().join("incoming");
+    std::fs::write(incoming.join(format!("{id}.json")), b"not json").unwrap();
+    std::fs::write(incoming.join(format!("{id}.eml")), RAW).unwrap();
+
+    assert_eq!(
+        send_digests(&s.store, &s.spool, &s.links, &settings(), now)
+            .await
+            .unwrap(),
+        1
+    );
+    let queued: Vec<_> = s
+        .spool
+        .list(SpoolState::Incoming)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|env| env.rcpt_to == ["other@example.test"])
+        .collect();
+    assert_eq!(queued.len(), 1);
+}
+
+#[tokio::test]
+async fn lists_show_held_items_unless_asked_for_all() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let ids = s
+        .store
+        .hold(&hold(SPAM_ID, "spam", None), RAW, now)
+        .await
+        .unwrap();
+    s.store
+        .hold(&hold(VIRUS_ID, "spam", None), RAW, now)
+        .await
+        .unwrap();
+    let admin = principal("root", Role::PlatformAdmin, None);
+    s.store
+        .act(&s.spool, &admin, &ids[0], LinkAction::Delete, None, now)
+        .await
+        .unwrap();
+    assert_eq!(
+        s.store
+            .list(&admin, &ListQuery::default())
+            .unwrap()
+            .items
+            .len(),
+        1
+    );
+    let all = ListQuery {
+        all: true,
+        ..ListQuery::default()
+    };
+    assert_eq!(s.store.list(&admin, &all).unwrap().items.len(), 2);
 }

@@ -28,6 +28,9 @@
 {% endfor %}
 </tbody>
 </table>
+{% if more > 0 %}
+<p>{{ more }} more held messages are not listed here. They will be in the next digest.</p>
+{% endif %}
 {% if outbound %}
 <p>Messages that are not released are removed automatically.</p>
 {% else %}
