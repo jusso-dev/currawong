@@ -6,28 +6,34 @@ use currawong_parser::{LoadRules, ParseRequest, ParseResponse};
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 
-struct Worker(Child);
+struct Worker {
+    child: Child,
+    /// The worker's stderr, shown if it dies mid-test.
+    stderr: std::path::PathBuf,
+}
 
 impl Worker {
     /// Started as the pool starts it: in its own directory (Landlock on
     /// Linux allows only `in/` and `out/`), and ready before the first job.
     fn spawn(dir: &std::path::Path) -> Self {
+        let stderr = dir.join("stderr");
         let child = Command::new(env!("CARGO_BIN_EXE_currawong-parser-worker"))
             .env_clear()
             .env("CURRAWONG_WORKER_DIR", dir)
+            .env("RUST_BACKTRACE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
             .spawn()
             .unwrap();
-        let mut worker = Self(child);
+        let mut worker = Self { child, stderr };
         let ready = worker.read();
         assert_eq!(ready.id, "ready", "{ready:?}");
         worker
     }
 
     fn send(&mut self, frame: &[u8]) -> ParseResponse {
-        let stdin = self.0.stdin.as_mut().unwrap();
+        let stdin = self.child.stdin.as_mut().unwrap();
         stdin
             .write_all(&(frame.len() as u32).to_be_bytes())
             .unwrap();
@@ -37,9 +43,13 @@ impl Worker {
     }
 
     fn read(&mut self) -> ParseResponse {
-        let stdout = self.0.stdout.as_mut().unwrap();
+        let stdout = self.child.stdout.as_mut().unwrap();
         let mut len = [0u8; 4];
-        stdout.read_exact(&mut len).unwrap();
+        if let Err(err) = stdout.read_exact(&mut len) {
+            let status = self.child.wait();
+            let stderr = std::fs::read_to_string(&self.stderr).unwrap_or_default();
+            panic!("worker gone ({err}), {status:?}:\n{stderr}");
+        }
         let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
         stdout.read_exact(&mut body).unwrap();
         serde_json::from_slice(&body).unwrap()
@@ -69,7 +79,7 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.0.kill();
+        let _ = self.child.kill();
     }
 }
 

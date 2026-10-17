@@ -10,7 +10,7 @@ read is appended to --log. Exits non-zero with a reason on any timeout.
   packaging/appliance/serial-expect.py --socket serial.sock --timeout 300 --complete
 
 --complete also logs in as root on the serial console and checks that
-currawongd is active and /healthz answers 200 inside the VM.
+currawongd and nftables are active and /healthz answers 200 inside the VM.
 """
 import argparse
 import re
@@ -114,8 +114,9 @@ def main():
     console.expect("#", "a root shell")
     console.send(
         "for i in $(seq 1 30); do curl -fsS http://127.0.0.1:9090/healthz >/dev/null && break; sleep 1; done; "
-        "if systemctl is-active --quiet currawongd && curl -fsS http://127.0.0.1:9090/healthz >/dev/null; "
-        "then echo HEALTHZ-$((6*7))-OK; else systemctl status currawongd --no-pager; echo HEALTHZ-$((6*7))-BAD; fi\r",
+        "if systemctl is-active --quiet currawongd nftables && curl -fsS http://127.0.0.1:9090/healthz >/dev/null; "
+        "then echo HEALTHZ-$((6*7))-OK; else systemctl status currawongd nftables --no-pager; "
+        "journalctl -b -u nftables --no-pager -n 50; echo HEALTHZ-$((6*7))-BAD; fi\r",
         pause=0.02,
     )
     console.expect("HEALTHZ-42-OK", "currawongd active and /healthz 200 in the VM", bad="HEALTHZ-42-BAD")

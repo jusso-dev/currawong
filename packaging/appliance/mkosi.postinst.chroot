@@ -7,7 +7,10 @@ set -e
 systemctl disable currawongd.service
 rm -f /etc/currawong/cert.pem /etc/currawong/key.pem
 
-# The wizard runs on the VGA console and the serial console.
+# The wizard runs on the VGA console and the serial console. It sets the
+# hostname and root password, so systemd's own first-boot prompt (which
+# blocks the console waiting for a key) is masked.
+systemctl mask systemd-firstboot.service
 systemctl enable currawong-firstboot@tty1.service currawong-firstboot@ttyS0.service
 systemctl enable systemd-networkd.service systemd-resolved.service \
     systemd-timesyncd.service nftables.service

@@ -11,6 +11,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # xmllint checks DMARC aggregate reports against testdata/dmarc/rua.xsd.
       - run: sudo apt-get install -y libxml2-utils
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo install cargo-deny --locked
       - run: cargo deny check
