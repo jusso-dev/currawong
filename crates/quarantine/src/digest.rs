@@ -172,6 +172,7 @@ fn envelope(
     Envelope {
         id,
         tenant_id,
+        authenticated_as: None,
         mail_from: settings.from.clone(),
         rcpt_to: vec![recipient.to_string()],
         received_at: now,

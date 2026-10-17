@@ -76,21 +76,23 @@ pub async fn classify_pending(
 
 /// A message released from quarantine is delivered without running policy
 /// again, so this one release cannot be quarantined a second time. The
-/// release itself is in the quarantine audit trail. Inbound mail keeps the
-/// headers it was held with; outbound mail is signed now.
+/// release itself is in the quarantine audit trail, and trains the Bayes
+/// classifier. Inbound mail keeps the headers it was held with; outbound
+/// mail is signed now.
 async fn deliver_released(
     spool: &Spool,
     pipeline: &Pipeline,
     mut env: Envelope,
 ) -> Result<(), String> {
+    let raw = spool
+        .read_body(&env.id)
+        .await
+        .map_err(|err| err.to_string())?;
     if env.direction == Direction::Outbound {
-        let raw = spool
-            .read_body(&env.id)
-            .await
-            .map_err(|err| err.to_string())?;
         let report = ScanReport::new(env.id.clone());
         env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
     }
+    pipeline.learn_released(&env, &raw).await;
     env.pipeline = "deliver".into();
     spool.update(&env).await.map_err(|err| err.to_string())?;
     tracing::info!(id = %env.id, "released from quarantine, policy skipped");
@@ -335,6 +337,8 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     let mut dsn = env.clone();
     dsn.id = derived_id(&env.id, "dsn");
     dsn.mail_from = String::new();
+    // The gateway sends the bounce; it is not the submitting user's mail.
+    dsn.authenticated_as = None;
     dsn.rcpt_to = vec![env.mail_from.clone()];
     dsn.received_at = OffsetDateTime::now_utc();
     dsn.remote_ip = std::net::Ipv4Addr::LOCALHOST.into();

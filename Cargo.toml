@@ -8,6 +8,11 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/jusso-dev/currawong"
 
+# DLP scans every outbound message. Optimise it in dev builds too so the
+# hostile-input time bounds in its tests hold; debug assertions stay on.
+[profile.dev.package.currawong-dlp]
+opt-level = 2
+
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -63,6 +68,13 @@ rsa = { version = "0.9", features = ["sha2", "pem"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
 zeroize = "1"
+pdf-extract = "0.12"
+calamine = { version = "0.36", default-features = false }
+unicode-security = "0.1"
+strsim = "0.11"
+psl = "2"
+idna = "1"
+regex = "1"
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
@@ -73,6 +85,15 @@ askama = "0.16"
 # 0.13 needs the digest 0.11 line; sha2 here is 0.10.
 hmac = "0.12"
 tower = { version = "0.5", features = ["util"] }
+# Only under object_store, through the residency-guarded connector.
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+
+# Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 # RSA-2048 key generation is very slow unoptimised, and tests generate keys.
 [profile.dev.package.rsa]

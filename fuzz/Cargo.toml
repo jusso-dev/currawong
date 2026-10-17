@@ -8,12 +8,13 @@ license = "MIT"
 [package.metadata]
 cargo-fuzz = true
 
+# Entry points live in crates/fuzzstand and the crates' fuzz modules, so the
+# stable `cargo test -p currawong-fuzzstand` runs the same code.
 [dependencies]
 libfuzzer-sys = "0.4"
 currawong-smtp = { path = "../crates/smtp" }
 currawong-parser-worker = { path = "../crates/parser-worker" }
-currawong-scan = { path = "../crates/scan" }
-currawong-dlp = { path = "../crates/dlp" }
+currawong-fuzzstand = { path = "../crates/fuzzstand" }
 
 [[bin]]
 name = "smtp_command"
@@ -25,6 +26,13 @@ bench = false
 [[bin]]
 name = "smtp_data"
 path = "fuzz_targets/smtp_data.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smtp_sasl"
+path = "fuzz_targets/smtp_sasl.rs"
 test = false
 doc = false
 bench = false
@@ -44,8 +52,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "office_detect"
+path = "fuzz_targets/office_detect.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pspf_parse"
 path = "fuzz_targets/pspf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dlp_scan"
+path = "fuzz_targets/dlp_scan.rs"
 test = false
 doc = false
 bench = false
@@ -58,8 +80,29 @@ doc = false
 bench = false
 
 [[bin]]
-name = "dlp_scan"
-path = "fuzz_targets/dlp_scan.rs"
+name = "auth_strip"
+path = "fuzz_targets/auth_strip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "clamd_address"
+path = "fuzz_targets/clamd_address.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parser_ipc"
+path = "fuzz_targets/parser_ipc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spool_envelope"
+path = "fuzz_targets/spool_envelope.rs"
 test = false
 doc = false
 bench = false

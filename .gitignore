@@ -1,5 +1,7 @@
 target/
 *.eml.tmp
 /spool/
+/fuzz/corpus/
+/fuzz/artifacts/
 .claude/worktrees/
 .claude/scratch/

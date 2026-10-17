@@ -116,6 +116,7 @@ async fn spam_released_from_a_digest_link_is_delivered_and_audited() {
     let env = Envelope {
         id: MessageId(ID.into()),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: "sender@outside.test".into(),
         rcpt_to: vec!["user@example.test".into()],
         received_at: OffsetDateTime::now_utc(),

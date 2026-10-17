@@ -1,0 +1,18 @@
+# Australian brands protected against lookalike sender and link domains.
+# One brand per line: a name, a colon, then the domains it is known by.
+# A domain listed here is never flagged itself. A domain starting with `!` is
+# never flagged and is not a target: the brand's sites in other countries, or
+# a well-known unrelated site with the same name. Lines starting with # are comments.
+ATO: ato.gov.au
+myGov: my.gov.au mygov.au
+Services Australia: servicesaustralia.gov.au
+Medicare: medicare.gov.au !medicare.com !medicare.gov
+CBA: commbank.com.au cba.com.au
+Westpac: westpac.com.au !westpac.co.nz !westpac.com.fj !westpac.com.pg
+NAB: nab.com.au
+ANZ: anz.com.au anz.com !anz.co.nz !anz.com.sg
+Australia Post: auspost.com.au
+Telstra: telstra.com.au telstra.com !telstra.net
+Optus: optus.com.au
+Xero: xero.com !xero.com.au
+MYOB: myob.com myob.com.au

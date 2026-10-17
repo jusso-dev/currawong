@@ -136,6 +136,59 @@ fn old_m1_priorities_hold() {
 }
 
 #[test]
+fn default_pack_holds_outbound_dlp_findings() {
+    use currawong_core::{DlpKind, DlpReport};
+    let outbound = Context {
+        direction: Direction::Outbound,
+        ..ctx("agent@external.test")
+    };
+    let verdict = |dlp: DlpReport, ctx: &Context| {
+        let mut scanned = report();
+        scanned.dlp = Some(dlp);
+        evaluate(&Signals::from_report(&scanned), ctx, default_pack()).verdict
+    };
+    let with = |kind: DlpKind, count: u32| DlpReport {
+        counts: [(kind, count)].into(),
+        ..DlpReport::default()
+    };
+    assert_eq!(
+        verdict(with(DlpKind::Tfn, 5), &outbound),
+        quarantine("dlp-tfn")
+    );
+    assert_eq!(verdict(with(DlpKind::Tfn, 4), &outbound), Verdict::Deliver);
+    assert_eq!(
+        verdict(with(DlpKind::Medicare, 5), &outbound),
+        quarantine("dlp-medicare")
+    );
+    assert_eq!(
+        verdict(with(DlpKind::Card, 7), &outbound),
+        quarantine("dlp-card")
+    );
+    assert_eq!(
+        verdict(with(DlpKind::DriverLicence, 5), &outbound),
+        quarantine("dlp-driver-licence")
+    );
+    // ABNs and ACNs are public; inbound mail is not held by the default pack.
+    assert_eq!(verdict(with(DlpKind::Abn, 9), &outbound), Verdict::Deliver);
+    assert_eq!(verdict(with(DlpKind::Acn, 9), &outbound), Verdict::Deliver);
+    assert_eq!(
+        verdict(with(DlpKind::Tfn, 5), &ctx("user@example.com.au")),
+        Verdict::Deliver
+    );
+    let partial = DlpReport {
+        incomplete: true,
+        ..DlpReport::default()
+    };
+    assert_eq!(verdict(partial, &outbound), quarantine("dlp-incomplete"));
+    let mut scanned = report();
+    scanned.dlp = Some(with(DlpKind::Tfn, 5));
+    assert_eq!(
+        Signals::from_report(&scanned).counts.get("dlp.tfn"),
+        Some(&5)
+    );
+}
+
+#[test]
 fn floor_cannot_be_overridden_by_tenant_policies_or_an_operator_pack() {
     let user_deliver = policy(
         "vip",

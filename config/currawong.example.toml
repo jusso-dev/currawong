@@ -14,10 +14,14 @@ listen = "127.0.0.1:9090"
 
 # limits.max_message_bytes: at least 1 MiB. Default is 50 MiB.
 # limits.max_recipients: recipients accepted in one transaction.
-# limits.smtp_command_timeout_secs: idle timeout between SMTP commands.
+# limits.smtp_command_timeout_secs: idle timeout between SMTP commands, and
+# the longest a reply write may block on a client that is not reading.
 # limits.max_connections: process-wide connection cap.
-# limits.max_line_bytes: RFC 5321 line limit, excluding the line ending.
-# limits.max_connections_per_ip: per-address connection cap.
+# limits.max_line_bytes: RFC 5321 line limit, including the CRLF (1000 allows 998 octets).
+# limits.max_connections_per_ip: per-address connection cap, shared by all listeners.
+# limits.tls_handshake_timeout_secs: implicit TLS and STARTTLS handshake deadline.
+# limits.data_timeout_secs: deadline for a whole DATA transfer (slow-drip clients).
+# limits.spool_min_free_bytes: below this free space DATA gets 452 4.3.1.
 [limits]
 max_message_bytes = 52428800
 max_recipients = 100
@@ -25,6 +29,9 @@ smtp_command_timeout_secs = 300
 max_connections = 1000
 max_line_bytes = 1000
 max_connections_per_ip = 20
+tls_handshake_timeout_secs = 30
+data_timeout_secs = 600
+spool_min_free_bytes = 1073741824
 
 # spool.dir: absolute path. The 250 reply is sent only after an fsync.
 [spool]
@@ -52,8 +59,7 @@ mode = "implicit"
 role = "submission"
 
 # tls.cert and tls.key: PEM paths. Reloaded on SIGHUP.
-# tls.acme is optional and is not required for M1. Leave it unset unless
-# the binary was built with the acme feature. ACME does not carry message content.
+# tls.acme is not implemented yet. --check-config refuses a config that sets it.
 [tls]
 cert = "/etc/currawong/cert.pem"
 key = "/etc/currawong/key.pem"
@@ -61,6 +67,7 @@ key = "/etc/currawong/key.pem"
 # scanner.enabled: isolated parser workers and the malware engines.
 # scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp.
 # scanner.clamd.address: unix:/path or tcp:127.0.0.1:3310. Empty disables ClamAV.
+#   clamd gets whole messages, so in au mode TCP must be loopback or an allowed CIDR.
 # scanner.clamd.required: an unreachable required engine fails closed (defer).
 # scanner.yara.rules_dir: *.yar and *.yara files (subdirectories included),
 # matched against the raw message and every part inside the parser worker.
@@ -108,15 +115,21 @@ max_uncompressed_bytes = 209715200
 max_files = 1000
 max_ratio = 100
 
-# residency.mode: "au" (default) or "off".
+# residency.mode: "au" (default) or "off". "off" is refused unless
+#   residency.off_approval = { reason = "...", approved_by = "..." } is set.
 # residency.allowed_host_suffixes: Sydney and Melbourne object-storage names.
 # residency.allowed_names: exact hostnames, never a GeoIP lookup.
-# residency.allowed_cidrs: on-premises ranges.
+# residency.allowed_cidrs: on-premises ranges. The defaults trust loopback and
+#   every RFC 1918 range as on-premises. Narrow them to your own networks.
 # residency.content_endpoints: sandbox, LLM, object store and webhook URLs
-# checked at startup. A us-east-1 bucket fails in au mode.
+#   (http or https) checked at startup. A us-east-1 bucket fails in au mode.
+#   scanner.clamd.address is checked too: unix:, loopback or an allowed CIDR.
 # residency.overrides: audited exceptions (url, reason, approved_by).
-# residency.signing_key_path: Ed25519 key for the residency report.
-# residency.report_dir: where signed monthly reports are written.
+# residency.signing_key_path: Ed25519 key for the residency report. Unset
+#   means no signed report (currawongd logs a warning).
+# residency.report_dir: signed reports (monthly, and at startup when the
+#   residency config changed), 0600.
+# residency.report_retention_days: reports older than this are deleted.
 [residency]
 mode = "au"
 allowed_host_suffixes = [
@@ -134,6 +147,7 @@ allowed_cidrs = [
 content_endpoints = []
 overrides = []
 report_dir = "/var/lib/currawong/residency"
+report_retention_days = 400
 
 # gateway.hostname: EHLO name and Received header.
 [gateway]
@@ -157,7 +171,8 @@ max_age_days = 5
 require_tls = false
 
 # checks.*_enabled: each pre-DATA check can be turned off.
-# checks.allow_cidrs: skip DNSBL, greylisting and reputation.
+# checks.allow_cidrs: skip rate limits, DNSBL, greylisting and reputation.
+# Trusted tenant networks and SMTP AUTH sessions skip them as well.
 # Put published Microsoft and Google outbound ranges here; do not hard-code a
 # stale copy into the binary.
 # checks.dnsbl: zone, optional dqs_key (never logged) and 127.0.0.x codes.
@@ -176,7 +191,8 @@ reputation_reject_score = 100.0
 reputation_half_life_secs = 86400
 dnsbl = []
 
-# relay.database: argon2 SMTP AUTH credentials.
+# relay.database: argon2 SMTP AUTH credentials. A login may send only as
+# its own address (when the username is an address) or a listed alias.
 # relay.tenants: trusted CIDRs and the domains that tenant may send as.
 [relay]
 database = "/var/lib/currawong/relay.sqlite"
@@ -231,6 +247,27 @@ max_rows_per_report = 1000
 max_report_bytes = 5242880
 retention_days = 7
 
+# classify.enabled: spam score and lookalike domains on every report. Policy
+# decides what a score means; classify does not quarantine on its own.
+# classify.bayes_database: per-tenant Bayes token counts (hashes, not words).
+# The directory must exist. If it cannot be opened, rules still score.
+# classify.spam_rules_dir: directory of *.toml rules ([[rule]] name, target,
+# pattern, score). Leave unset for the built-in rules in rules/spam/.
+# classify.brands_file: "Name: domain ..." per line. Leave unset for the
+# built-in Australian list in rules/brands-au.txt.
+# classify.protected_domains: more domains to protect in every tenant's mail.
+# Each relay tenant's own domains are protected in that tenant's mail only;
+# an accepted domain with no tenant protects itself and has its own Bayes store.
+# classify.allowed_domains: never flagged as lookalikes (partners or vendors
+# whose names resemble a tenant's). Brand siblings are `!domain` entries in
+# the brand list.
+# --check-config opens the Bayes store when its directory exists.
+[classify]
+enabled = true
+bayes_database = "/var/lib/currawong/bayes.sqlite"
+protected_domains = []
+allowed_domains = []
+
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.
 # policy.forward_domains: domains, beyond the recipient tenant's own, that redirect and bcc may target.
@@ -239,6 +276,19 @@ retention_days = 7
 # pack = "/etc/currawong/policies.toml"
 # database = "/var/lib/currawong/policy.db"
 forward_domains = []
+
+# dlp: TFN, Medicare, ABN, ACN, driver's licence and payment card detection.
+# Outbound mail is scanned; set scan_inbound to scan inbound mail too.
+# dlp.min_confidence: 0 to 100. A bare TFN or Medicare number scores 40; the
+# word "TFN" nearby adds 30, anywhere in the text 15. Policies act on the
+# distinct counts (`dlp.tfn` and so on) and the `dlp.incomplete` flag; the
+# default pack holds outbound mail with 5 or more TFNs, Medicare, card or
+# licence numbers, or an incomplete scan, in the `dlp` queue.
+# Logs and events carry counts and redacted samples (`123 *** ***`) only.
+[dlp]
+enabled = true
+scan_inbound = false
+min_confidence = 50
 
 # quarantine.dir: index (quarantine.sqlite) and fs blobs. Empty uses <spool.dir>/quarantine.
 # quarantine.retention_days: kept this long, then purged hourly from the index

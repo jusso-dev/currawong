@@ -1,14 +1,23 @@
 //! Where quarantined message bytes live. Keys are spool message ids.
 use async_trait::async_trait;
-use currawong_core::{
-    config::BlobStoreConfig, content::ObjectStoreClient, residency::ResidencyGuard,
+use currawong_core::{config::BlobStoreConfig, residency::ResidencyGuard};
+use object_store::{
+    aws::AmazonS3Builder,
+    client::{
+        ClientOptions, HttpClient, HttpConnector, HttpError, HttpErrorKind, HttpRequest,
+        HttpResponse, HttpService,
+    },
+    path::Path as ObjectPath,
+    ObjectStore, ObjectStoreExt,
 };
-use object_store::{aws::AmazonS3Builder, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
 use std::{
     io,
+    net::SocketAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
+use url::Url;
 
 #[async_trait]
 pub trait BlobStore: Send + Sync {
@@ -80,27 +89,31 @@ async fn sync_dir(dir: &Path) -> io::Result<()> {
 }
 
 /// An S3-compatible bucket. The endpoint must pass the residency guard
-/// before a client exists.
+/// before a client exists, and every request goes through [`GuardedHttp`].
 #[derive(Debug, Clone)]
 pub struct S3BlobStore {
     store: Arc<dyn ObjectStore>,
 }
 
 impl S3BlobStore {
-    pub fn new(guard: &ResidencyGuard, cfg: &BlobStoreConfig) -> Result<Self, String> {
-        let client = ObjectStoreClient::new(guard, &cfg.endpoint).map_err(|err| err.to_string())?;
-        if client.endpoint().scheme() != "https" {
+    pub fn new(guard: Arc<ResidencyGuard>, cfg: &BlobStoreConfig) -> Result<Self, String> {
+        let endpoint =
+            Url::parse(&cfg.endpoint).map_err(|err| format!("{}: {err}", cfg.endpoint))?;
+        guard
+            .check_request(&endpoint)
+            .map_err(|err| err.to_string())?;
+        if endpoint.scheme() != "https" {
             return Err(format!(
-                "quarantine blob endpoint {} must use https",
-                client.endpoint()
+                "quarantine blob endpoint {endpoint} must use https"
             ));
         }
         // Path-style requests keep every request on the checked endpoint host.
         let store = AmazonS3Builder::from_env()
-            .with_endpoint(client.endpoint().as_str().trim_end_matches('/'))
+            .with_endpoint(endpoint.as_str().trim_end_matches('/'))
             .with_bucket_name(&cfg.bucket)
             .with_region(&cfg.region)
             .with_virtual_hosted_style_request(false)
+            .with_http_connector(GuardedHttp { guard })
             .build()
             .map_err(|err| err.to_string())?;
         Ok(Self::from_store(Arc::new(store)))
@@ -143,14 +156,82 @@ impl BlobStore for S3BlobStore {
     }
 }
 
+/// object_store HTTP that, like `GuardedClient`, checks, resolves and pins
+/// every request through the residency guard and never follows a redirect:
+/// an S3 307 to another region fails instead of carrying the message there.
+struct GuardedHttp {
+    guard: Arc<ResidencyGuard>,
+}
+
+impl std::fmt::Debug for GuardedHttp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuardedHttp")
+    }
+}
+
+impl HttpConnector for GuardedHttp {
+    fn connect(&self, _: &ClientOptions) -> object_store::Result<HttpClient> {
+        Ok(HttpClient::new(GuardedService {
+            guard: Arc::clone(&self.guard),
+            pinned: Mutex::new(None),
+        }))
+    }
+}
+
+struct GuardedService {
+    guard: Arc<ResidencyGuard>,
+    /// One client per pinned address, rebuilt when the address changes.
+    pinned: Mutex<Option<(SocketAddr, reqwest::Client)>>,
+}
+
+impl std::fmt::Debug for GuardedService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuardedService")
+    }
+}
+
+#[async_trait]
+impl HttpService for GuardedService {
+    async fn call(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        let url = Url::parse(&request.uri().to_string())
+            .map_err(|err| HttpError::new(HttpErrorKind::Request, err))?;
+        let peer = self
+            .guard
+            .resolve(&url)
+            .await
+            .map_err(|err| HttpError::new(HttpErrorKind::Request, err))?;
+        let client = self.client(&url, peer)?;
+        client.call(request).await
+    }
+}
+
+impl GuardedService {
+    fn client(&self, url: &Url, peer: SocketAddr) -> Result<reqwest::Client, HttpError> {
+        let mut pinned = self.pinned.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some((_, client)) = pinned.as_ref().filter(|(addr, _)| *addr == peer) {
+            return Ok(client.clone());
+        }
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .https_only(true)
+            .resolve(url.host_str().unwrap_or_default(), peer)
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(120))
+            .build()
+            .map_err(|err| HttpError::new(HttpErrorKind::Connect, err))?;
+        *pinned = Some((peer, client.clone()));
+        Ok(client)
+    }
+}
+
 /// The configured blob store: `fs` under `dir/blobs`, or `s3`.
 pub fn open_blob_store(
     cfg: &BlobStoreConfig,
-    guard: &ResidencyGuard,
+    guard: &Arc<ResidencyGuard>,
     dir: &Path,
 ) -> Result<Arc<dyn BlobStore>, String> {
     match cfg.kind.as_str() {
-        "s3" => Ok(Arc::new(S3BlobStore::new(guard, cfg)?)),
+        "s3" => Ok(Arc::new(S3BlobStore::new(Arc::clone(guard), cfg)?)),
         _ => Ok(Arc::new(
             FsBlobStore::open(dir.join("blobs")).map_err(|err| err.to_string())?,
         )),
@@ -209,16 +290,16 @@ mod tests {
 
     #[test]
     fn s3_store_refuses_a_bucket_outside_australia() {
-        let guard = ResidencyGuard::from_config(&ResidencyConfig::default()).unwrap();
+        let guard = Arc::new(ResidencyGuard::from_config(&ResidencyConfig::default()).unwrap());
         let mut cfg = BlobStoreConfig {
             kind: "s3".into(),
             endpoint: "https://s3.us-east-1.amazonaws.com".into(),
             bucket: "held".into(),
             region: "us-east-1".into(),
         };
-        assert!(S3BlobStore::new(&guard, &cfg).is_err());
+        assert!(S3BlobStore::new(Arc::clone(&guard), &cfg).is_err());
         cfg.endpoint = "https://s3.ap-southeast-2.amazonaws.com".into();
         cfg.region = "ap-southeast-2".into();
-        S3BlobStore::new(&guard, &cfg).unwrap();
+        S3BlobStore::new(guard, &cfg).unwrap();
     }
 }

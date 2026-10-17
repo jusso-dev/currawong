@@ -1,0 +1,48 @@
+# Built-in spam rules. Each rule adds `score` to the spam total once when
+# `pattern` (Rust regex syntax) matches its target. Targets:
+#   header:<Name>  every value of that header, name compared case-insensitively
+#   body           decoded text body
+#   uri            each link found in the message
+# A negative score lowers the total. Rule names must be unique across files.
+
+[[rule]]
+name = "subject_shouting"
+target = "header:Subject"
+pattern = "^[^a-z]*[A-Z]{6,}[^a-z]*$"
+score = 1.5
+
+[[rule]]
+name = "subject_prize"
+target = "header:Subject"
+pattern = "(?i)\\b(winner|you (have )?won|prize|free gift|claim (your|now))\\b"
+score = 1.5
+
+[[rule]]
+name = "body_urgency"
+target = "body"
+pattern = "(?i)\\b(act now|limited time offer|expires today|final notice|risk[- ]free)\\b"
+score = 1.0
+
+[[rule]]
+name = "body_crypto_returns"
+target = "body"
+pattern = "(?i)\\b(bitcoin|crypto(currency)?)\\b[^.]{0,80}\\b(double|guaranteed|returns?|profit)\\b"
+score = 2.0
+
+[[rule]]
+name = "uri_ip_literal"
+target = "uri"
+pattern = "(?i)^https?://\\d{1,3}(\\.\\d{1,3}){3}([:/]|$)"
+score = 2.0
+
+[[rule]]
+name = "uri_shortener"
+target = "uri"
+pattern = "(?i)^https?://(bit\\.ly|tinyurl\\.com|is\\.gd|cutt\\.ly|t\\.co|rb\\.gy)/"
+score = 1.0
+
+[[rule]]
+name = "header_bulk_mailer"
+target = "header:X-Mailer"
+pattern = "(?i)\\b(mass|bulk)\\s?mail"
+score = 1.0

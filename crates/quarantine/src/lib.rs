@@ -32,7 +32,8 @@ use time::OffsetDateTime;
 const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_quarantine.sql")];
 
 /// Spool `pipeline` of a released message: the scheduler delivers it without
-/// running policy again, so it cannot be quarantined a second time.
+/// running policy again, so it cannot be quarantined a second time, and
+/// trains the Bayes classifier on it.
 pub const RELEASE_PIPELINE: &str = "release";
 
 #[derive(Debug, thiserror::Error)]
@@ -595,7 +596,6 @@ impl QuarantineStore {
                 params![item.id, now, principal.actor],
             )
             .map_err(db)?;
-        self.learn_released(item, &raw);
         self.audit(
             principal,
             item,
@@ -606,13 +606,6 @@ impl QuarantineStore {
         )?;
         tracing::info!(item = %item.id, released = %env.id, actor = %principal.actor, "quarantine item released");
         Ok(Some(env.id))
-    }
-
-    /// HOOK(classify): once `currawong-classify` is on main, call
-    /// `learn(item.tenant_id, raw, Feedback::Released)` here so a released
-    /// item trains the Bayes classifier.
-    fn learn_released(&self, item: &Item, raw: &[u8]) {
-        tracing::debug!(item = %item.id, bytes = raw.len(), "no classifier to train on release");
     }
 
     async fn delete(
@@ -754,6 +747,7 @@ fn release_envelope(item: &Item, now: i64) -> Envelope {
     Envelope {
         id: MessageId(derived_id(&item.id, "release")),
         tenant_id: item.tenant_id.clone(),
+        authenticated_as: None,
         mail_from: item.sender.clone(),
         rcpt_to: vec![item.recipient.clone()],
         received_at: OffsetDateTime::from_unix_timestamp(now)

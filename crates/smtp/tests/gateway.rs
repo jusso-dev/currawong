@@ -721,6 +721,7 @@ async fn queued(spool: &Spool, from: &str, to: &str, body: &[u8]) -> Envelope {
     let env = Envelope {
         id: Envelope::new_id(),
         tenant_id: None,
+        authenticated_as: None,
         mail_from: from.into(),
         rcpt_to: vec![to.into()],
         received_at: time::OffsetDateTime::now_utc(),
