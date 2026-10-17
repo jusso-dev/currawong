@@ -1,3 +1,4 @@
 target/
 *.eml.tmp
 /spool/
+.claude/worktrees/

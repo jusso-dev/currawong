@@ -38,6 +38,7 @@ pub struct Config {
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
     pub classify: ClassifyConfig,
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +288,18 @@ pub struct ClassifyConfig {
     pub protected_domains: Vec<String>,
 }
 
+/// Policy engine. With neither set, the built-in default pack applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyConfig {
+    /// TOML policy pack. Seeds the database when the database has no policies.
+    pub pack: Option<PathBuf>,
+    /// SQLite policy store. When set, policies are read from it.
+    pub database: Option<PathBuf>,
+    /// Domains outside the tenant's own that redirect and bcc may send to.
+    pub forward_domains: Vec<String>,
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -513,6 +526,7 @@ impl Default for Config {
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
             classify: ClassifyConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -633,6 +647,18 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        // An empty tenant id would share the platform's policy namespace.
+        if let Some(tenant) = self
+            .relay
+            .tenants
+            .iter()
+            .find(|t| t.id.trim().is_empty() || t.id.trim() != t.id)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "relay tenant id {:?} must be non-empty with no surrounding spaces",
+                tenant.id
+            )));
+        }
         Ok(())
     }
 
@@ -679,6 +705,19 @@ mod tests {
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
+    }
+
+    #[test]
+    fn blank_tenant_id_is_refused() {
+        for id in ["", " ", " t1"] {
+            let mut cfg = Config::load(&example_path()).unwrap();
+            cfg.relay.tenants.push(TenantConfig {
+                id: id.into(),
+                domains: vec!["example.test".into()],
+                trusted_cidrs: Vec::new(),
+            });
+            assert!(cfg.validate().is_err(), "{id:?}");
+        }
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     if cfg.classify.enabled {
         currawong_classify::check_config(&cfg.classify).map_err(|err| err.to_string())?;
     }
+    currawong_policy::load_pack(&cfg.policy).map_err(|err| err.to_string())?;
     let guard = ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?;
     guard
         .enforce_startup(&cfg.residency.content_endpoints)

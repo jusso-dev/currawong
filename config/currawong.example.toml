@@ -200,3 +200,12 @@ authserv_id = "currawong.example.test"
 enabled = true
 bayes_database = "/var/lib/currawong/bayes.sqlite"
 protected_domains = []
+
+# policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
+# policy.database: SQLite policy store, seeded from the pack the first time it is opened.
+# policy.forward_domains: domains, beyond the recipient tenant's own, that redirect and bcc may target.
+# Policies are reloaded on every pipeline pass.
+[policy]
+# pack = "/etc/currawong/policies.toml"
+# database = "/var/lib/currawong/policy.db"
+forward_domains = []
