@@ -240,11 +240,281 @@ pub struct DomainsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "DomainRouteToml", into = "DomainRouteToml")]
 pub struct DomainRoute {
+    /// Lower case with no trailing dot once loaded.
     pub domain: String,
-    /// `host` or `host:port`. Skips MX lookup.
+    /// `host` or `host:port`. Skips MX lookup. Empty for Exchange
+    /// on-premises, which delivers to its `mailbox_hosts` instead.
     pub next_hop: String,
+    /// The mailbox platform behind this domain. `None` is a plain smart host.
+    pub platform: Option<MailboxPlatform>,
+}
+
+/// `M365` and `GoogleWorkspace` only label a route for now: delivery uses
+/// its `next_hop` exactly as for a plain smart host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxPlatform {
+    M365,
+    GoogleWorkspace,
+    ExchangeOnPrem {
+        version: ExchangeVersion,
+        /// Exchange Mailbox servers, `host` or `host:port`, tried in order.
+        mailbox_hosts: Vec<String>,
+        /// Name the Exchange certificate must carry. Delivery requires TLS.
+        tls_cert_name: String,
+        /// PEM file with the CA that issued the Exchange certificate, trusted
+        /// in addition to the WebPKI roots. For an internal enterprise CA.
+        ca_file: Option<PathBuf>,
+        /// Client certificate and key (PEM) presented to Exchange, for a
+        /// domain secure (mutual TLS) Receive connector. Both or neither;
+        /// when unset the gateway's `tls.cert` and `tls.key` are used.
+        client_cert: Option<PathBuf>,
+        client_key: Option<PathBuf>,
+    },
+}
+
+impl MailboxPlatform {
+    /// The certificate and key Currawong presents to an Exchange route: the
+    /// route's own pair, else the gateway's inbound `tls.cert` and `tls.key`.
+    /// `None` when neither is set, so the connector cannot be domain secure.
+    pub fn client_identity<'a>(&'a self, tls: &'a TlsConfig) -> Option<(&'a Path, &'a Path)> {
+        let Self::ExchangeOnPrem {
+            client_cert,
+            client_key,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        match (client_cert, client_key, &tls.cert, &tls.key) {
+            (Some(cert), Some(key), _, _) | (None, None, Some(cert), Some(key)) => {
+                Some((cert.as_path(), key.as_path()))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Exchange Server 2016, 2019 or Subscription Edition. SE uses the 2019 cmdlets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeVersion {
+    #[serde(rename = "2016")]
+    Ex2016,
+    #[serde(rename = "2019")]
+    Ex2019,
+    #[serde(rename = "se")]
+    Se,
+}
+
+impl ExchangeVersion {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ex2016 => "Exchange Server 2016",
+            Self::Ex2019 => "Exchange Server 2019",
+            Self::Se => "Exchange Server Subscription Edition",
+        }
+    }
+}
+
+/// Lower case, no surrounding space, no trailing dot. Route lookups compare
+/// domains in this form on both sides.
+pub fn normalise_domain(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl DomainsConfig {
+    /// The configured route for `domain`, if any. The one lookup delivery
+    /// uses for both the next hop and its TLS rule.
+    pub fn route_for(&self, domain: &str) -> Option<&DomainRoute> {
+        let domain = normalise_domain(domain);
+        self.routes
+            .iter()
+            .find(|route| normalise_domain(&route.domain) == domain)
+    }
+}
+
+/// A DNS host name: dot-separated labels of letters, digits and inner hyphens.
+fn is_host_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && !name
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// `host`, `host:port`, an IP address or `ip:port` (`[v6]:port`).
+fn is_hop(hop: &str) -> bool {
+    if hop.parse::<SocketAddr>().is_ok() || hop.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let (host, port) = match hop.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|p| *p != 0)),
+        None => (hop, Some(25)),
+    };
+    port.is_some() && is_host_name(host)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlatformKind {
+    M365,
+    GoogleWorkspace,
+    ExchangeOnprem,
+}
+
+/// The flat TOML form of a route. `DomainRoute` is checked on the way in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainRouteToml {
+    domain: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    next_hop: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mailbox_platform: Option<PlatformKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exchange_version: Option<ExchangeVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mailbox_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_cert_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key: Option<PathBuf>,
+}
+
+impl TryFrom<DomainRouteToml> for DomainRoute {
+    type Error = String;
+
+    fn try_from(raw: DomainRouteToml) -> Result<Self, String> {
+        let domain = normalise_domain(&raw.domain);
+        if !is_host_name(&domain) {
+            return Err(format!(
+                "route {:?}: domain is not a domain name",
+                raw.domain
+            ));
+        }
+        let exchange_only = raw.exchange_version.is_some()
+            || !raw.mailbox_hosts.is_empty()
+            || raw.tls_cert_name.is_some()
+            || raw.ca_file.is_some()
+            || raw.client_cert.is_some()
+            || raw.client_key.is_some();
+        let platform = match raw.mailbox_platform {
+            Some(PlatformKind::ExchangeOnprem) => {
+                let version = raw.exchange_version.ok_or_else(|| {
+                    format!("route {domain}: exchange_onprem needs exchange_version \"2016\", \"2019\" or \"se\"")
+                })?;
+                if raw.mailbox_hosts.is_empty() {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem needs at least one mailbox_hosts entry"
+                    ));
+                }
+                if let Some(bad) = raw.mailbox_hosts.iter().find(|host| !is_hop(host)) {
+                    return Err(format!(
+                        "route {domain}: mailbox_hosts entry {bad:?} must be host or host:port"
+                    ));
+                }
+                let tls_cert_name = normalise_domain(&raw.tls_cert_name.unwrap_or_default());
+                if !is_host_name(&tls_cert_name)
+                    && tls_cert_name.parse::<std::net::IpAddr>().is_err()
+                {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem needs tls_cert_name, the host name on the Exchange certificate"
+                    ));
+                }
+                if raw.client_cert.is_some() != raw.client_key.is_some() {
+                    return Err(format!(
+                        "route {domain}: set both client_cert and client_key, or neither"
+                    ));
+                }
+                if !raw.next_hop.is_empty() {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem uses mailbox_hosts, not next_hop"
+                    ));
+                }
+                return Ok(Self {
+                    domain,
+                    next_hop: String::new(),
+                    platform: Some(MailboxPlatform::ExchangeOnPrem {
+                        version,
+                        mailbox_hosts: raw.mailbox_hosts,
+                        tls_cert_name,
+                        ca_file: raw.ca_file,
+                        client_cert: raw.client_cert,
+                        client_key: raw.client_key,
+                    }),
+                });
+            }
+            Some(PlatformKind::M365) => Some(MailboxPlatform::M365),
+            Some(PlatformKind::GoogleWorkspace) => Some(MailboxPlatform::GoogleWorkspace),
+            None => None,
+        };
+        if exchange_only {
+            return Err(format!(
+                "route {domain}: exchange_version, mailbox_hosts, tls_cert_name, ca_file, client_cert and client_key need mailbox_platform = \"exchange_onprem\""
+            ));
+        }
+        if raw.next_hop.trim().is_empty() {
+            return Err(format!("route {domain}: next_hop is required"));
+        }
+        Ok(Self {
+            domain,
+            next_hop: raw.next_hop,
+            platform,
+        })
+    }
+}
+
+impl From<DomainRoute> for DomainRouteToml {
+    fn from(route: DomainRoute) -> Self {
+        let mut raw = DomainRouteToml {
+            domain: route.domain,
+            next_hop: route.next_hop,
+            mailbox_platform: None,
+            exchange_version: None,
+            mailbox_hosts: Vec::new(),
+            tls_cert_name: None,
+            ca_file: None,
+            client_cert: None,
+            client_key: None,
+        };
+        match route.platform {
+            None => {}
+            Some(MailboxPlatform::M365) => raw.mailbox_platform = Some(PlatformKind::M365),
+            Some(MailboxPlatform::GoogleWorkspace) => {
+                raw.mailbox_platform = Some(PlatformKind::GoogleWorkspace)
+            }
+            Some(MailboxPlatform::ExchangeOnPrem {
+                version,
+                mailbox_hosts,
+                tls_cert_name,
+                ca_file,
+                client_cert,
+                client_key,
+            }) => {
+                raw.mailbox_platform = Some(PlatformKind::ExchangeOnprem);
+                raw.exchange_version = Some(version);
+                raw.mailbox_hosts = mailbox_hosts;
+                raw.tls_cert_name = Some(tls_cert_name);
+                raw.ca_file = ca_file;
+                raw.client_cert = client_cert;
+                raw.client_key = client_key;
+            }
+        }
+        raw
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1328,28 @@ impl Config {
                 tenant.id
             )));
         }
+        // Exchange routes read these on every delivery; a missing file would
+        // defer all mail for the domain, so fail at startup instead.
+        for route in &self.domains.routes {
+            let Some(MailboxPlatform::ExchangeOnPrem {
+                ca_file,
+                client_cert,
+                client_key,
+                ..
+            }) = &route.platform
+            else {
+                continue;
+            };
+            for path in [ca_file, client_cert, client_key].into_iter().flatten() {
+                if !path.is_file() {
+                    return Err(ConfigError::Invalid(format!(
+                        "route {}: {} is not a readable file",
+                        route.domain,
+                        path.display()
+                    )));
+                }
+            }
+        }
         self.events.validate()?;
         Ok(())
     }
@@ -1146,6 +1438,172 @@ mod tests {
             });
             assert!(cfg.validate().is_err(), "{id:?}");
         }
+    }
+
+    fn routes(toml: &str) -> Result<Vec<DomainRoute>, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.toml");
+        std::fs::write(&path, toml).unwrap();
+        load(&path).map(|cfg| cfg.domains.routes)
+    }
+
+    #[test]
+    fn exchange_onprem_route_parses() {
+        let routes = routes(
+            "[[domains.routes]]\ndomain = \"agency.example\"\nmailbox_platform = \"exchange_onprem\"\n\
+             exchange_version = \"se\"\nmailbox_hosts = [\"exch01.agency.example\", \"exch02.agency.example:2525\"]\n\
+             tls_cert_name = \"mail.agency.example\"\n\n\
+             [[domains.routes]]\ndomain = \"plain.example\"\nnext_hop = \"10.0.0.5\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            routes[0].platform,
+            Some(MailboxPlatform::ExchangeOnPrem {
+                version: ExchangeVersion::Se,
+                mailbox_hosts: vec![
+                    "exch01.agency.example".into(),
+                    "exch02.agency.example:2525".into()
+                ],
+                tls_cert_name: "mail.agency.example".into(),
+                ca_file: None,
+                client_cert: None,
+                client_key: None,
+            })
+        );
+        assert_eq!(routes[1].platform, None);
+        assert_eq!(routes[1].next_hop, "10.0.0.5");
+        // The flat form survives a round trip.
+        let again: DomainRoute = toml::from_str(&toml::to_string(&routes[0]).unwrap()).unwrap();
+        assert_eq!(again.platform, routes[0].platform);
+    }
+
+    #[test]
+    fn exchange_onprem_route_needs_its_settings() {
+        let base = "[[domains.routes]]\ndomain = \"agency.example\"\n";
+        for (extra, needle) in [
+            (
+                "mailbox_platform = \"exchange_onprem\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\n",
+                "exchange_version",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\ntls_cert_name = \"e\"\n",
+                "mailbox_hosts",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2016\"\nmailbox_hosts = [\"e\"]\n",
+                "tls_cert_name",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2013\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\n",
+                "2013",
+            ),
+            ("next_hop = \"e\"\nmailbox_hosts = [\"e\"]\n", "exchange_onprem"),
+            ("mailbox_platform = \"m365\"\n", "next_hop"),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch01\", \"\"]\ntls_cert_name = \"e\"\n",
+                "mailbox_hosts entry \"\"",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch01:99999\"]\ntls_cert_name = \"e\"\n",
+                "exch01:99999",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch 01\"]\ntls_cert_name = \"e\"\n",
+                "exch 01",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"mail agency\"\n",
+                "tls_cert_name",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\nclient_cert = \"/c.pem\"\n",
+                "client_key",
+            ),
+        ] {
+            let err = routes(&format!("{base}{extra}")).unwrap_err().to_string();
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn route_domains_are_normalised_and_looked_up_alike() {
+        let routes = routes(
+            "[[domains.routes]]\ndomain = \" Agency.Example. \"\nmailbox_platform = \"exchange_onprem\"\n\
+             exchange_version = \"2019\"\nmailbox_hosts = [\"10.1.1.5\", \"[2001:db8::5]:2525\"]\n\
+             tls_cert_name = \"Mail.Agency.Example.\"\n",
+        )
+        .unwrap();
+        assert_eq!(routes[0].domain, "agency.example");
+        let Some(MailboxPlatform::ExchangeOnPrem { tls_cert_name, .. }) = &routes[0].platform
+        else {
+            panic!("{:?}", routes[0]);
+        };
+        assert_eq!(tls_cert_name, "mail.agency.example");
+        let mut domains = DomainsConfig {
+            routes,
+            ..DomainsConfig::default()
+        };
+        // A route built in code is matched the same way.
+        domains.routes[0].domain = "AGENCY.example.".into();
+        for name in ["agency.example", "AGENCY.EXAMPLE.", " agency.example "] {
+            assert!(domains.route_for(name).is_some(), "{name}");
+        }
+        assert!(domains.route_for("other.example").is_none());
+    }
+
+    #[test]
+    fn exchange_files_are_checked_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = |ca: &str, cert: Option<&str>| MailboxPlatform::ExchangeOnPrem {
+            version: ExchangeVersion::Ex2019,
+            mailbox_hosts: vec!["exch01.agency.example".into()],
+            tls_cert_name: "mail.agency.example".into(),
+            ca_file: Some(dir.path().join(ca)),
+            client_cert: cert.map(|c| dir.path().join(c)),
+            client_key: cert.map(|_| dir.path().join("client.key")),
+        };
+        std::fs::write(dir.path().join("ca.pem"), "x").unwrap();
+        std::fs::write(dir.path().join("client.pem"), "x").unwrap();
+        std::fs::write(dir.path().join("client.key"), "x").unwrap();
+        for (ca, cert, ok) in [
+            ("ca.pem", None, true),
+            ("ca.pem", Some("client.pem"), true),
+            ("missing.pem", None, false),
+            ("ca.pem", Some("missing.pem"), false),
+        ] {
+            let mut cfg = load(&example_path()).unwrap();
+            cfg.domains.routes.push(DomainRoute {
+                domain: "agency.example".into(),
+                next_hop: String::new(),
+                platform: Some(platform(ca, cert)),
+            });
+            assert_eq!(cfg.validate().is_ok(), ok, "{ca} {cert:?}");
+        }
+    }
+
+    #[test]
+    fn exchange_client_identity_defaults_to_the_gateway_certificate() {
+        let mut tls = TlsConfig::default();
+        let route = |cert: Option<&str>| MailboxPlatform::ExchangeOnPrem {
+            version: ExchangeVersion::Ex2019,
+            mailbox_hosts: vec!["e".into()],
+            tls_cert_name: "e".into(),
+            ca_file: None,
+            client_cert: cert.map(PathBuf::from),
+            client_key: cert.map(|_| PathBuf::from("/route.key")),
+        };
+        assert_eq!(route(None).client_identity(&tls), None);
+        tls.cert = Some("/gw.pem".into());
+        tls.key = Some("/gw.key".into());
+        assert_eq!(
+            route(None).client_identity(&tls),
+            Some((Path::new("/gw.pem"), Path::new("/gw.key")))
+        );
+        assert_eq!(
+            route(Some("/route.pem")).client_identity(&tls),
+            Some((Path::new("/route.pem"), Path::new("/route.key")))
+        );
+        assert_eq!(MailboxPlatform::M365.client_identity(&tls), None);
     }
 
     #[test]

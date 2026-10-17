@@ -1,0 +1,37 @@
+# Currawong rollback for {{ c.version }}.
+# Point the MX records back at the previous host first, or inbound mail will
+# queue at senders. Then run this in the Exchange Management Shell. It
+# removes the Currawong connectors and undoes only what the Currawong
+# scripts changed, using the copies they saved.
+{% for server in c.servers -%}
+if (Get-ReceiveConnector "{{ server }}\Currawong Inbound" -ErrorAction SilentlyContinue) {
+    Remove-ReceiveConnector "{{ server }}\Currawong Inbound" -Confirm:$false
+}
+$saved = Join-Path $env:USERPROFILE "currawong-frontend-{{ server }}.xml"
+if (Test-Path $saved) {
+    # Default Frontend was locked down: put back the ranges it had before.
+    Set-ReceiveConnector "{{ server }}\Default Frontend {{ server }}" -RemoteIPRanges (Import-Clixml -Path $saved)
+    Remove-Item -Path $saved
+}
+{% endfor -%}
+if (Get-SendConnector "Currawong Outbound" -ErrorAction SilentlyContinue) {
+    Remove-SendConnector "Currawong Outbound" -Confirm:$false
+}
+$backup = Join-Path $env:USERPROFILE "currawong-transport-backup.xml"
+if (Test-Path $backup) {
+    # Saved values read like "10 MB (10,485,760 bytes)"; the part before the bracket is enough.
+    $previous = Import-Clixml -Path $backup
+    Set-TransportConfig -MaxReceiveSize ($previous.MaxReceiveSize -replace '\s*\(.*$', '') -MaxSendSize ($previous.MaxSendSize -replace '\s*\(.*$', '')
+{%- if c.domain_secure %}
+    # Take Currawong off the domain secure lists only if the transport script added it.
+    if (-not $previous.ReceiveSecure) {
+        Set-TransportConfig -TLSReceiveDomainSecureList @{Remove="{{ c.fqdn }}"}
+    }
+    if (-not $previous.SendSecure) {
+        Set-TransportConfig -TLSSendDomainSecureList @{Remove="{{ c.fqdn }}"}
+    }
+{%- endif %}
+    Remove-Item -Path $backup
+} else {
+    Write-Warning "$backup was not found. Set MaxReceiveSize and MaxSendSize back by hand, and check the domain secure lists."
+}

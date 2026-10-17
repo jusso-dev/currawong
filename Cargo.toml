@@ -86,6 +86,7 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
 proptest = "1"
+askama = "0.16"
 
 # Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
 [profile.dev.package.argon2]

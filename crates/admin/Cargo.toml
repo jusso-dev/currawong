@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 currawong-core = { path = "../core" }
+askama = { workspace = true }
+ipnet = { workspace = true }
+thiserror = { workspace = true }

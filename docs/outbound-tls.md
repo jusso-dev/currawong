@@ -19,6 +19,8 @@ Currawong picks the TLS rule for each MX host in this order.
    - The message's `Received` header gains the comment `(relayed onward without TLS)`.
    - Set `delivery.require_tls = true` to defer instead. That setting also covers `domains.routes` next hops, which DANE and MTA-STS do not apply to.
 
+An `exchange_onprem` route always requires STARTTLS, whatever `delivery.require_tls` says. The certificate must be valid for the route's `tls_cert_name` and chain to the WebPKI roots or to the CA in its `ca_file`. Currawong presents the route's `client_cert` (or `tls.cert`) when Exchange asks for a client certificate. See [integrations/exchange-onprem.md](integrations/exchange-onprem.md).
+
 WebPKI roots are the Mozilla set shipped in `webpki-roots`.
 
 ## Limits

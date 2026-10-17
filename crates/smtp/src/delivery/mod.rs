@@ -3,6 +3,7 @@
 pub mod client;
 pub mod dane;
 mod dsn;
+mod exchange;
 pub mod mta_sts;
 pub mod outbound_tls;
 pub mod route;
@@ -13,7 +14,10 @@ pub use outbound_tls::OutboundTls;
 pub use route::{resolve_route, RouteError};
 
 use client::{HostFailure, Starttls, Transaction};
-use currawong_core::{config::Config, MessageId};
+use currawong_core::{
+    config::{Config, MailboxPlatform},
+    MessageId,
+};
 use currawong_spool::{next_retry, Envelope, RcptStatus, Spool, SpoolError, SpoolState};
 use futures::{FutureExt, StreamExt};
 use mail_auth::report::tlsrpt::{PolicyDetails, PolicyType, ResultType};
@@ -96,6 +100,7 @@ pub struct Deliverer<D: DnsLookup> {
     destinations: dashmap::DashMap<String, Arc<Semaphore>>,
     /// DSNs sent this hour, per sender address and per sender domain.
     dsn_counts: Mutex<HashMap<String, (Instant, u32)>>,
+    exchange_tls: exchange::ExchangeTlsCache,
 }
 
 /// The TLS rule for one MX host, chosen in RFC 7672 / RFC 8461 order.
@@ -104,6 +109,13 @@ enum Plan {
     Dane(Vec<crate::dns::Tlsa>, String),
     Sts(Arc<mta_sts::Policy>),
     Opportunistic,
+    /// An Exchange on-premises route: STARTTLS required, the certificate
+    /// valid for `name` and trusted by WebPKI or the route's `ca_file`, and
+    /// a client certificate presented when one is configured.
+    Exchange {
+        name: String,
+        files: exchange::ExchangeTlsFiles,
+    },
 }
 
 /// The bytes for one message, with our `Received` header in two forms.
@@ -150,6 +162,7 @@ impl<D: DnsLookup> Deliverer<D> {
             http,
             destinations: dashmap::DashMap::new(),
             dsn_counts: Mutex::new(HashMap::new()),
+            exchange_tls: exchange::ExchangeTlsCache::default(),
         }
     }
 
@@ -523,6 +536,25 @@ impl<D: DnsLookup> Deliverer<D> {
         report: bool,
     ) -> Result<Plan, HostFailure> {
         if !route.via_mx {
+            if let Some(
+                platform @ MailboxPlatform::ExchangeOnPrem {
+                    tls_cert_name,
+                    ca_file,
+                    ..
+                },
+            ) = &route.platform
+            {
+                let client = platform
+                    .client_identity(&self.cfg.tls)
+                    .map(|(cert, key)| (cert.to_path_buf(), key.to_path_buf()));
+                return Ok(Plan::Exchange {
+                    name: tls_cert_name.clone(),
+                    files: exchange::ExchangeTlsFiles {
+                        ca_file: ca_file.clone(),
+                        client,
+                    },
+                });
+            }
             return Ok(Plan::Opportunistic);
         }
         if self.cfg.delivery.dane && route.mx_secure && hop.secure {
@@ -608,6 +640,23 @@ impl<D: DnsLookup> Deliverer<D> {
             .map_err(|_| HostFailure::temp(format!("4.7.5 bad host name {}", hop.host)))?;
         let webpki = || self.tls.webpki_config().map_err(HostFailure::temp);
         let (starttls, fallback, report) = match plan {
+            Plan::Exchange { name, files } => {
+                let config = self
+                    .exchange_tls
+                    .config(&self.tls, files)
+                    .await
+                    .map_err(HostFailure::temp)?;
+                let server_name = ServerName::try_from(name.clone()).map_err(|_| {
+                    HostFailure::temp(format!("4.7.5 bad tls_cert_name {name} for {domain}"))
+                })?;
+                let starttls = Starttls {
+                    config,
+                    server_name,
+                    required: true,
+                    policy: format!("Exchange route for {domain}"),
+                };
+                (starttls, false, None)
+            }
             Plan::Dane(records, base) => {
                 // Reference names for DANE-TA (RFC 7672 3.2.2).
                 let mut names: Vec<&str> = vec![base, &hop.host, domain];

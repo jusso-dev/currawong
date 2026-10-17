@@ -177,6 +177,26 @@ accept = ["example.test"]
 domain = "example.test"
 next_hop = "127.0.0.1:2526"
 
+# Exchange Server on-premises (2016, 2019 or SE): mailbox_hosts are tried in
+# order, failing over on connect or session errors. TLS is required and the
+# certificate must be valid for tls_cert_name; ca_file adds an internal CA to
+# the WebPKI roots for this route. client_cert and client_key (both or
+# neither, default tls.cert and tls.key) are presented to a domain secure
+# Receive connector. Put the Exchange servers' source addresses in that
+# tenant's relay.tenants trusted_cidrs for outbound.
+# mailbox_platform = "m365" or "google_workspace" is a label only for now;
+# those routes use next_hop.
+# See docs/integrations/exchange-onprem.md.
+# [[domains.routes]]
+# domain = "agency.example"
+# mailbox_platform = "exchange_onprem"
+# exchange_version = "2019"
+# mailbox_hosts = ["exch01.agency.example", "exch02.agency.example"]
+# tls_cert_name = "mail.agency.example"
+# ca_file = "/etc/currawong/agency-ca.pem"
+# client_cert = "/etc/currawong/exchange-client.pem"
+# client_key = "/etc/currawong/exchange-client.key"
+
 # delivery.poll_secs: how often deferred mail is retried.
 # delivery.max_age_days: then a DSN, never to the null sender.
 # delivery.max_concurrent: messages delivered at once in one pass.

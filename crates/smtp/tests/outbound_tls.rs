@@ -2,7 +2,7 @@
 //! `Deliverer::deliver` against in-process STARTTLS sinks. DNS, DNSSEC state
 //! and the MTA-STS policy fetch are fakes; the TLS is real.
 use async_trait::async_trait;
-use currawong_core::config::{Config, DomainRoute};
+use currawong_core::config::{Config, DomainRoute, ExchangeVersion, MailboxPlatform};
 use currawong_smtp::{
     delivery::{
         mta_sts::{MtaSts, PolicyFetcher},
@@ -106,6 +106,8 @@ impl Identity {
 #[derive(Debug, Default)]
 struct Session {
     tls: bool,
+    /// The leaf certificate the client presented, if the sink asked for one.
+    client_cert: Option<Vec<u8>>,
     commands: Vec<String>,
 }
 
@@ -138,9 +140,13 @@ impl Sink {
 
 /// An SMTP sink. With an identity it offers STARTTLS.
 async fn sink(identity: Option<Identity>) -> Sink {
+    sink_with(identity.map(|identity| identity.acceptor())).await
+}
+
+/// An SMTP sink with a given TLS acceptor, which may ask for a client certificate.
+async fn sink_with(acceptor: Option<TlsAcceptor>) -> Sink {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let acceptor = identity.map(|identity| identity.acceptor());
     let (tx, sessions) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Ok((sock, _)) = listener.accept().await {
@@ -154,6 +160,12 @@ async fn sink(identity: Option<Identity>) -> Sink {
                     let tcp = plain.into_inner();
                     if let Ok(stream) = acceptor.unwrap().accept(tcp).await {
                         session.tls = true;
+                        session.client_cert = stream
+                            .get_ref()
+                            .1
+                            .peer_certificates()
+                            .and_then(|chain| chain.first())
+                            .map(|cert| cert.to_vec());
                         let mut secure = BufReader::new(stream);
                         converse(&mut secure, &mut session, false).await;
                     }
@@ -718,6 +730,7 @@ async fn opportunistic_tls_is_verified_or_not_used() {
     setup.cfg.domains.routes.push(DomainRoute {
         domain: "example.test".into(),
         next_hop: format!("{MX}:{}", trusted.addr.port()),
+        platform: None,
     });
     let done = setup.deliver(&trusted, pki.roots()).await;
     assert_eq!(done.outcome, DeliveryOutcome::Delivered);
@@ -728,6 +741,7 @@ async fn opportunistic_tls_is_verified_or_not_used() {
     again.cfg.domains.routes.push(DomainRoute {
         domain: "example.test".into(),
         next_hop: format!("{MX}:{}", untrusted.addr.port()),
+        platform: None,
     });
     let done = again.deliver(&untrusted, pki.roots()).await;
     assert_eq!(done.outcome, DeliveryOutcome::Delivered);
@@ -745,6 +759,7 @@ async fn require_tls_refuses_unverified_certificates() {
     setup.cfg.domains.routes.push(DomainRoute {
         domain: "example.test".into(),
         next_hop: format!("{MX}:{}", sink.addr.port()),
+        platform: None,
     });
     let done = setup.deliver(&sink, pki.roots()).await;
     assert!(
@@ -757,4 +772,221 @@ async fn require_tls_refuses_unverified_certificates() {
         .await
         .iter()
         .all(|session| !session.sent_mail()));
+}
+
+/// #47: an Exchange on-premises route with two Mailbox servers. The
+/// certificate names `tls_cert_name`, not the host, and chains to a CA that is
+/// trusted only through the route's `ca_file`.
+async fn exchange_setup(hosts: &[String], ca_pem: Option<&str>) -> Setup {
+    let mut setup = setup().await;
+    // No gateway certificate, so no client certificate, unless a test sets one.
+    setup.cfg.tls.cert = None;
+    setup.cfg.tls.key = None;
+    let ca_file = ca_pem.map(|pem| {
+        let path = setup._dir.path().join("exchange-ca.pem");
+        std::fs::write(&path, pem).unwrap();
+        path
+    });
+    for host in ["exch01.example.test", "exch02.example.test"] {
+        setup
+            .dns
+            .ips
+            .insert(host.into(), vec!["127.0.0.1".parse().unwrap()]);
+    }
+    setup.cfg.domains.routes.push(DomainRoute {
+        domain: "example.test".into(),
+        next_hop: String::new(),
+        platform: Some(MailboxPlatform::ExchangeOnPrem {
+            version: ExchangeVersion::Ex2019,
+            mailbox_hosts: hosts.to_vec(),
+            tls_cert_name: "mail.example.test".into(),
+            ca_file,
+            client_cert: None,
+            client_key: None,
+        }),
+    });
+    setup
+}
+
+/// A port nothing listens on, so connecting is refused.
+async fn refused_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    listener.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn exchange_delivery_uses_tls_and_fails_over_to_the_second_host() {
+    let pki = Pki::new();
+    let mut second = sink(Some(pki.leaf("mail.example.test"))).await;
+    let hosts = [
+        format!("exch01.example.test:{}", refused_port().await),
+        format!("exch02.example.test:{}", second.addr.port()),
+    ];
+    let setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let done = setup.deliver(&second, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    let session = second.next().await;
+    assert!(session.tls && session.sent_mail(), "{session:?}");
+}
+
+#[tokio::test]
+async fn exchange_delivery_refuses_plaintext_and_defers_with_the_reason() {
+    let mut plain = sink(None).await;
+    let hosts = [format!("exch01.example.test:{}", plain.addr.port())];
+    let setup = exchange_setup(&hosts, None).await;
+    let done = setup.deliver(&plain, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::TempFail(
+            "4.7.5 Exchange route for example.test requires TLS with mail.example.test: STARTTLS not offered"
+                .into()
+        )
+    );
+    assert!(plain.drain().await.iter().all(|s| !s.sent_mail()));
+    let deferred = done._setup.spool.list(SpoolState::Deferred).await.unwrap();
+    assert_eq!(deferred.len(), 1);
+    assert_eq!(deferred[0].rcpt_status[0].status, "temp");
+}
+
+#[tokio::test]
+async fn exchange_delivery_checks_the_certificate_name_and_ca() {
+    let pki = Pki::new();
+    // Valid chain, but for the host name rather than tls_cert_name.
+    let mut wrong_name = sink(Some(pki.leaf("exch01.example.test"))).await;
+    let hosts = [format!("exch01.example.test:{}", wrong_name.addr.port())];
+    let setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let done = setup.deliver(&wrong_name, OutboundTls::webpki()).await;
+    assert!(
+        matches!(&done.outcome, DeliveryOutcome::TempFail(d) if d.contains("requires TLS with mail.example.test")),
+        "{:?}",
+        done.outcome
+    );
+    assert!(wrong_name.drain().await.iter().all(|s| !s.sent_mail()));
+
+    // Right name, but the CA is not in ca_file or the WebPKI roots.
+    let mut untrusted = sink(Some(pki.leaf("mail.example.test"))).await;
+    let hosts = [format!("exch01.example.test:{}", untrusted.addr.port())];
+    let setup = exchange_setup(&hosts, None).await;
+    let done = setup.deliver(&untrusted, OutboundTls::webpki()).await;
+    assert!(
+        matches!(&done.outcome, DeliveryOutcome::TempFail(_)),
+        "{:?}",
+        done.outcome
+    );
+    assert!(untrusted.drain().await.iter().all(|s| !s.sent_mail()));
+}
+
+#[tokio::test]
+async fn exchange_delivery_fails_over_after_a_tls_failure() {
+    let pki = Pki::new();
+    let mut plain = sink(None).await;
+    let mut good = sink(Some(pki.leaf("mail.example.test"))).await;
+    let hosts = [
+        format!("exch01.example.test:{}", plain.addr.port()),
+        format!("exch02.example.test:{}", good.addr.port()),
+    ];
+    let setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let done = setup.deliver(&good, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    assert!(plain.drain().await.iter().all(|s| !s.sent_mail()));
+    let session = good.next().await;
+    assert!(session.tls && session.sent_mail(), "{session:?}");
+}
+
+/// A route domain written with other case and a trailing dot is still an
+/// Exchange route for TLS, not only for routing.
+#[tokio::test]
+async fn exchange_delivery_route_domain_is_normalised_for_tls_too() {
+    let mut plain = sink(None).await;
+    let hosts = [format!("exch01.example.test:{}", plain.addr.port())];
+    let mut setup = exchange_setup(&hosts, None).await;
+    setup.cfg.domains.routes[0].domain = " Example.TEST. ".into();
+    let done = setup.deliver(&plain, OutboundTls::webpki()).await;
+    assert!(
+        done.detail()
+            .contains("Exchange route for example.test requires TLS"),
+        "{}",
+        done.detail()
+    );
+    assert!(plain.drain().await.iter().all(|s| !s.sent_mail()));
+}
+
+/// The gateway's inbound certificate is presented to a Receive connector that
+/// asks for one (domain secure mail), unless the route names its own pair.
+#[tokio::test]
+async fn exchange_delivery_presents_the_gateway_client_certificate() {
+    let pki = Pki::new();
+    // The fake Exchange server requires a client certificate from the CA.
+    let mut roots = RootCertStore::empty();
+    roots.add(pki.ca.clone()).unwrap();
+    let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(roots),
+        Arc::new(rustls::crypto::ring::default_provider()),
+    )
+    .build()
+    .unwrap();
+    let server = pki.leaf("mail.example.test");
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server.key.serialize_der()));
+    let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_client_cert_verifier(verifier)
+    .with_single_cert(server.chain.clone(), key)
+    .unwrap();
+    let mut exchange = sink_with(Some(TlsAcceptor::from(Arc::new(config)))).await;
+
+    // Currawong's inbound certificate, usable as a client certificate too.
+    let gw_key = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["gw.currawong.test".to_string()]).unwrap();
+    params.extended_key_usages = vec![
+        ExtendedKeyUsagePurpose::ServerAuth,
+        ExtendedKeyUsagePurpose::ClientAuth,
+    ];
+    let gw_cert = params
+        .signed_by(&gw_key, &pki.ca_cert, &pki.ca_key)
+        .unwrap();
+
+    let hosts = [format!("exch01.example.test:{}", exchange.addr.port())];
+    let mut setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let cert_path = setup._dir.path().join("gw.pem");
+    let key_path = setup._dir.path().join("gw.key");
+    std::fs::write(&cert_path, gw_cert.pem()).unwrap();
+    std::fs::write(&key_path, gw_key.serialize_pem()).unwrap();
+    setup.cfg.tls.cert = Some(cert_path);
+    setup.cfg.tls.key = Some(key_path);
+    let done = setup.deliver(&exchange, OutboundTls::webpki()).await;
+    assert_eq!(
+        done.outcome,
+        DeliveryOutcome::Delivered,
+        "{}",
+        done.detail()
+    );
+    let session = exchange.next().await;
+    assert!(session.sent_mail(), "{session:?}");
+    assert_eq!(session.client_cert.as_deref(), Some(gw_cert.der().as_ref()));
+
+    // Without a client certificate the same server refuses the session (TLS
+    // 1.3 reports it on the first read), and the message defers rather than
+    // going in plaintext.
+    let hosts = [format!("exch01.example.test:{}", exchange.addr.port())];
+    let setup = exchange_setup(&hosts, Some(&pki.ca_cert.pem())).await;
+    let done = setup.deliver(&exchange, OutboundTls::webpki()).await;
+    assert!(
+        matches!(&done.outcome, DeliveryOutcome::TempFail(d) if d.contains("CertificateRequired")),
+        "{:?}",
+        done.outcome
+    );
+    assert!(exchange.drain().await.iter().all(|s| !s.sent_mail()));
 }

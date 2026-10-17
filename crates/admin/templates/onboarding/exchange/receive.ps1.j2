@@ -1,0 +1,42 @@
+# Currawong inbound Receive connector for {{ c.version }}.
+# Run in the Exchange Management Shell. This creates the connector on each
+# Mailbox server and is safe to run again. Only Currawong
+# ({{ c.remote_ips }}) may use it, over TLS.
+{%- if c.domain_secure %}
+# Partner usage (domain secure): Currawong presents a client certificate for
+# {{ c.fqdn }}, which the transport script adds to the domain secure lists.
+{%- else %}
+# Anonymous usage: Currawong has no client certificate configured, so the
+# connector cannot be domain secure. Hosts at these addresses may send
+# without one. The RemoteIPRanges restriction is the key control, so keep it
+# to Currawong's addresses only. TLS is still required.
+{%- endif %}
+{% for server in c.servers %}
+if (-not (Get-ReceiveConnector "{{ server }}\Currawong Inbound" -ErrorAction SilentlyContinue)) {
+{%- if c.domain_secure %}
+    New-ReceiveConnector -Name "Currawong Inbound" -Server {{ server }} -TransportRole FrontendTransport -Usage Partner -Bindings 0.0.0.0:25 -RemoteIPRanges {{ c.remote_ips }} -RequireTLS $true -AuthMechanism Tls -PermissionGroups Partners -MaxMessageSize {{ c.size }}
+{%- else %}
+    New-ReceiveConnector -Name "Currawong Inbound" -Server {{ server }} -TransportRole FrontendTransport -Usage Custom -Bindings 0.0.0.0:25 -RemoteIPRanges {{ c.remote_ips }} -RequireTLS $true -PermissionGroups AnonymousUsers -MaxMessageSize {{ c.size }}
+{%- endif %}
+}
+{%- if c.domain_secure %}
+Set-ReceiveConnector "{{ server }}\Currawong Inbound" -RemoteIPRanges {{ c.remote_ips }} -MaxMessageSize {{ c.size }} -TlsDomainCapabilities "{{ c.fqdn }}:AcceptCloudServicesMail" -ProtocolLoggingLevel Verbose
+{%- else %}
+Set-ReceiveConnector "{{ server }}\Currawong Inbound" -RemoteIPRanges {{ c.remote_ips }} -MaxMessageSize {{ c.size }} -ProtocolLoggingLevel Verbose
+{%- endif %}
+{% endfor %}
+{%- if c.lockdown %}
+# WARNING: optional lock-down. After this, the Default Frontend connector on
+# each server accepts mail only from {{ c.internal_ranges }}.
+# Mail from anywhere else, including another gateway or the old MX, is
+# refused. List every internal sender (applications, devices, other Exchange
+# servers) in these ranges first. The first run saves each connector's
+# current ranges; the rollback script puts them back.
+{% for server in c.servers -%}
+$saved = Join-Path $env:USERPROFILE "currawong-frontend-{{ server }}.xml"
+if (-not (Test-Path $saved)) {
+    (Get-ReceiveConnector "{{ server }}\Default Frontend {{ server }}").RemoteIPRanges | ForEach-Object { $_.ToString() } | Export-Clixml -Path $saved
+}
+Set-ReceiveConnector "{{ server }}\Default Frontend {{ server }}" -RemoteIPRanges {{ c.internal_ranges }}
+{% endfor %}
+{%- endif %}
