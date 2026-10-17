@@ -78,6 +78,7 @@ regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 hmac = "0.12"
 webpki-roots = "1"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"

@@ -1,0 +1,6 @@
+# DHCP on every wired interface. Replace with a static [Address] for production.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes

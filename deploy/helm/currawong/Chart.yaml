@@ -1,0 +1,7 @@
+apiVersion: v2
+name: currawong
+description: Currawong email security gateway
+type: application
+version: 0.0.1
+appVersion: "0.0.1"
+home: https://github.com/jusso-dev/currawong
