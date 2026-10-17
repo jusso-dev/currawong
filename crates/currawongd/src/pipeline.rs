@@ -10,6 +10,7 @@ use currawong_policy::{
     canonical_domain, default_pack, evaluate_message, Context, MessageDecision, PolicySet,
 };
 use currawong_scan::engines::yara::{self, CompiledRules, PollWatcher};
+use currawong_scan::urls::UrlRewriter;
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, FileTypeScanner, ScanItem, ScanOutcome,
     Scanner, WorkerPool, YaraEngine,
@@ -33,6 +34,8 @@ pub struct Pipeline {
     pub bimi_jobs: Option<tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
+    /// Click-time link protection for delivered inbound mail.
+    pub url_rewriter: Option<Arc<UrlRewriter>>,
 }
 
 impl Pipeline {
@@ -72,6 +75,7 @@ impl Pipeline {
             bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
+            url_rewriter: None,
         }
     }
 
@@ -166,6 +170,56 @@ impl Pipeline {
             }
             Err(err) => {
                 tracing::error!(%err, "ARC key lookup failed");
+                None
+            }
+        }
+    }
+
+    pub fn with_url_rewriter(mut self, rewriter: UrlRewriter) -> Self {
+        self.url_rewriter = Some(Arc::new(rewriter));
+        self
+    }
+
+    /// Links in inbound mail that will be delivered point at the click
+    /// service. Returns the rewritten message and marks the report modified,
+    /// or `None` when nothing changed. A message that cannot be rewritten is
+    /// delivered as it is, with the reason in the report.
+    pub async fn rewrite_urls(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &mut ScanReport,
+    ) -> Option<Vec<u8>> {
+        let rewriter = Arc::clone(self.url_rewriter.as_ref()?);
+        if env.direction != Direction::Inbound {
+            return None;
+        }
+        // Arrival time, not now, so a retry rebuilds the same bytes.
+        let issued = env.received_at.unix_timestamp().max(0) as u64;
+        let (owned, id) = (raw.to_vec(), env.id.to_string());
+        let result =
+            tokio::task::spawn_blocking(move || rewriter.rewrite_message(&owned, &id, issued))
+                .await;
+        match result {
+            Ok(Ok(out)) => {
+                report.notes.extend(out.notes);
+                if out.links == 0 {
+                    return None;
+                }
+                tracing::info!(id = %env.id, links = out.links, "links rewritten");
+                report.modified = true;
+                Some(out.message)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(id = %env.id, %err, "links not rewritten");
+                report.notes.push(format!("links not rewritten: {err}"));
+                None
+            }
+            Err(err) => {
+                tracing::error!(id = %env.id, %err, "link rewriting failed");
+                report
+                    .notes
+                    .push("links not rewritten: rewriter failed".into());
                 None
             }
         }
@@ -513,7 +567,7 @@ pub fn auth_header(auth: &AuthResults) -> String {
 }
 
 /// Atomically replace a spool body (write beside it, fsync, rename).
-async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let tmp = path.with_extension("eml.strip");
     let mut file = tokio::fs::File::create(&tmp).await?;

@@ -136,6 +136,15 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     } else if cfg.dkim.sign_outbound || cfg.dkim.seal_arc {
         tracing::warn!(database = %cfg.dkim.database.display(), "no DKIM key store; outbound mail is not signed");
     }
+    if cfg.url_rewrite.enabled {
+        let (rewriter, clicks) = currawongd::url_protection(&cfg)?;
+        pipeline = pipeline.with_url_rewriter(rewriter);
+        let listener = TcpListener::bind(&cfg.url_rewrite.listen)
+            .await
+            .map_err(|err| format!("{}: {err}", cfg.url_rewrite.listen))?;
+        tracing::info!(bind = %cfg.url_rewrite.listen, "click service listening");
+        tokio::spawn(currawong_admin::routes::click::serve(listener, clicks));
+    }
     pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     if cfg.auth.dmarc_reports.enabled {

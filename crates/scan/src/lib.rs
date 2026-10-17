@@ -9,7 +9,7 @@ pub mod combine;
 pub mod engines;
 pub mod filetype;
 pub mod pool;
-pub mod url_rewrite;
+pub mod urls;
 
 pub use clamav::{ClamdAddress, ClamdClient};
 pub use combine::{combine, EngineOutput};

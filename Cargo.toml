@@ -28,6 +28,7 @@ tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 bytes = "1"
 futures = "0.3"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
 url = "2"
@@ -67,6 +68,8 @@ zeroize = "1"
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
 proptest = "1"
+lol_html = "3"
+encoding_rs = "0.8"
 
 # RSA-2048 key generation is very slow unoptimised, and tests generate keys.
 [profile.dev.package.rsa]

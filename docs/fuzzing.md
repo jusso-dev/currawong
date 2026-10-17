@@ -4,7 +4,7 @@ Parser entry points live in library code so the normal test suite does not need 
 
 - `currawong_smtp::fuzz::{command, data}`
 - `currawong_parser::fuzz::{mime, archive, urls_in}`
-- `currawong_scan::url_rewrite::fuzz`
+- `currawong_scan::urls::fuzz`
 - `currawong_dlp::fuzz_scan` (TFN checksum samples and PSPF markings)
 
 `cargo test -p currawong-fuzzstand` runs those functions on fixed seeds. That is the stand-in when `cargo-fuzz` is not installed.

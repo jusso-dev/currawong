@@ -25,7 +25,7 @@ fn parser_seeds_do_not_panic() {
         currawong_parser::fuzz::mime(&seed);
         currawong_parser::fuzz::archive(&seed);
         let _ = currawong_parser::fuzz::urls_in(&seed);
-        currawong_scan::url_rewrite::fuzz(&seed);
+        currawong_scan::urls::fuzz(&seed);
         currawong_dlp::fuzz_scan(&seed);
     }
 }

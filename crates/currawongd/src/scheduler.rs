@@ -26,6 +26,10 @@ struct Plan {
     headers: Vec<String>,
     bounce: bool,
     groups: Vec<Vec<Decision>>,
+    /// Delivered copies carry rewritten links. A retry rebuilds the same
+    /// bytes, which the headers above were computed over.
+    #[serde(default)]
+    rewritten: bool,
 }
 
 /// One failing message is logged and skipped; it does not stall the rest.
@@ -76,10 +80,20 @@ async fn classify_one(
     let raw = pipeline.strip_spooled(&raw, body_path.as_deref()).await?;
     let plan_path = plan_path(spool, &env.id);
     let mut bimi_auth = None;
+    // The body delivered copies get when links were rewritten. Quarantine
+    // and bounces keep the original.
+    let mut delivered = None;
     let plan = match tokio::fs::read(&plan_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
+        Ok(bytes) => {
+            let plan: Plan = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+            if plan.rewritten {
+                let mut report = ScanReport::new(env.id.clone());
+                delivered = pipeline.rewrite_urls(&env, &raw, &mut report).await;
+            }
+            plan
+        }
         Err(_) => {
-            let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            let (mut report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
             bimi_auth = report.auth.clone();
             let mut groups: Vec<Vec<Decision>> = decision
                 .split()
@@ -90,10 +104,14 @@ async fn classify_one(
                 .iter()
                 .flatten()
                 .any(|d| matches!(d.verdict, Verdict::Deliver));
+            if delivers {
+                delivered = pipeline.rewrite_urls(&env, &raw, &mut report).await;
+            }
             let headers = if !delivers {
                 pipeline.auth_headers(&env, &report)
             } else {
-                match pipeline.delivery_headers(&env, &raw, &report).await {
+                let body = delivered.as_deref().unwrap_or(&raw);
+                match pipeline.delivery_headers(&env, body, &report).await {
                     Ok(headers) => headers,
                     // Never send a tenant's mail unsigned when it has a key.
                     Err(reason) => {
@@ -113,6 +131,7 @@ async fn classify_one(
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
                 groups,
+                rewritten: delivered.is_some(),
             };
             if plan.groups.len() > 1 {
                 write_atomic(
@@ -144,11 +163,15 @@ async fn classify_one(
             copy.pipeline = "pending".into();
             narrow(&mut copy, &rcpts);
             tracing::info!(id = %env.id, split = %copy.id, "recipients differ, message split");
+            let body = match (&delivered, &group[0].verdict) {
+                (Some(rewritten), Verdict::Deliver) => rewritten.clone(),
+                _ => raw.clone(),
+            };
             spool
-                .accept(copy.clone(), Cursor::new(raw.clone()))
+                .accept(copy.clone(), Cursor::new(body))
                 .await
                 .map_err(|err| err.to_string())?;
-            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan).await?;
+            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan, None).await?;
         }
         let rcpts: Vec<String> = plan.groups[0].iter().map(|d| d.recipient.clone()).collect();
         narrow(&mut env, &rcpts);
@@ -157,13 +180,26 @@ async fn classify_one(
     }
     let id = env.id.clone();
     let quarantined = matches!(plan.groups[0][0].verdict, Verdict::Quarantine { .. });
-    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await?;
+    let rewritten = delivered.as_deref();
+    act(
+        spool,
+        quarantine,
+        cfg,
+        env,
+        &raw,
+        &plan.groups[0][0],
+        &plan,
+        rewritten,
+    )
+    .await?;
     if let (true, Some(auth)) = (quarantined, bimi_auth) {
         pipeline.queue_bimi(id, auth);
     }
     Ok(())
 }
 
+/// `rewritten` replaces the spool body when the message is delivered.
+#[allow(clippy::too_many_arguments)]
 async fn act(
     spool: &Spool,
     quarantine: &QuarantineStore,
@@ -172,6 +208,7 @@ async fn act(
     raw: &[u8],
     decision: &Decision,
     plan: &Plan,
+    rewritten: Option<&[u8]>,
 ) -> Result<(), String> {
     tracing::info!(id = %env.id, explanation = %decision.explanation.join("; "), "policy decision");
     // Replace, never extend: a re-evaluated deferred message must not
@@ -188,6 +225,12 @@ async fn act(
     };
     match &decision.verdict {
         Verdict::Deliver => {
+            if let Some(body) = rewritten {
+                let path = spool_body(spool, &env).ok_or("spool body missing")?;
+                crate::pipeline::rewrite_body(&path, body)
+                    .await
+                    .map_err(|err| format!("could not store rewritten links: {err}"))?;
+            }
             apply_actions(&mut env, decision, cfg, raw);
             env.pipeline = "deliver".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;

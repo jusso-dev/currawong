@@ -1,0 +1,61 @@
+From: Sender <sender@example.org>
+To: dest@example.test
+Subject: Links fixture
+Date: Wed, 14 Oct 2026 01:00:00 +0000
+Message-ID: <links-fixture@example.org>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="outer"
+
+This is a multi-part message in MIME format.
+--outer
+Content-Type: multipart/alternative; boundary="alt"
+
+--alt
+Content-Type: text/plain; charset=utf-8; format=flowed
+Content-Transfer-Encoding: quoted-printable
+
+Hello,
+Pay here: https://pay.example.net/invoice/42?ref=3Dabc.
+Long link: https://docs.example.net/a/very/long/path/that/needs/a/soft/line/b=
+reak/in/quoted-printable
+Trusted: https://trusted.example/x and mail help@example.org
+Caf=C3=A9
+--alt
+Content-Type: text/html; charset=iso-8859-1
+Content-Transfer-Encoding: base64
+
+PGh0bWw+PGhlYWQ+PG1ldGEgY2hhcnNldD0iaXNvLTg4NTktMSI+PC9oZWFkPjxib2R5Pg0KPHA+
+Q2Fm6SBtZW51OiA8YSBocmVmPSJodHRwczovL3Nob3AuZXhhbXBsZS5uZXQvbWVudT9hPTEmYW1w
+O2I9MiI+bWVudTwvYT48L3A+DQo8cD48QSBIUkVGPSJIVFRQUzovL0xvZ2luLkV4YW1wbGUub3Jn
+L1Jlc2V0Ij5yZXNldDwvQT4gYW5kIDxhIGhyZWY9Imh0dHBzOi8vd3d3LnRydXN0ZWQuZXhhbXBs
+ZS9vayI+dHJ1c3RlZDwvYT4gYW5kIDxhIGhyZWY9Im1haWx0bzpoZWxwQGV4YW1wbGUub3JnIj5t
+YWlsPC9hPjwvcD4NCjxtYXA+PGFyZWEgaHJlZj0iaHR0cDovL21hcHMuZXhhbXBsZS5uZXQvYXJl
+YSIgYWx0PSJ4Ij48L21hcD4NCjwvYm9keT48L2h0bWw+DQo=
+--alt--
+
+--outer
+Content-Type: text/plain; charset=us-ascii
+Content-Transfer-Encoding: 7bit
+
+Plain part: http://plain.example.net/start (see also <https://plain.example.net/end>)
+--outer
+Content-Type: multipart/signed; protocol="application/pkcs7-signature"; micalg=sha-256; boundary="sig"
+
+--sig
+Content-Type: text/plain; charset=us-ascii
+
+Signed text keeps https://signed.example.net/keep as it is.
+--sig
+Content-Type: application/pkcs7-signature; name="smime.p7s"
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="smime.p7s"
+
+AAAA
+--sig--
+
+--outer
+Content-Type: text/html; charset=utf-8
+Content-Disposition: attachment; filename="page.html"
+
+<a href="https://attached.example.net/keep">attached</a>
+--outer--

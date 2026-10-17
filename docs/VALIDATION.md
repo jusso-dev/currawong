@@ -54,6 +54,25 @@ Advisories: yara-x 1.21 (the latest) pins wasmtime ^45, which has seven RustSec 
 - When recipients (or tenants) get different outcomes the message is split. The plan is saved under `spool/split/` before any copy is made, and a retry finishes that plan rather than deciding again. Copies carry the same decision and get ids derived from the original and their recipients.
 - Policies are checked on every pipeline pass, on a blocking thread, and reloaded only when the pack file's time or size or the database revision changes. A database is seeded from the pack once; after that the pack file is not read. A database with the layout of an earlier development build is refused with a clear error.
 
+## URL rewriting (#29)
+
+`cargo test -p currawong-scan urls`, `cargo test -p currawong-admin` and `cargo test -p currawongd --test urls` cover it.
+
+- Round trip: every http(s) link in `testdata/urls/links.eml` (a quoted-printable UTF-8 text part with a link split by a soft line break, a base64 ISO-8859-1 HTML part with `&amp;`, an upper-case scheme and an `<area>`, and a 7bit text part) is rewritten, and each token verifies back to the link a browser would open. The admin test clicks every rewritten link through the click service over a socket and checks each 302 `Location`. Allow-listed links, `mailto:`, the `multipart/signed` part and the HTML attachment are unchanged; headers, the preamble, other parts, charsets and transfer encodings are byte for byte or equivalent. Obfuscated schemes (`ht&#9;tps:`, `&colon;`) are parsed the WHATWG way and still rewritten.
+- Tampering: a changed payload, a changed or cut signature, a token without a signature, junk, a token from another key and an oversized token all get HTTP 400; an expired token gets 410. The MAC is checked with `hmac`'s constant-time comparison before the payload is decoded.
+- Blocked after delivery: a link is delivered and clicked (302), its domain is then added to the block list file, and the same link gets the 403 block page. The click log records both. `currawongd --test urls` runs this through `classify_pending` with the config-built rewriter and click service, and checks that the delivered spool body carries the rewritten link, that `ScanReport.modified` led to an ARC seal over the rewritten body that `mail-auth` validates, and that outbound mail is not rewritten.
+- Only copies that are delivered are rewritten. Quarantine, bounces and split copies with another verdict keep the original. Tokens expire `ttl_days` after the message arrived (not after classification), so a retry of a split plan rebuilds the same bytes the saved ARC set covers.
+- Bounds: messages over `max_message_bytes` (default 10 MiB), more than 10,000 links or a parse failure leave the message unchanged with a note on the report; links over 8 KiB are kept and counted. lol_html runs non-strict with a 32 MiB memory cap. Rewriting runs on a blocking thread, so a panic is a note, not a crash. Hostile and random inputs are in the tests and in the `url_rewrite` fuzz target.
+- A 7bit or 8bit part whose line would pass 998 octets after rewriting is re-encoded as quoted-printable and its `Content-Transfer-Encoding` header replaced.
+
+Known limits, not done:
+
+- Rewriting parses MIME with `mail-parser` in the supervisor, not in the parser worker (ADR 0002). It only runs on mail the worker has already parsed without failing closed, and it is size capped.
+- Only `href` on `<a>` and `<area>` is rewritten. Bare URLs in HTML text (which some clients turn into links), `<form action>`, relative links under `<base href>`, links in attached messages, HTML attachments and parts in a charset that is not ASCII-compatible (UTF-16, ISO-2022-JP) are not.
+- One body serves every recipient of a copy, so tokens carry the message id, not the recipient.
+- Reputation at click time is the local block list only. The `UrlReputation` trait is where a threat-intel feed plugs in. There is no warn (click-through) verdict yet.
+- The click service speaks plain HTTP and expects a TLS proxy in front of `base_url`. No TLS proxy, real browser or real mail client was exercised; the tests use raw HTTP/1.1 over a local socket.
+
 ## ADR 0002 and the worker transport
 
 ADR 0002 says the supervisor talks to parser workers over a Unix socket. Issue #23 specifies length-prefixed JSON on stdin and stdout. M1 follows the issue: `LengthDelimitedCodec` on the worker's standard streams. The ADR decision is unchanged. The transport should be reconciled in a later ADR update rather than silently rewritten.

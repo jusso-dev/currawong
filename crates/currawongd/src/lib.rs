@@ -11,9 +11,11 @@ pub use health::{checks_for, reload_certificates, ClamdReady, SignaturesReady, S
 pub use pipeline::Pipeline;
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};
 
+use currawong_admin::routes::click::{ClickLog, ClickState};
 use currawong_core::{config::Config, residency::ResidencyGuard, Config as CoreConfig};
 use currawong_scan::engines::yara::{compile_dir, RuleSummary};
-use std::path::Path;
+use currawong_scan::urls::{LocalBlocklist, UrlReputation, UrlRewriter, UrlSigner};
+use std::{path::Path, sync::Arc};
 
 pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     let cfg = Config::load(path).map_err(|err| err.to_string())?;
@@ -28,7 +30,42 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
             .map_err(|err| err.to_string())?;
     }
     yara_summary(&cfg)?;
+    if cfg.url_rewrite.enabled {
+        url_rewriter(&cfg)?;
+    }
     Ok(cfg)
+}
+
+fn url_rewriter(cfg: &CoreConfig) -> Result<UrlRewriter, String> {
+    let urls = &cfg.url_rewrite;
+    UrlRewriter::new(
+        UrlSigner::from_file(&urls.key_file)?,
+        &urls.base_url,
+        &urls.allow_domains,
+        urls.ttl_days.saturating_mul(86_400),
+        urls.max_message_bytes,
+    )
+}
+
+/// The link rewriter and the click service state for `url_rewrite`.
+pub fn url_protection(cfg: &CoreConfig) -> Result<(UrlRewriter, ClickState), String> {
+    let urls = &cfg.url_rewrite;
+    let rewriter = url_rewriter(cfg)?;
+    let signer = rewriter.signer().clone();
+    let reputation: Arc<dyn UrlReputation> = match &urls.blocklist {
+        Some(path) => Arc::new(LocalBlocklist::from_file(path)),
+        None => Arc::new(LocalBlocklist::from_entries("")),
+    };
+    let log = ClickLog::open(&urls.click_log)
+        .map_err(|err| format!("click log {}: {err}", urls.click_log.display()))?;
+    Ok((
+        rewriter,
+        ClickState {
+            signer,
+            reputation,
+            log: Arc::new(log),
+        },
+    ))
 }
 
 /// Compile the configured YARA rules. `--check-config` prints the summary:

@@ -38,6 +38,7 @@ pub struct Config {
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
     pub policy: PolicyConfig,
+    pub url_rewrite: UrlRewriteConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +341,46 @@ impl Default for DmarcReportConfig {
     }
 }
 
+/// Links in delivered inbound mail point at the click service, which checks
+/// the real link again when it is clicked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UrlRewriteConfig {
+    pub enabled: bool,
+    /// Public `https://` base of the click service. Links become `<base_url>/u/<token>`.
+    pub base_url: String,
+    /// Click service bind address. It speaks plain HTTP: put a TLS proxy in front.
+    pub listen: String,
+    /// HMAC key, at least 32 bytes. Every node that serves clicks needs the same file.
+    pub key_file: PathBuf,
+    /// Links stop working this many days after the message arrived.
+    pub ttl_days: u64,
+    /// Links to these domains and their subdomains are not rewritten.
+    pub allow_domains: Vec<String>,
+    /// Domains or URL prefixes blocked at click time, one per line. Read again when it changes.
+    pub blocklist: Option<PathBuf>,
+    /// Click events, one JSON object per line.
+    pub click_log: PathBuf,
+    /// Larger messages are delivered without rewriting.
+    pub max_message_bytes: usize,
+}
+
+impl Default for UrlRewriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            listen: "127.0.0.1:8090".into(),
+            key_file: PathBuf::from("/etc/currawong/url.key"),
+            ttl_days: 30,
+            allow_domains: Vec::new(),
+            blocklist: None,
+            click_log: PathBuf::from("/var/lib/currawong/clicks.jsonl"),
+            max_message_bytes: 10 * 1024 * 1024,
+        }
+    }
+}
+
 /// Policy engine. With neither set, the built-in default pack applies.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -569,6 +610,7 @@ impl Default for Config {
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
             policy: PolicyConfig::default(),
+            url_rewrite: UrlRewriteConfig::default(),
         }
     }
 }
@@ -715,6 +757,25 @@ impl Config {
                 return Err(ConfigError::Invalid(format!(
                     "auth.dmarc_reports.{name} must be at least 1"
                 )));
+            }
+        }
+        let urls = &self.url_rewrite;
+        if urls.enabled {
+            if !urls.base_url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite.base_url must start with https://".into(),
+                ));
+            }
+            urls.listen.parse::<SocketAddr>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "url_rewrite.listen '{}' is not a socket address",
+                    urls.listen
+                ))
+            })?;
+            if urls.ttl_days == 0 {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite.ttl_days must be at least 1".into(),
+                ));
             }
         }
         // An empty tenant id would share the platform's policy namespace.
