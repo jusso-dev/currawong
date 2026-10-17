@@ -1,8 +1,11 @@
 # Business email compromise lexicon (Australian English). Each phrase is
 # matched case-insensitively on word boundaries in the subject and body.
-# category: payment_change, gift_card, urgency, secrecy.
-# A payment_change phrase only counts with a bank-detail pattern (BSB,
-# account number) or a second payment_change phrase.
+# Text and phrases are folded first (lower case, confusables mapped,
+# punctuation and line breaks become single spaces), so `Gift-Cards` and a
+# hard-wrapped `new bank\n details` still match.
+# category: payment_change, invoice, gift_card, urgency, secrecy.
+# payment_change counts with bank details (BSB or account number), a second
+# payment_change phrase, or an invoice phrase. invoice alone never counts.
 
 [[phrase]]
 text = "change of bank details"
@@ -34,11 +37,11 @@ category = "payment_change"
 
 [[phrase]]
 text = "remittance advice"
-category = "payment_change"
+category = "invoice"
 
 [[phrase]]
 text = "outstanding invoice"
-category = "payment_change"
+category = "invoice"
 
 [[phrase]]
 text = "gift card"
@@ -99,3 +102,31 @@ category = "secrecy"
 [[phrase]]
 text = "in a meeting"
 category = "secrecy"
+
+[[phrase]]
+text = "giftcard"
+category = "gift_card"
+
+[[phrase]]
+text = "giftcards"
+category = "gift_card"
+
+[[phrase]]
+text = "gift voucher"
+category = "gift_card"
+
+[[phrase]]
+text = "gift vouchers"
+category = "gift_card"
+
+[[phrase]]
+text = "change of account details"
+category = "payment_change"
+
+[[phrase]]
+text = "new banking details"
+category = "payment_change"
+
+[[phrase]]
+text = "payment details have changed"
+category = "payment_change"

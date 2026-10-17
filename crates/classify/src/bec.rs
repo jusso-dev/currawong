@@ -6,7 +6,7 @@
 //! policy pack quarantines inbound mail at `bec >= 0.6`.
 use crate::message::{address_domain, MessageView};
 use crate::TenantContext;
-use currawong_core::directory::Directory;
+use currawong_core::directory::{fold, Directory};
 use currawong_core::{BecReason, BecReport};
 use regex::Regex;
 use rusqlite::{params, Connection, OpenFlags};
@@ -41,22 +41,13 @@ const FREE_MAIL: &[&str] = &[
     "yandex.com",
 ];
 
-fn weight(reason: BecReason) -> f64 {
-    match reason {
-        BecReason::DisplayNameSpoof => 0.5,
-        BecReason::LookalikeSender => 0.4,
-        BecReason::PaymentChange => 0.4,
-        BecReason::GiftCard => 0.3,
-        BecReason::ReplyToMismatch => 0.25,
-        BecReason::AuthFailure => 0.2,
-        BecReason::Urgency | BecReason::Secrecy | BecReason::FirstTimeSender => 0.1,
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Category {
+    /// Asks to change bank or payment details.
     PaymentChange,
+    /// Invoice and remittance language: supporting evidence only.
+    Invoice,
     GiftCard,
     Urgency,
     Secrecy,
@@ -85,7 +76,7 @@ impl Lexicon {
         let phrases = file
             .phrase
             .into_iter()
-            .map(|p| (p.text.to_lowercase(), p.category))
+            .map(|p| (fold(&p.text), p.category))
             .filter(|(text, _)| !text.trim().is_empty())
             .collect();
         Ok(Self { phrases })
@@ -96,6 +87,7 @@ impl Lexicon {
         LEXICON.get_or_init(|| Self::parse(LEXICON_EN_AU).expect("built-in BEC lexicon is valid"))
     }
 
+    /// `text` must already be folded with `currawong_core::directory::fold`.
     fn hits(&self, text: &str, category: Category) -> usize {
         self.phrases
             .iter()
@@ -108,10 +100,10 @@ impl Lexicon {
 #[derive(Debug, Clone, Default)]
 pub struct BecContext {
     pub dmarc_failed: bool,
-    /// A lookalike finding on the From, Reply-To or envelope sender.
+    /// A strong lookalike finding on the From, Reply-To or envelope sender.
     pub lookalike_sender: bool,
-    /// `Some(true)` when no mail from this sender has been delivered to the
-    /// tenant before; `None` when the history is unavailable.
+    /// `Some(true)` when no authenticated mail from this sender has been
+    /// delivered to the tenant before; `None` when the history is unavailable.
     pub first_time: Option<bool>,
 }
 
@@ -122,12 +114,13 @@ pub fn analyse(
     directory: Option<&dyn Directory>,
     lexicon: &Lexicon,
 ) -> BecReport {
-    let mut reasons: Vec<(BecReason, String)> = Vec::new();
+    let mut reasons: Vec<(BecReason, f64, String)> = Vec::new();
     let in_tenant = |domain: &str| {
-        tenant
-            .domains
-            .iter()
-            .any(|d| d.eq_ignore_ascii_case(domain.trim_end_matches('.')))
+        let domain = domain.trim_end_matches('.').to_ascii_lowercase();
+        tenant.domains.iter().any(|owned| {
+            let owned = owned.trim_end_matches('.').to_ascii_lowercase();
+            domain == owned || domain.ends_with(&format!(".{owned}"))
+        })
     };
 
     for (name, address) in view.from_names.iter().zip(&view.from) {
@@ -139,19 +132,26 @@ pub fn analyse(
         let embedded = name
             .split(|c: char| c.is_whitespace() || matches!(c, '<' | '>' | '(' | ')' | '"'))
             .filter_map(address_domain)
-            .any(in_tenant);
-        let colleague = directory.is_some_and(|dir| {
-            dir.by_name(name).iter().any(|person| {
-                address_domain(&person.email).is_some_and(in_tenant)
+            .any(&in_tenant);
+        let colleagues: Vec<_> = directory
+            .map(|dir| dir.by_name(name))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|person| {
+                address_domain(&person.email).is_some_and(&in_tenant)
                     && !person.email.eq_ignore_ascii_case(address)
             })
-        });
-        if embedded || colleague {
+            .collect();
+        if embedded || !colleagues.is_empty() {
+            let vip = colleagues.iter().any(|person| person.vip);
+            // A VIP's name on an outside address is enough to hold the mail.
+            let weight = if vip { 0.6 } else { 0.5 };
             reasons.push((
                 BecReason::DisplayNameSpoof,
+                weight,
                 format!(
-                    "display name of a {} colleague on an outside address",
-                    if colleague { "directory" } else { "tenant" }
+                    "display name of a {} on an outside address",
+                    if vip { "VIP colleague" } else { "colleague" }
                 ),
             ));
             break;
@@ -161,72 +161,98 @@ pub fn analyse(
     if ctx.lookalike_sender {
         reasons.push((
             BecReason::LookalikeSender,
+            0.4,
             "sender domain imitates a protected domain".into(),
         ));
     }
 
     let from_domains: Vec<&str> = view.from.iter().filter_map(|a| address_domain(a)).collect();
-    if let Some(reply) = view
-        .reply_to
-        .iter()
-        .filter_map(|a| address_domain(a))
-        .find(|reply| !from_domains.iter().any(|f| f.eq_ignore_ascii_case(reply)))
-    {
-        if is_free_mail(reply) {
+    for reply in &view.reply_to {
+        let same_address = view
+            .from
+            .iter()
+            .any(|from| from.eq_ignore_ascii_case(reply));
+        let Some(domain) = address_domain(reply) else {
+            continue;
+        };
+        let same_domain = from_domains.iter().any(|f| f.eq_ignore_ascii_case(domain));
+        if !same_address && is_free_mail(domain) {
             reasons.push((
                 BecReason::ReplyToMismatch,
-                "replies go to a free mail address".into(),
+                0.25,
+                "replies go to a different free mail address".into(),
             ));
+            break;
+        }
+        if !same_domain {
+            reasons.push((
+                BecReason::ReplyToMismatch,
+                0.15,
+                "replies go to another domain".into(),
+            ));
+            break;
         }
     }
 
     let subject = view.header("Subject").next().unwrap_or("");
-    let text = format!("{subject}\n{}", view.body).to_lowercase();
-    let payment_phrases = lexicon.hits(&text, Category::PaymentChange);
+    let text = fold(&format!("{subject}\n{}\n{}", view.body, view.body_tail));
+    let change = lexicon.hits(&text, Category::PaymentChange);
+    let invoice = lexicon.hits(&text, Category::Invoice);
     let (bsb, account) = bank_details(&text);
-    let payment =
-        (payment_phrases > 0 && (bsb || account)) || payment_phrases >= 2 || (bsb && account);
-    if payment {
+    if change > 0 && (bsb || account) {
+        // A change request quoting new bank details is the costliest BEC.
         reasons.push((
             BecReason::PaymentChange,
-            "asks to change or use new bank details".into(),
+            0.6,
+            "asks to pay new bank details".into(),
+        ));
+    } else if change >= 2 || (change == 1 && invoice > 0) {
+        reasons.push((
+            BecReason::PaymentChange,
+            0.4,
+            "asks to change payment details".into(),
         ));
     }
+    let payment = reasons
+        .iter()
+        .any(|(r, _, _)| *r == BecReason::PaymentChange);
     let gift = lexicon.hits(&text, Category::GiftCard) > 0;
     if gift {
-        reasons.push((BecReason::GiftCard, "asks for gift cards".into()));
+        reasons.push((BecReason::GiftCard, 0.3, "asks for gift cards".into()));
     }
     if lexicon.hits(&text, Category::Urgency) > 0 {
-        reasons.push((BecReason::Urgency, "urgent language".into()));
+        reasons.push((BecReason::Urgency, 0.1, "urgent language".into()));
     }
     if lexicon.hits(&text, Category::Secrecy) > 0 {
         reasons.push((
             BecReason::Secrecy,
+            0.1,
             "asks for secrecy or avoids a call".into(),
         ));
     }
     if ctx.first_time == Some(true) && (payment || gift) {
         reasons.push((
             BecReason::FirstTimeSender,
+            0.1,
             "first message from this sender".into(),
         ));
     }
     if ctx.dmarc_failed {
         reasons.push((
             BecReason::AuthFailure,
+            0.2,
             "DMARC failed for the From domain".into(),
         ));
     }
 
     let score = reasons
         .iter()
-        .map(|(r, _)| weight(*r))
-        .sum::<f64>()
+        .fold(0.0_f64, |sum, (_, w, _)| sum + w)
         .min(1.0);
     BecReport {
         score,
-        reasons: reasons.iter().map(|(r, _)| *r).collect(),
-        explanation: reasons.into_iter().map(|(_, e)| e).collect(),
+        reasons: reasons.iter().map(|(r, _, _)| *r).collect(),
+        explanation: reasons.into_iter().map(|(_, _, e)| e).collect(),
     }
 }
 
@@ -235,20 +261,17 @@ fn is_free_mail(domain: &str) -> bool {
     FREE_MAIL.contains(&domain.as_str())
 }
 
-/// Whole-word, case-insensitive (callers pass lower-case text).
+/// Whole-word match on folded text (single spaces, lower case).
 fn contains_words(text: &str, phrase: &str) -> bool {
+    if phrase.is_empty() {
+        return false;
+    }
     let mut from = 0;
     while let Some(pos) = text[from..].find(phrase) {
         let start = from + pos;
         let end = start + phrase.len();
-        let before = text[..start]
-            .chars()
-            .next_back()
-            .is_none_or(|c| !c.is_alphanumeric());
-        let after = text[end..]
-            .chars()
-            .next()
-            .is_none_or(|c| !c.is_alphanumeric());
+        let before = start == 0 || text.as_bytes()[start - 1] == b' ';
+        let after = end == text.len() || text.as_bytes()[end] == b' ';
         if before && after {
             return true;
         }
@@ -257,14 +280,14 @@ fn contains_words(text: &str, phrase: &str) -> bool {
     false
 }
 
-/// (BSB present, account number present), for example `BSB: 000-000` and
-/// `account number 00000000`.
+/// (BSB present, account number present) in folded text, for example
+/// `bsb 000 000`, `bsb number 062000` and `account number 0000 0000`.
 fn bank_details(text: &str) -> (bool, bool) {
     static BSB: OnceLock<Regex> = OnceLock::new();
     static ACCOUNT: OnceLock<Regex> = OnceLock::new();
-    let bsb = BSB.get_or_init(|| Regex::new(r"\bbsb\b[\s:#.-]{0,4}\d{3}[\s-]?\d{3}\b").unwrap());
+    let bsb = BSB.get_or_init(|| Regex::new(r"\bbsb( no| number| num)? \d{3} ?\d{3}\b").unwrap());
     let account = ACCOUNT.get_or_init(|| {
-        Regex::new(r"\b(account|acct|a/c)\b(\s*(no|number|num|#))?[\s:#.-]{0,4}\d{6,10}\b").unwrap()
+        Regex::new(r"\b(account|acct|acc|a c)( no| number| num)? \d(?: ?\d){5,9}\b").unwrap()
     });
     (bsb.is_match(text), account.is_match(text))
 }
@@ -302,6 +325,7 @@ impl SenderHistory {
                  sender TEXT NOT NULL,
                  recipient TEXT NOT NULL,
                  first_seen INTEGER NOT NULL,
+                 last_seen INTEGER NOT NULL DEFAULT 0,
                  count INTEGER NOT NULL,
                  PRIMARY KEY (tenant_id, sender, recipient)
              );",
@@ -343,9 +367,10 @@ impl SenderHistory {
         let tx = conn.transaction()?;
         for recipient in recipients {
             tx.execute(
-                "INSERT INTO sender_history (tenant_id, sender, recipient, first_seen, count)
-                 VALUES (?1, ?2, ?3, ?4, 1)
-                 ON CONFLICT (tenant_id, sender, recipient) DO UPDATE SET count = count + 1",
+                "INSERT INTO sender_history (tenant_id, sender, recipient, first_seen, last_seen, count)
+                 VALUES (?1, ?2, ?3, ?4, ?4, 1)
+                 ON CONFLICT (tenant_id, sender, recipient)
+                 DO UPDATE SET count = count + 1, last_seen = ?4",
                 params![
                     tenant,
                     sender.to_ascii_lowercase(),
@@ -354,10 +379,25 @@ impl SenderHistory {
                 ],
             )?;
         }
+        // Senders not seen for a year are forgotten, and each tenant keeps
+        // at most MAX_HISTORY_ROWS pairs (the least recently seen go first).
+        tx.execute(
+            "DELETE FROM sender_history WHERE last_seen < ?1",
+            params![now - HISTORY_TTL_SECS],
+        )?;
+        tx.execute(
+            "DELETE FROM sender_history WHERE tenant_id = ?1 AND rowid IN (
+                 SELECT rowid FROM sender_history WHERE tenant_id = ?1
+                 ORDER BY last_seen DESC LIMIT -1 OFFSET ?2)",
+            params![tenant, MAX_HISTORY_ROWS],
+        )?;
         tx.commit()?;
         Ok(())
     }
 }
+
+const HISTORY_TTL_SECS: i64 = 365 * 24 * 3600;
+const MAX_HISTORY_ROWS: i64 = 200_000;
 
 #[cfg(test)]
 mod tests {
@@ -365,16 +405,26 @@ mod tests {
 
     #[test]
     fn bec_bank_detail_patterns_and_whole_words() {
+        let bd = |t: &str| bank_details(&fold(t));
         assert_eq!(
-            bank_details("new bsb: 000-000 account number: 00000000"),
+            bd("new bsb: 000-000 account number: 00000000"),
             (true, true)
         );
-        assert_eq!(bank_details("bsb 000 000"), (true, false));
-        assert_eq!(bank_details("acct # 1234567"), (false, true));
-        assert_eq!(bank_details("phone 0400 000 000"), (false, false));
-        assert!(contains_words("this is urgent!", "urgent"));
-        assert!(!contains_words("detergent sale", "urgent"));
-        assert!(!contains_words("urgently", "urgent"));
+        assert_eq!(bd("bsb 000 000"), (true, false));
+        assert_eq!(bd("BSB number: 062000 acc 12345678"), (true, true));
+        assert_eq!(bd("acct # 1234 5678"), (false, true));
+        assert_eq!(bd("phone 0400 000 000"), (false, false));
+        assert!(contains_words(&fold("this is urgent!"), "urgent"));
+        assert!(!contains_words(&fold("detergent sale"), "urgent"));
+        assert!(!contains_words(&fold("urgently"), "urgent"));
+        assert!(contains_words(
+            &fold("new bank\r\n  details"),
+            &fold("new bank details")
+        ));
+        assert!(contains_words(
+            &fold("b\u{0430}nk\u{00A0}details"),
+            &fold("bank details")
+        ));
     }
 
     #[test]

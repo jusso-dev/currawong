@@ -402,7 +402,8 @@ async fn yara_matches_reach_the_report_and_policy() {
     assert!(report.engines.iter().any(|f| f.engine == "yara"));
     assert!(matches!(verdict, Verdict::Quarantine { reason } if reason == "malware"));
 
-    // A `bec` match is recorded for policy and does not quarantine by itself.
+    // A `bec` YARA match is recorded for policy and is not malware. The BEC
+    // classifier (not the YARA tag) holds this bank-detail change.
     let bec = b"From: a@example.test\r\nTo: b@example.test\r\nSubject: invoice\r\n\r\nPlease note our change of bank details. BSB 000-000.\r\n";
     let (report, verdict) = pipeline.evaluate(&env, bec, None).await;
     let hit = report
@@ -412,7 +413,10 @@ async fn yara_matches_reach_the_report_and_policy() {
         .expect("bec rule matched");
     assert_eq!(hit.tags, vec!["bec".to_string()]);
     assert!(!report.malware && !report.active_content, "{report:?}");
-    assert!(matches!(verdict, Verdict::Deliver), "{verdict:?}");
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "bec-quarantine"),
+        "{verdict:?}"
+    );
 }
 
 #[test]
@@ -508,4 +512,69 @@ async fn yara_rules_that_cannot_load_fail_closed() {
         "{report:?}"
     );
     assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+}
+
+#[tokio::test]
+async fn bec_inbound_spoof_is_quarantined_and_a_weak_one_marked_through_the_pipeline() {
+    let dir = tempfile::tempdir().unwrap();
+    let directory = dir.path().join("directory.csv");
+    std::fs::write(
+        &directory,
+        "email,name,vip\njane.smith@acme.test,Jane Smith,true\nbob@acme.test,Bob Jones,false\n",
+    )
+    .unwrap();
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.path().join("spool");
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.enabled = false;
+    cfg.classify.bayes_database = dir.path().join("bayes.sqlite");
+    cfg.classify.history_database = dir.path().join("history.sqlite");
+    cfg.classify.directory_csv = Some(directory);
+    cfg.domains.accept = vec!["acme.test".into()];
+    cfg.relay
+        .tenants
+        .push(currawong_core::config::TenantConfig {
+            id: "acme".into(),
+            domains: vec!["acme.test".into()],
+            trusted_cidrs: Vec::new(),
+        });
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    let mut pipeline = Pipeline::new(Arc::new(cfg), auth);
+    let mut env = envelope("someone@gmail.com");
+    env.rcpt_to = vec!["finance@acme.test".into()];
+
+    let raw = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/bec/ceo-gift-cards.eml"
+    ))
+    .unwrap();
+    let (report, verdict) = pipeline.evaluate(&env, &raw, None).await;
+    let bec = report.bec.as_ref().expect("inbound mail is scored");
+    assert!(bec
+        .reasons
+        .contains(&currawong_core::BecReason::DisplayNameSpoof));
+    assert!(
+        matches!(&verdict, Verdict::Quarantine { reason } if reason == "bec-quarantine"),
+        "{verdict:?}"
+    );
+
+    // A non-VIP colleague's name with no request is marked, not held.
+    let raw = b"From: \"Bob Jones\" <bob.jones.home@gmail.com>\r\nTo: finance@acme.test\r\nSubject: hi\r\n\r\nSee you soon.\r\n";
+    let (_, decision) = pipeline.assess(&env, raw, None).await;
+    let d = &decision.decisions[0];
+    assert!(matches!(d.verdict, Verdict::Deliver), "{:?}", d.verdict);
+    assert!(
+        d.actions.iter().any(|a| matches!(a, currawong_policy::Action::AddHeader { name, .. } if name == "X-Currawong-Warning")),
+        "{:?}",
+        d.actions
+    );
+
+    // Unauthenticated mail is never remembered as a known sender.
+    assert_eq!(pipeline.history_sender(&env, raw, &report), None);
+
+    // Outbound mail is not BEC-scored.
+    let mut outbound = env.clone();
+    outbound.direction = Direction::Outbound;
+    let (report, _) = pipeline.evaluate(&outbound, raw, None).await;
+    assert!(report.bec.is_none());
 }

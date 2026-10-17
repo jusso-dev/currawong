@@ -15,53 +15,107 @@ pub trait Directory: Send + Sync {
     fn by_name(&self, name: &str) -> Vec<&Person>;
 }
 
-/// Lower case, letters and digits only, single spaces: `"Smith, Jane (CEO)"`
-/// and `"jane smith"` normalise differently, so names are also compared
-/// with their words sorted (see `name_key`).
-pub fn normalise_name(name: &str) -> String {
-    let cleaned: String = name
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                ' '
-            }
-        })
-        .collect();
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+/// Invisible format characters that can be slipped inside a word.
+fn is_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+    )
 }
 
-/// Order-independent key, so `Smith, Jane` matches `Jane Smith`. Words in
-/// brackets such as a title are dropped first.
-pub fn name_key(name: &str) -> String {
-    let mut depth = 0usize;
-    let without_brackets: String = name
-        .chars()
-        .filter(|c| match c {
-            '(' | '[' => {
-                depth += 1;
-                false
+/// Fold text for matching: drop invisible format characters, map each
+/// non-ASCII letter to its UTS 39 confusable skeleton (so Cyrillic `а`, fullwidth `Ｊ`
+/// and accented `é` compare equal to `a`, `j` and `e`), keep ASCII digits as
+/// they are, lower-case, and turn every run of other characters into one space.
+pub fn fold(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut space = true;
+    let mut push = |c: char, out: &mut String| {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+            space = false;
+        } else if !space {
+            out.push(' ');
+            space = true;
+        }
+    };
+    let mut buf = [0u8; 4];
+    for c in text.chars().filter(|c| !is_format(*c)) {
+        // ASCII is kept as it is (skeletons would turn `m` into `rn`); only
+        // non-ASCII letters are mapped to their confusable skeleton.
+        if c.is_ascii() || c.is_whitespace() {
+            push(c, &mut out);
+            continue;
+        }
+        // Lower-case first: skeletons are case-sensitive (`M` and `m` differ).
+        for lower in c.to_lowercase() {
+            for folded in unicode_security::skeleton(lower.encode_utf8(&mut buf)) {
+                for lower in folded.to_lowercase() {
+                    push(lower, &mut out);
+                }
             }
-            ')' | ']' => {
-                depth = depth.saturating_sub(1);
-                false
-            }
-            _ => depth == 0,
-        })
-        .collect();
-    let mut words: Vec<String> = normalise_name(&without_brackets)
+        }
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
+/// Titles and roles that may decorate a display name.
+const TITLES: &[&str] = &[
+    "mr",
+    "mrs",
+    "ms",
+    "miss",
+    "dr",
+    "prof",
+    "professor",
+    "sir",
+    "ceo",
+    "cfo",
+    "coo",
+    "cto",
+    "cio",
+    "md",
+    "gm",
+    "director",
+    "manager",
+    "president",
+    "chair",
+    "chairman",
+    "head",
+    "of",
+    "finance",
+    "accounts",
+    "the",
+    "office",
+];
+
+/// The words of a name worth matching: folded, without titles or initials.
+pub fn name_words(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = fold(name)
         .split(' ')
-        .filter(|w| !w.is_empty())
+        .filter(|w| w.chars().count() > 1 && !TITLES.contains(w))
         .map(str::to_string)
         .collect();
     words.sort();
-    words.join(" ")
+    words.dedup();
+    words
+}
+
+/// Order-independent key of a name's words.
+pub fn name_key(name: &str) -> String {
+    name_words(name).join(" ")
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct CsvDirectory {
     people: Vec<Person>,
+    /// Folded name word -> people whose name contains it.
+    by_word: std::collections::HashMap<String, Vec<usize>>,
+    words: Vec<Vec<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +181,22 @@ impl CsvDirectory {
             };
             people.push(Person { email, name, vip });
         }
-        Ok(Self { people })
+        let mut directory = Self {
+            people,
+            ..Self::default()
+        };
+        for (index, person) in directory.people.iter().enumerate() {
+            let words = name_words(&person.name);
+            for word in &words {
+                directory
+                    .by_word
+                    .entry(word.clone())
+                    .or_default()
+                    .push(index);
+            }
+            directory.words.push(words);
+        }
+        Ok(directory)
     }
 
     pub fn people(&self) -> &[Person] {
@@ -136,15 +205,23 @@ impl CsvDirectory {
 }
 
 impl Directory for CsvDirectory {
+    /// People whose name words (at least two, ignoring titles and initials)
+    /// all appear in `name`, so `Dr Jane A. Smith - CEO` matches `Jane Smith`.
     fn by_name(&self, name: &str) -> Vec<&Person> {
-        let key = name_key(name);
-        if key.is_empty() {
-            return Vec::new();
-        }
-        self.people
+        let shown = name_words(name);
+        let mut found: Vec<usize> = shown
             .iter()
-            .filter(|person| name_key(&person.name) == key)
-            .collect()
+            .filter_map(|word| self.by_word.get(word))
+            .flatten()
+            .copied()
+            .filter(|index| {
+                let words = &self.words[*index];
+                words.len() >= 2 && words.iter().all(|w| shown.contains(w))
+            })
+            .collect();
+        found.sort_unstable();
+        found.dedup();
+        found.into_iter().map(|index| &self.people[index]).collect()
     }
 }
 
@@ -185,6 +262,20 @@ mod tests {
         );
         assert_eq!(directory.by_name("jane SMITH (CEO)").len(), 1);
         assert!(directory.by_name("Janet Smith").is_empty());
+        for disguised in [
+            "Jane Smith - CEO",
+            "Jane Smith, CEO",
+            "Jane A. Smith",
+            "Dr Jane Smith",
+            "J\u{0430}ne Smith",
+            "\u{FF2A}ane Smith",
+            "Jan\u{00E9} Smith",
+            "Ja\u{200B}ne Smith",
+        ] {
+            assert_eq!(directory.by_name(disguised).len(), 1, "{disguised}");
+        }
+        // One shared word is not enough.
+        assert!(directory.by_name("Jane Doe").is_empty());
         assert!(directory.by_name("").is_empty());
         assert!(directory.people()[0].vip && !directory.people()[1].vip);
         assert!(CsvDirectory::parse("no-at-sign,Name\n").is_err());

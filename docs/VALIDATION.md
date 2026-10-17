@@ -64,3 +64,11 @@ ADR 0002 says the supervisor talks to parser workers over a Unix socket. Issue #
 ## Malware accuracy
 
 Official ClamAV signatures are the baseline only. See `docs/adr/0005-malware-engines.md`. Do not treat a clean clamd result, on the official set alone, as proof that a message is safe. File-type and macro findings are part of the M1 decision.
+
+## BEC detection (#31)
+
+- Run with `cargo test -p currawong-classify bec` (the issue's `-p currawong-scan` command names an old location).
+- Heuristics are tuned on synthetic fixtures only; false-positive rates on real mail are not measured.
+- The `prepend_banner` policy action is not implemented yet: policy banner actions need message-body rewriting (being added with URL rewriting, #29). Until then the default pack marks sub-threshold impersonation with an `X-Currawong-Warning` header (`bec-warn`) that transport rules or clients can turn into a banner.
+- A message to recipients in several tenants is scored once, for the first recipient's tenant.
+- The sender history only records From addresses of delivered inbound mail that passed SPF or DMARC; it keeps at most 200,000 pairs per tenant and forgets senders not seen for a year.

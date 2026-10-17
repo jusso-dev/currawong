@@ -26,6 +26,10 @@ struct Plan {
     headers: Vec<String>,
     bounce: bool,
     groups: Vec<Vec<Decision>>,
+    /// The authenticated From address to remember once the message is
+    /// delivered, for BEC first-time sender checks.
+    #[serde(default)]
+    history_sender: Option<String>,
 }
 
 /// One failing message is logged and skipped; it does not stall the rest.
@@ -110,6 +114,7 @@ async fn classify_one(
             let plan = Plan {
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
+                history_sender: pipeline.history_sender(&env, &raw, &report),
                 groups,
             };
             if plan.groups.len() > 1 {
@@ -129,7 +134,10 @@ async fn classify_one(
         .filter(|d| matches!(d.verdict, Verdict::Deliver))
         .map(|d| d.recipient.clone())
         .collect();
-    pipeline.record_delivery(&env, delivered).await;
+    let history = plan
+        .history_sender
+        .clone()
+        .map(|sender| (env.clone(), sender));
     let cfg = &pipeline.cfg;
     if plan.groups.len() > 1 {
         // Copies get ids derived from the original and their recipients, so a
@@ -161,7 +169,12 @@ async fn classify_one(
         spool.update(&env).await.map_err(|err| err.to_string())?;
         let _ = tokio::fs::remove_file(&plan_path).await;
     }
-    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await
+    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await?;
+    // Only once the message was handed to delivery.
+    if let Some((env, sender)) = history {
+        pipeline.record_delivery(&env, &sender, delivered).await;
+    }
+    Ok(())
 }
 
 async fn act(

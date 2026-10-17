@@ -58,6 +58,8 @@ impl TenantContext {
 
 /// Lookalike findings kept per report, one per source and target.
 const MAX_FINDINGS: usize = 32;
+/// Lookalike findings at or above this count towards BEC.
+const STRONG_LOOKALIKE: f64 = 0.7;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
@@ -143,7 +145,9 @@ impl Classifier {
         self
     }
 
-    /// Note a delivery so later mail from `sender` is not a first-time sender.
+    /// Note a delivery so later mail from `sender` (the From address) is not
+    /// a first-time sender. Callers record only mail that passed SPF or DMARC,
+    /// so a forged From cannot pre-seed the history.
     pub fn record_delivery(&self, tenant: &TenantContext, sender: &str, recipients: &[String]) {
         let Some(history) = &self.history else {
             return;
@@ -293,15 +297,16 @@ impl Classifier {
         let (spam, note) = self.spam.score_noted(&tenant.key, &view, urls);
         notes.extend(note);
         let bec = bec.map(|mut ctx| {
-            ctx.lookalike_sender |= lookalikes.iter().any(|f| f.source != "url");
+            ctx.lookalike_sender |= lookalikes
+                .iter()
+                .any(|f| f.source != "url" && f.score >= STRONG_LOOKALIKE);
             if ctx.first_time.is_none() {
-                // The same address `record_delivery` stores: the envelope
-                // sender, or the From address for a null sender.
-                let sender = if envelope_sender.is_empty() {
-                    view.from.first().map(String::as_str).unwrap_or("")
-                } else {
-                    envelope_sender
-                };
+                // The From address, the one `record_delivery` stores.
+                let sender = view
+                    .from
+                    .first()
+                    .map(String::as_str)
+                    .unwrap_or(envelope_sender);
                 ctx.first_time = self
                     .history
                     .as_ref()
