@@ -50,16 +50,23 @@ impl TenantContext {
     }
 }
 
+/// Lookalike findings kept per report, one per source and target.
+const MAX_FINDINGS: usize = 32;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Classification {
-    pub spam: SpamReport,
+    /// `None` when the message was skipped.
+    pub spam: Option<SpamReport>,
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Report flags for policy: `classify_skipped`, `link_scan_truncated`.
+    pub flags: Vec<String>,
     /// Degraded scoring, for the report notes.
     pub notes: Vec<String>,
 }
 
 pub struct Classifier {
-    /// Brands and `classify.protected_domains`, shared by every tenant.
+    /// Brands, `classify.protected_domains` and the allowed domains, shared
+    /// by every tenant.
     protected: Protected,
     spam: SpamClassifier,
 }
@@ -69,7 +76,7 @@ impl Classifier {
     /// logged and skipped, so rules and lookalikes still score, and each
     /// report says so.
     pub fn from_config(cfg: &Config) -> Result<Self, ClassifyError> {
-        let (rules, brands) = load(&cfg.classify)?;
+        let loaded = load(&cfg.classify)?;
         let bayes = match Bayes::open(&cfg.classify.bayes_database) {
             Ok(store) => Some(store),
             Err(err) => {
@@ -77,9 +84,12 @@ impl Classifier {
                 None
             }
         };
-        let mut protected = brands;
+        let mut protected = loaded.brands;
         protected.extend(cfg.classify.protected_domains.iter().cloned());
-        Ok(Self::new(&protected, SpamClassifier { bayes, rules }))
+        let mut allowed = loaded.siblings;
+        allowed.extend(cfg.classify.allowed_domains.iter().cloned());
+        let rules = loaded.rules;
+        Ok(Self::new(&protected, SpamClassifier { bayes, rules }).with_allowed(&allowed))
     }
 
     pub fn new(protected: &[String], spam: SpamClassifier) -> Self {
@@ -87,6 +97,12 @@ impl Classifier {
             protected: Protected::new(protected),
             spam,
         }
+    }
+
+    /// Domains never flagged as lookalikes.
+    pub fn with_allowed(mut self, allowed: &[String]) -> Self {
+        self.protected.allow(allowed);
+        self
     }
 
     pub fn spam(&self) -> &SpamClassifier {
@@ -115,6 +131,19 @@ impl Classifier {
     ) -> Classification {
         let view = MessageView::parse(raw);
         let mut notes = Vec::new();
+        let mut flags = Vec::new();
+        if view.skipped {
+            return Classification {
+                spam: None,
+                lookalikes: Vec::new(),
+                flags: vec!["classify_skipped".into()],
+                notes: vec![format!(
+                    "classify skipped: more than {} embedded messages or {} multiparts",
+                    message::MAX_EMBEDDED_MESSAGES,
+                    message::MAX_MULTIPARTS
+                )],
+            };
+        }
         if view.failed {
             notes.push("classify could not parse the message headers".to_string());
         }
@@ -124,28 +153,48 @@ impl Classifier {
                 message::MAX_RAW_BYTES
             ));
         }
+        if view.links_truncated {
+            flags.push("link_scan_truncated".to_string());
+            notes.push("link scan truncated: some links were not checked".to_string());
+        }
         if self.spam.bayes.is_none() {
             notes.push("bayes store unavailable: spam score is rules only".to_string());
         }
         let mut protected = self.protected.clone();
         protected.extend(&tenant.domains);
         let mut lookalikes: Vec<LookalikeFinding> = Vec::new();
+        let mut capped = false;
+        let mut seen = std::collections::HashSet::new();
         let mut check = |source: &str, domain: &str| {
             let domain = domain.to_lowercase();
-            if lookalikes
-                .iter()
-                .any(|found| found.source == source && found.domain == domain)
+            if lookalikes.len() >= MAX_FINDINGS
+                || !seen.insert((source.to_string(), domain.clone()))
             {
                 return;
             }
             if let Some(hit) = protected.score(&domain) {
-                lookalikes.push(LookalikeFinding {
-                    source: source.into(),
-                    domain,
-                    target: hit.target,
-                    technique: hit.technique,
-                    score: hit.score,
-                });
+                match lookalikes
+                    .iter_mut()
+                    .find(|found| found.source == source && found.target == hit.target)
+                {
+                    // One finding per source and target: keep the strongest.
+                    Some(found) if found.score >= hit.score => {}
+                    Some(found) => {
+                        found.domain = domain;
+                        found.technique = hit.technique;
+                        found.score = hit.score;
+                    }
+                    None => {
+                        lookalikes.push(LookalikeFinding {
+                            source: source.into(),
+                            domain,
+                            target: hit.target,
+                            technique: hit.technique,
+                            score: hit.score,
+                        });
+                        capped |= lookalikes.len() >= MAX_FINDINGS;
+                    }
+                }
             }
         };
         let senders = view
@@ -167,31 +216,51 @@ impl Classifier {
         for host in view.hosts.iter().cloned().chain(worker_hosts) {
             check("url", &host);
         }
+        if capped {
+            notes.push(format!("lookalike findings capped at {MAX_FINDINGS}"));
+        }
+        let (spam, note) = self.spam.score_noted(&tenant.key, &view, urls);
+        notes.extend(note);
         Classification {
-            spam: self.spam.score(&tenant.key, &view, urls),
+            spam: Some(spam),
             lookalikes,
+            flags,
             notes,
         }
     }
 }
 
-/// Load the configured rules and brand list, for `--check-config`.
+/// Load the configured rules and brand list, and open the Bayes store when
+/// its directory exists, for `--check-config`.
 pub fn check_config(cfg: &ClassifyConfig) -> Result<(), ClassifyError> {
-    load(cfg).map(|_| ())
+    load(cfg)?;
+    if cfg.bayes_database.parent().is_some_and(|dir| dir.is_dir()) {
+        Bayes::open(&cfg.bayes_database)?;
+    }
+    Ok(())
 }
 
-fn load(cfg: &ClassifyConfig) -> Result<(RuleSet, Vec<String>), ClassifyError> {
+struct Loaded {
+    rules: RuleSet,
+    brands: Vec<String>,
+    siblings: Vec<String>,
+}
+
+fn load(cfg: &ClassifyConfig) -> Result<Loaded, ClassifyError> {
     let rules = match &cfg.spam_rules_dir {
         Some(dir) => RuleSet::load_dir(dir)?,
         None => RuleSet::builtin()?,
     };
-    let brands = match &cfg.brands_file {
+    let text = match &cfg.brands_file {
         Some(path) => std::fs::read_to_string(path)
-            .map(|text| lookalike::parse_brands(&text))
             .map_err(|err| ClassifyError::Brands(format!("{}: {err}", path.display())))?,
-        None => lookalike::parse_brands(lookalike::BRANDS_AU),
+        None => lookalike::BRANDS_AU.to_string(),
     };
-    Ok((rules, brands))
+    Ok(Loaded {
+        rules,
+        brands: lookalike::parse_brands(&text),
+        siblings: lookalike::parse_brand_siblings(&text),
+    })
 }
 
 #[cfg(test)]

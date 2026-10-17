@@ -129,6 +129,10 @@ pub struct ScanReport {
     pub spam: Option<SpamReport>,
     #[serde(default)]
     pub lookalikes: Vec<LookalikeFinding>,
+    /// Named conditions from later stages, exposed to policy as flags, for
+    /// example `classify_skipped` or `link_scan_truncated`.
+    #[serde(default)]
+    pub flags: Vec<String>,
 }
 
 impl ScanReport {
@@ -146,6 +150,7 @@ impl ScanReport {
             notes: Vec::new(),
             spam: None,
             lookalikes: Vec::new(),
+            flags: Vec::new(),
         }
     }
 }

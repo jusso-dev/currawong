@@ -14,11 +14,31 @@ pub const BRANDS_AU: &str = include_str!("../../../rules/brands-au.txt");
 /// which also bounds the edit distance work per candidate.
 const MAX_HOST_BYTES: usize = 253;
 const MAX_LABEL_CHARS: usize = 63;
-/// Labels shorter than this only swap between Australian suffixes, so
-/// `my.com` or `anz.co.nz` are not lookalikes of `my.gov.au` or `anz.com`.
-const MIN_FREE_SWAP_LABEL: usize = 5;
+/// A suffix swap is an Australian suffix, or for labels of at least
+/// `MIN_GENERIC_SWAP_LABEL` characters a generic one. Other country suffixes
+/// (`westpac.co.nz`, `anz.com.sg`) are usually the brand's own sites, and short
+/// ordinary words (`my.com`, `word.org`) are usually someone else's.
+const MIN_GENERIC_SWAP_LABEL: usize = 6;
 const AU_SUFFIXES: &[&str] = &[
     "au", "com.au", "net.au", "org.au", "gov.au", "asn.au", "id.au",
+];
+const GENERIC_SUFFIXES: &[&str] = &["com", "net", "org", "co", "info", "biz"];
+/// Edit distance needs a label this long; `opus` is one edit from `optus`.
+const MIN_EDIT_LABEL: usize = 6;
+/// Hosting and CDN domains whose customer hosts often embed the customer's
+/// own name (`ato.gov.au.cdn.cloudflare.net`). They are not cousins.
+const CDN_DOMAINS: &[&str] = &[
+    "akamai.net",
+    "akamaiedge.net",
+    "akamaihd.net",
+    "azureedge.net",
+    "azurefd.net",
+    "cloudflare.net",
+    "cloudfront.net",
+    "edgekey.net",
+    "edgesuite.net",
+    "fastly.net",
+    "trafficmanager.net",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -28,15 +48,29 @@ pub struct Lookalike {
     pub score: f64,
 }
 
-/// Domains from a brand list. Each line is `Name: domain domain ...`.
+/// Protected domains from a brand list. Each line is
+/// `Name: domain domain ... !sibling ...`; `!` marks the brand's own sites
+/// elsewhere (`!anz.co.nz`), which are never flagged and are not targets.
 pub fn parse_brands(text: &str) -> Vec<String> {
+    brand_entries(text)
+        .filter(|entry| !entry.starts_with('!'))
+        .collect()
+}
+
+/// The `!sibling` domains from a brand list.
+pub fn parse_brand_siblings(text: &str) -> Vec<String> {
+    brand_entries(text)
+        .filter_map(|entry| entry.strip_prefix('!').map(str::to_string))
+        .collect()
+}
+
+fn brand_entries(text: &str) -> impl Iterator<Item = String> + '_ {
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| line.split_once(':').map(|(_, domains)| domains))
         .flat_map(str::split_whitespace)
         .map(str::to_ascii_lowercase)
-        .collect()
 }
 
 /// The strongest imitation of a protected domain, if any.
@@ -44,10 +78,11 @@ pub fn score(candidate: &str, protected: &[String]) -> Option<Lookalike> {
     Protected::new(protected).score(candidate)
 }
 
-/// Protected domains, normalised once.
+/// Protected domains, normalised once, and allowed domains that are never flagged.
 #[derive(Debug, Clone, Default)]
 pub struct Protected {
     domains: Vec<Domain>,
+    allowed: Vec<String>,
 }
 
 impl Protected {
@@ -69,12 +104,23 @@ impl Protected {
         }
     }
 
+    /// Registrable domains that are never lookalikes, such as a brand's
+    /// sibling sites or a tenant's partners.
+    pub fn allow(&mut self, names: &[String]) {
+        for domain in names.iter().filter_map(|name| Domain::new(name)) {
+            if !self.allowed.contains(&domain.registrable) {
+                self.allowed.push(domain.registrable);
+            }
+        }
+    }
+
     pub fn score(&self, candidate: &str) -> Option<Lookalike> {
         let candidate = Domain::new(candidate)?;
-        if self
-            .domains
-            .iter()
-            .any(|target| target.registrable == candidate.registrable)
+        if self.allowed.contains(&candidate.registrable)
+            || self
+                .domains
+                .iter()
+                .any(|target| target.registrable == candidate.registrable)
         {
             return None;
         }
@@ -104,18 +150,18 @@ fn compare(candidate: &Domain, target: &Domain) -> Option<Lookalike> {
         return found(LookalikeTechnique::Homoglyph, 0.95);
     }
     let length = target.label.chars().count();
+    let suffix = candidate.suffix.as_str();
     if candidate.label == target.label
-        && (length >= MIN_FREE_SWAP_LABEL
-            || (AU_SUFFIXES.contains(&candidate.suffix.as_str())
-                && AU_SUFFIXES.contains(&target.suffix.as_str())))
+        && (AU_SUFFIXES.contains(&suffix)
+            || (length >= MIN_GENERIC_SWAP_LABEL && GENERIC_SUFFIXES.contains(&suffix)))
     {
         return found(LookalikeTechnique::SuffixSwap, 0.8);
     }
-    // Short labels such as `ato` or `nab` are a single edit from ordinary
-    // words, so they only match on skeletons, suffixes and cousins.
+    // Short labels such as `ato`, `nab` or `optus` are a single edit from
+    // ordinary words, so they only match on skeletons, suffixes and cousins.
     let max_edits = match length {
-        0..=4 => 0,
-        5..=8 => 1,
+        0..MIN_EDIT_LABEL => 0,
+        MIN_EDIT_LABEL..=8 => 1,
         _ => 2,
     };
     if max_edits > 0
@@ -134,7 +180,15 @@ fn compare(candidate: &Domain, target: &Domain) -> Option<Lookalike> {
             );
         }
     }
-    if embeds(&candidate.host, &target.registrable) {
+    // The protected name must sit in front of the candidate's own suffix:
+    // `xero.com.au` is `xero` under `com.au`, not `xero.com` embedded.
+    let before_suffix = &candidate.host[..candidate.host.len() - candidate.suffix.len() - 1];
+    // CDN names can be public suffixes themselves (`cdn.cloudflare.net`), so
+    // match on the host.
+    let on_cdn = CDN_DOMAINS
+        .iter()
+        .any(|cdn| candidate.host.ends_with(&format!(".{cdn}")));
+    if embeds(before_suffix, &target.registrable) && !on_cdn {
         return found(LookalikeTechnique::Cousin, 0.7);
     }
     // A hyphenated label with the protected name as one part. An equal label

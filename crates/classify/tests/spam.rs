@@ -370,7 +370,7 @@ fn spam_degraded_scoring_is_noted() {
         "",
         &[],
     );
-    assert_eq!(result.spam.bayes, 0.5);
+    assert_eq!(result.spam.unwrap().bayes, 0.5);
     assert!(
         result
             .notes

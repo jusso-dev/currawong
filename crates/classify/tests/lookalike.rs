@@ -1,5 +1,5 @@
 use currawong_classify::{
-    lookalike::{parse_brands, score, BRANDS_AU},
+    lookalike::{parse_brand_siblings, parse_brands, score, Protected, BRANDS_AU},
     spam::{RuleSet, SpamClassifier},
     Classifier, TenantContext,
 };
@@ -205,4 +205,79 @@ fn lookalike_config_protects_extra_domains_for_every_tenant() {
         .collect();
     assert_eq!(targets, vec!["partner.com.au", "example.test"]);
     assert!(result.notes.is_empty(), "{:?}", result.notes);
+
+    // Configured allowed domains and brand siblings are never flagged.
+    cfg.classify.allowed_domains = vec!["partner.net.au".into()];
+    let classifier = Classifier::from_config(&cfg).unwrap();
+    let raw = b"From: a@partner.net.au\r\nSubject: hi\r\n\r\nhttps://westpac.co.nz/\r\n";
+    let result = classifier.classify(&TenantContext::domain("example.test"), raw, "", &[]);
+    assert!(result.lookalikes.is_empty(), "{:?}", result.lookalikes);
+}
+
+#[test]
+fn lookalike_siblings_vendors_and_short_words_are_not_flagged() {
+    let mut protected = Protected::new(&protected());
+    protected.allow(&parse_brand_siblings(BRANDS_AU));
+    protected.extend(&["plumb.com.au".to_string()]);
+    for candidate in [
+        "westpac.co.nz",
+        "westpac.com.fj",
+        "medicare.com",
+        "opus.com.au",
+        "xero.com.au",
+        "xero.co.nz",
+        "anz.com.sg",
+        "anz.co.nz",
+        "ato.gov.au.cdn.cloudflare.net",
+        "plumb.org",
+    ] {
+        assert_eq!(protected.score(candidate), None, "{candidate}");
+    }
+    // Real imitations still are.
+    for (candidate, target) in [
+        ("commbank.com", "commbank.com.au"),
+        ("plumb.net.au", "plumb.com.au"),
+        ("ato.gov.au.secure-login.net", "ato.gov.au"),
+    ] {
+        let hit = protected
+            .score(candidate)
+            .unwrap_or_else(|| panic!("{candidate}"));
+        assert_eq!(hit.target, target, "{candidate}");
+    }
+}
+
+#[test]
+fn lookalike_findings_are_deduplicated_and_capped() {
+    let mut body = String::new();
+    for i in 0..100 {
+        body.push_str(&format!("https://login{i}.c0mmbank.com.au/\r\n"));
+    }
+    for i in 0..10 {
+        body.push_str(&format!("https://login{i}.westpak.com.au/\r\n"));
+    }
+    let raw = format!("From: a@example.test\r\nSubject: news\r\n\r\n{body}");
+    let result = classifier().classify(
+        &TenantContext::domain("example.test"),
+        raw.as_bytes(),
+        "",
+        &[],
+    );
+    let targets: Vec<&str> = result
+        .lookalikes
+        .iter()
+        .map(|f| f.target.as_str())
+        .collect();
+    // One finding per source and target, however many hosts imitate it.
+    assert_eq!(targets, vec!["commbank.com.au", "westpac.com.au"]);
+
+    let mut body = String::new();
+    for i in 0..100 {
+        body.push_str(&format!("https://ex{i}mple.test/\r\n"));
+    }
+    let raw = format!("From: a@example.test\r\nSubject: news\r\n\r\n{body}");
+    // Many different tenants' lookalikes at once are capped.
+    let tenant_domains: Vec<String> = (0..100).map(|i| format!("ex{i}ample.test")).collect();
+    let many = TenantContext::tenant("t", &tenant_domains);
+    let result = classifier().classify(&many, raw.as_bytes(), "", &[]);
+    assert!(result.lookalikes.len() <= 32, "{}", result.lookalikes.len());
 }

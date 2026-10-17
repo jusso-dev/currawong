@@ -286,6 +286,9 @@ pub struct ClassifyConfig {
     /// More domains to protect in every tenant's mail. A tenant's own domains
     /// are protected in its own mail.
     pub protected_domains: Vec<String>,
+    /// Domains never flagged as lookalikes, such as partners or vendors whose
+    /// names resemble a tenant's.
+    pub allowed_domains: Vec<String>,
 }
 
 /// Policy engine. With neither set, the built-in default pack applies.
@@ -478,6 +481,7 @@ impl Default for ClassifyConfig {
             spam_rules_dir: None,
             brands_file: None,
             protected_domains: Vec::new(),
+            allowed_domains: Vec::new(),
         }
     }
 }

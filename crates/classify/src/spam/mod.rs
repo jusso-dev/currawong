@@ -50,11 +50,23 @@ pub struct SpamClassifier {
 
 impl SpamClassifier {
     pub fn score(&self, tenant: &str, view: &MessageView, urls: &[String]) -> SpamReport {
+        self.score_noted(tenant, view, urls).0
+    }
+
+    /// The report, plus a note when the Bayes lookup failed and only rules scored.
+    pub fn score_noted(
+        &self,
+        tenant: &str,
+        view: &MessageView,
+        urls: &[String],
+    ) -> (SpamReport, Option<String>) {
+        let mut note = None;
         let bayes = match &self.bayes {
             Some(store) => store
                 .score(tenant, &bayes::tokens(view, urls))
                 .unwrap_or_else(|err| {
                     tracing::warn!(%err, "bayes score failed");
+                    note = Some(format!("bayes score failed, rules only: {err}"));
                     0.5
                 }),
             None => 0.5,
@@ -62,11 +74,12 @@ impl SpamClassifier {
         let rules_hit = self.rules.evaluate(view, urls);
         let total =
             (bayes - 0.5) * 2.0 * BAYES_POINTS + rules_hit.iter().map(|hit| hit.score).sum::<f64>();
-        SpamReport {
+        let report = SpamReport {
             bayes,
             rules_hit,
             total,
-        }
+        };
+        (report, note)
     }
 
     /// Train the tenant's classifier from a quarantine release or a user

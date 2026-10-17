@@ -196,10 +196,15 @@ authserv_id = "currawong.example.test"
 # classify.protected_domains: more domains to protect in every tenant's mail.
 # Each relay tenant's own domains are protected in that tenant's mail only;
 # an accepted domain with no tenant protects itself and has its own Bayes store.
+# classify.allowed_domains: never flagged as lookalikes (partners or vendors
+# whose names resemble a tenant's). Brand siblings are `!domain` entries in
+# the brand list.
+# --check-config opens the Bayes store when its directory exists.
 [classify]
 enabled = true
 bayes_database = "/var/lib/currawong/bayes.sqlite"
 protected_domains = []
+allowed_domains = []
 
 # policy.pack: TOML policy pack (see config/policies/default.toml). Unset uses the built-in default pack.
 # policy.database: SQLite policy store, seeded from the pack the first time it is opened.

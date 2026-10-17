@@ -13,8 +13,8 @@
 # even after the verdict is set. `dry_run = true` explains a match without
 # acting on it. Unmatched mail is delivered.
 #
-# Spam scores are not produced yet; the spam policies take effect once the
-# spam stage reports a `spam` score.
+# The `spam` score is the classify stage's total: Bayes points (-5 to +5, 0
+# until a tenant has trained) plus the weighted rules in rules/spam/.
 
 [[policy]]
 id = "active-content"

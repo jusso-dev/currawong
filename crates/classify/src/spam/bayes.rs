@@ -8,7 +8,7 @@
 //! so padding a message with unknown words does not dilute it.
 use super::SpamError;
 use crate::message::{address_domain, url_host, MessageView};
-use rusqlite::{params, params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{params, params_from_iter, types::Value, Connection, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, path::Path, sync::Mutex};
 
@@ -25,6 +25,12 @@ const MAX_DISCRIMINATORS: usize = 150;
 const LOOKUP_CHUNK: usize = 500;
 /// Token rows kept per tenant. Training beyond this evicts the rarest tokens.
 pub const DEFAULT_MAX_TOKENS_PER_TENANT: usize = 500_000;
+/// Rows evicted per training call, so one call never holds the writer long.
+const EVICT_BATCH: i64 = 10_000;
+/// Trained-message records are kept this long for relabelling. Feedback on
+/// an older message counts as new.
+pub const DEFAULT_TRAINED_TTL_SECS: i64 = 180 * 24 * 60 * 60;
+const EXPIRE_BATCH: i64 = 1_000;
 /// Header words that become `name:word` tokens.
 const PREFIXED_HEADERS: &[&str] = &[
     "subject",
@@ -67,15 +73,26 @@ pub enum Trained {
     Relabelled,
 }
 
+/// Training writes through one connection and scoring reads through another
+/// (WAL), so a training transaction does not hold up scoring.
 pub struct Bayes {
-    conn: Mutex<Connection>,
-    max_tokens: usize,
+    writer: Mutex<Connection>,
+    /// `None` for an in-memory store, which scores through the writer.
+    reader: Option<Mutex<Connection>>,
+    max_tokens: i64,
+    trained_ttl_secs: i64,
 }
 
 impl Bayes {
     /// Open or create the store. The directory must already exist.
     pub fn open(path: &Path) -> Result<Self, SpamError> {
-        Self::init(Connection::open(path)?)
+        let mut bayes = Self::init(Connection::open(path)?)?;
+        let reader = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        bayes.reader = Some(Mutex::new(reader));
+        Ok(bayes)
     }
 
     pub fn in_memory() -> Result<Self, SpamError> {
@@ -84,7 +101,7 @@ impl Bayes {
 
     /// Token rows kept per tenant before the rarest are evicted.
     pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
-        self.max_tokens = max_tokens.max(1);
+        self.max_tokens = max_tokens.max(1) as i64;
         self
     }
 
@@ -100,27 +117,35 @@ impl Bayes {
                 ham INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (tenant_id, token_hash)
             );
+            CREATE INDEX IF NOT EXISTS bayes_tokens_weight
+                ON bayes_tokens (tenant_id, spam + ham);
             CREATE TABLE IF NOT EXISTS bayes_messages (
                 tenant_id TEXT PRIMARY KEY,
                 spam INTEGER NOT NULL DEFAULT 0,
-                ham INTEGER NOT NULL DEFAULT 0
+                ham INTEGER NOT NULL DEFAULT 0,
+                tokens INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS bayes_trained (
                 tenant_id TEXT NOT NULL,
                 message_id TEXT NOT NULL,
                 label INTEGER NOT NULL,
+                token_hashes BLOB NOT NULL,
+                trained_at INTEGER NOT NULL,
                 PRIMARY KEY (tenant_id, message_id)
-            );",
+            );
+            CREATE INDEX IF NOT EXISTS bayes_trained_age ON bayes_trained (trained_at);",
         )?;
         Ok(Self {
-            conn: Mutex::new(conn),
-            max_tokens: DEFAULT_MAX_TOKENS_PER_TENANT,
+            writer: Mutex::new(conn),
+            reader: None,
+            max_tokens: DEFAULT_MAX_TOKENS_PER_TENANT as i64,
+            trained_ttl_secs: DEFAULT_TRAINED_TTL_SECS,
         })
     }
 
     /// Count one message's tokens as spam or ham for a tenant. Training the
     /// same message again is a no-op; training it with the other label
-    /// reverses the first label.
+    /// reverses exactly the tokens recorded the first time.
     pub fn train(
         &self,
         tenant: &str,
@@ -128,138 +153,200 @@ impl Bayes {
         tokens: &[String],
         label: Label,
     ) -> Result<Trained, SpamError> {
-        let mut conn = self.conn.lock().map_err(|_| poisoned())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs() as i64)
+            .unwrap_or_default();
+        let mut conn = self.writer.lock().map_err(|_| poisoned())?;
         let tx = conn.transaction()?;
-        let previous: Option<i64> = tx
+        tx.execute(
+            "DELETE FROM bayes_trained WHERE rowid IN (
+                SELECT rowid FROM bayes_trained WHERE trained_at < ?1 LIMIT ?2)",
+            params![now - self.trained_ttl_secs, EXPIRE_BATCH],
+        )?;
+        let previous: Option<(i64, Vec<u8>)> = tx
             .query_row(
-                "SELECT label FROM bayes_trained WHERE tenant_id = ?1 AND message_id = ?2",
+                "SELECT label, token_hashes FROM bayes_trained
+                 WHERE tenant_id = ?1 AND message_id = ?2",
                 params![tenant, message_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
+        let (spam, ham) = label.counts();
         let outcome = match previous {
-            Some(code) if code == label.code() => return Ok(Trained::Unchanged),
-            Some(_) => Trained::Relabelled,
+            Some((code, _)) if code == label.code() => {
+                tx.commit()?;
+                return Ok(Trained::Unchanged);
+            }
+            Some((_, recorded)) => {
+                // The old label is the other one: take its counts back off.
+                let mut forget = tx.prepare_cached(
+                    "UPDATE bayes_tokens SET spam = MAX(spam - ?3, 0), ham = MAX(ham - ?4, 0)
+                     WHERE tenant_id = ?1 AND token_hash = ?2",
+                )?;
+                for hash in decode_hashes(&recorded) {
+                    forget.execute(params![tenant, hash, ham, spam])?;
+                }
+                tx.execute(
+                    "UPDATE bayes_messages SET spam = MAX(spam - ?2, 0), ham = MAX(ham - ?3, 0)
+                     WHERE tenant_id = ?1",
+                    params![tenant, ham, spam],
+                )?;
+                Trained::Relabelled
+            }
             None => Trained::New,
         };
-        let (spam, ham) = label.counts();
-        if outcome == Trained::Relabelled {
-            // The old label is the other one: take its counts back off.
-            let mut forget = tx.prepare_cached(
-                "UPDATE bayes_tokens SET spam = MAX(spam - ?3, 0), ham = MAX(ham - ?4, 0)
+        let hashes = unique_hashes(tokens);
+        let mut added = 0i64;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR IGNORE INTO bayes_tokens (tenant_id, token_hash, spam, ham)
+                 VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            let mut update = tx.prepare_cached(
+                "UPDATE bayes_tokens SET spam = spam + ?3, ham = ham + ?4
                  WHERE tenant_id = ?1 AND token_hash = ?2",
             )?;
-            for token in tokens {
-                forget.execute(params![tenant, token_hash(token), ham, spam])?;
-            }
-            tx.execute(
-                "UPDATE bayes_messages SET spam = MAX(spam - ?2, 0), ham = MAX(ham - ?3, 0)
-                 WHERE tenant_id = ?1",
-                params![tenant, ham, spam],
-            )?;
-        }
-        {
-            let mut upsert = tx.prepare_cached(
-                "INSERT INTO bayes_tokens (tenant_id, token_hash, spam, ham) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT (tenant_id, token_hash)
-                 DO UPDATE SET spam = spam + excluded.spam, ham = ham + excluded.ham",
-            )?;
-            for token in tokens {
-                upsert.execute(params![tenant, token_hash(token), spam, ham])?;
+            for hash in &hashes {
+                if insert.execute(params![tenant, hash, spam, ham])? == 1 {
+                    added += 1;
+                } else {
+                    update.execute(params![tenant, hash, spam, ham])?;
+                }
             }
         }
         tx.execute(
-            "INSERT INTO bayes_messages (tenant_id, spam, ham) VALUES (?1, ?2, ?3)
-             ON CONFLICT (tenant_id)
-             DO UPDATE SET spam = spam + excluded.spam, ham = ham + excluded.ham",
-            params![tenant, spam, ham],
+            "INSERT INTO bayes_messages (tenant_id, spam, ham, tokens) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (tenant_id) DO UPDATE SET spam = spam + excluded.spam,
+                 ham = ham + excluded.ham, tokens = tokens + excluded.tokens",
+            params![tenant, spam, ham, added],
         )?;
         tx.execute(
-            "INSERT INTO bayes_trained (tenant_id, message_id, label) VALUES (?1, ?2, ?3)
-             ON CONFLICT (tenant_id, message_id) DO UPDATE SET label = excluded.label",
-            params![tenant, message_id, label.code()],
+            "INSERT INTO bayes_trained (tenant_id, message_id, label, token_hashes, trained_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (tenant_id, message_id) DO UPDATE SET label = excluded.label,
+                 token_hashes = excluded.token_hashes, trained_at = excluded.trained_at",
+            params![
+                tenant,
+                message_id,
+                label.code(),
+                encode_hashes(&hashes),
+                now
+            ],
         )?;
         let rows: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM bayes_tokens WHERE tenant_id = ?1",
+            "SELECT tokens FROM bayes_messages WHERE tenant_id = ?1",
             params![tenant],
             |row| row.get(0),
         )?;
-        let max = self.max_tokens as i64;
-        if rows > max {
-            // Evict down to 90% so the next message does not prune again.
-            tx.execute(
+        if rows > self.max_tokens {
+            // Evict the rarest towards 90% of the cap, one bounded batch per call.
+            let excess = (rows - self.max_tokens * 9 / 10).min(EVICT_BATCH);
+            let evicted = tx.execute(
                 "DELETE FROM bayes_tokens WHERE rowid IN (
                     SELECT rowid FROM bayes_tokens WHERE tenant_id = ?1
-                    ORDER BY spam + ham ASC, rowid ASC LIMIT ?2)",
-                params![tenant, rows - max * 9 / 10],
+                    ORDER BY spam + ham ASC LIMIT ?2)",
+                params![tenant, excess],
+            )? as i64;
+            tx.execute(
+                "UPDATE bayes_messages SET tokens = MAX(tokens - ?2, 0) WHERE tenant_id = ?1",
+                params![tenant, evicted],
             )?;
         }
         tx.commit()?;
         Ok(outcome)
     }
 
+    fn read<T>(
+        &self,
+        query: impl FnOnce(&Connection) -> Result<T, SpamError>,
+    ) -> Result<T, SpamError> {
+        let lock = self.reader.as_ref().unwrap_or(&self.writer);
+        let conn = lock.lock().map_err(|_| poisoned())?;
+        query(&conn)
+    }
+
     /// Trained spam and ham message counts for a tenant.
     pub fn totals(&self, tenant: &str) -> Result<(i64, i64), SpamError> {
-        let conn = self.conn.lock().map_err(|_| poisoned())?;
-        Ok(conn
-            .query_row(
-                "SELECT spam, ham FROM bayes_messages WHERE tenant_id = ?1",
-                params![tenant],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or((0, 0)))
+        self.read(|conn| totals(conn, tenant))
     }
 
     /// Token rows stored for a tenant.
     pub fn token_rows(&self, tenant: &str) -> Result<i64, SpamError> {
-        let conn = self.conn.lock().map_err(|_| poisoned())?;
-        Ok(conn.query_row(
-            "SELECT COUNT(*) FROM bayes_tokens WHERE tenant_id = ?1",
-            params![tenant],
-            |row| row.get(0),
-        )?)
+        self.read(|conn| {
+            Ok(conn.query_row(
+                "SELECT COUNT(*) FROM bayes_tokens WHERE tenant_id = ?1",
+                params![tenant],
+                |row| row.get(0),
+            )?)
+        })
     }
 
     /// Spam probability from 0 to 1. 0.5 until the tenant has trained both classes.
     pub fn score(&self, tenant: &str, tokens: &[String]) -> Result<f64, SpamError> {
-        let (spam_total, ham_total) = self.totals(tenant)?;
-        if spam_total == 0 || ham_total == 0 {
-            return Ok(0.5);
-        }
-        let hashes: Vec<i64> = tokens
-            .iter()
-            .map(|token| token_hash(token))
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let conn = self.conn.lock().map_err(|_| poisoned())?;
-        let mut probabilities = Vec::new();
-        for chunk in hashes.chunks(LOOKUP_CHUNK) {
-            let placeholders = (0..chunk.len())
-                .map(|i| format!("?{}", i + 2))
-                .collect::<Vec<_>>()
-                .join(",");
-            let mut lookup = conn.prepare_cached(&format!(
-                "SELECT spam, ham FROM bayes_tokens WHERE tenant_id = ?1 AND token_hash IN ({placeholders})"
-            ))?;
-            let values = std::iter::once(Value::Text(tenant.to_string()))
-                .chain(chunk.iter().map(|hash| Value::Integer(*hash)));
-            let rows = lookup.query_map(params_from_iter(values), |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })?;
-            for row in rows {
-                let (spam, ham) = row?;
-                let f = robinson(spam, ham, spam_total, ham_total);
-                if (f - 0.5).abs() >= MIN_DEVIATION {
-                    probabilities.push(f);
+        self.read(|conn| {
+            let (spam_total, ham_total) = totals(conn, tenant)?;
+            if spam_total == 0 || ham_total == 0 {
+                return Ok(0.5);
+            }
+            let hashes = unique_hashes(tokens);
+            let mut probabilities = Vec::new();
+            for chunk in hashes.chunks(LOOKUP_CHUNK) {
+                let placeholders = (0..chunk.len())
+                    .map(|i| format!("?{}", i + 2))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let mut lookup = conn.prepare_cached(&format!(
+                    "SELECT spam, ham FROM bayes_tokens WHERE tenant_id = ?1 AND token_hash IN ({placeholders})"
+                ))?;
+                let values = std::iter::once(Value::Text(tenant.to_string()))
+                    .chain(chunk.iter().map(|hash| Value::Integer(*hash)));
+                let rows = lookup.query_map(params_from_iter(values), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })?;
+                for row in rows {
+                    let (spam, ham) = row?;
+                    let f = robinson(spam, ham, spam_total, ham_total);
+                    if (f - 0.5).abs() >= MIN_DEVIATION {
+                        probabilities.push(f);
+                    }
                 }
             }
-        }
-        probabilities.sort_by(|a, b| (b - 0.5).abs().total_cmp(&(a - 0.5).abs()));
-        probabilities.truncate(MAX_DISCRIMINATORS);
-        Ok(fisher(&probabilities))
+            probabilities.sort_by(|a, b| (b - 0.5).abs().total_cmp(&(a - 0.5).abs()));
+            probabilities.truncate(MAX_DISCRIMINATORS);
+            Ok(fisher(&probabilities))
+        })
     }
+}
+
+fn totals(conn: &Connection, tenant: &str) -> Result<(i64, i64), SpamError> {
+    Ok(conn
+        .query_row(
+            "SELECT spam, ham FROM bayes_messages WHERE tenant_id = ?1",
+            params![tenant],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, 0)))
+}
+
+fn unique_hashes(tokens: &[String]) -> Vec<i64> {
+    let mut seen = HashSet::new();
+    tokens
+        .iter()
+        .map(|token| token_hash(token))
+        .filter(|hash| seen.insert(*hash))
+        .collect()
+}
+
+fn encode_hashes(hashes: &[i64]) -> Vec<u8> {
+    hashes.iter().flat_map(|hash| hash.to_be_bytes()).collect()
+}
+
+fn decode_hashes(bytes: &[u8]) -> impl Iterator<Item = i64> + '_ {
+    bytes
+        .chunks_exact(8)
+        .map(|chunk| i64::from_be_bytes(chunk.try_into().expect("eight bytes")))
 }
 
 /// Robinson's f(w): the token's spam ratio pulled towards 0.5 when it is rare.
@@ -357,9 +444,22 @@ fn words(text: &str) -> impl Iterator<Item = String> + '_ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{sync::mpsc, time::Duration};
 
     fn strings(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| word.to_string()).collect()
+    }
+
+    fn counts(bayes: &Bayes, tenant: &str, token: &str) -> (i64, i64) {
+        let conn = bayes.writer.lock().unwrap();
+        conn.query_row(
+            "SELECT spam, ham FROM bayes_tokens WHERE tenant_id = ?1 AND token_hash = ?2",
+            params![tenant, token_hash(token)],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .unwrap()
+        .unwrap_or((0, 0))
     }
 
     #[test]
@@ -407,10 +507,42 @@ mod tests {
             Trained::Relabelled
         );
         assert_eq!(bayes.totals("t").unwrap(), (0, 1));
-        // The spam counts were taken back off: a fresh spam message plus this
-        // ham one leave the shared tokens exactly neutral.
-        bayes.train("t", "m2", &tokens, Label::Spam).unwrap();
-        assert_eq!(bayes.score("t", &tokens).unwrap(), 0.5);
+        assert_eq!(counts(&bayes, "t", "invoice"), (0, 1));
+    }
+
+    #[test]
+    fn relabelling_reverses_the_recorded_tokens() {
+        let bayes = Bayes::in_memory().unwrap();
+        bayes
+            .train("t", "m1", &strings(&["alpha", "bravo"]), Label::Spam)
+            .unwrap();
+        // The second report tokenises differently (say, a rule or parser
+        // change); the first label's tokens are still reversed exactly.
+        bayes
+            .train("t", "m1", &strings(&["charlie"]), Label::Ham)
+            .unwrap();
+        assert_eq!(counts(&bayes, "t", "alpha"), (0, 0));
+        assert_eq!(counts(&bayes, "t", "bravo"), (0, 0));
+        assert_eq!(counts(&bayes, "t", "charlie"), (0, 1));
+    }
+
+    #[test]
+    fn trained_records_expire() {
+        let bayes = Bayes::in_memory().unwrap();
+        let tokens = strings(&["invoice"]);
+        bayes.train("t", "m1", &tokens, Label::Spam).unwrap();
+        bayes
+            .writer
+            .lock()
+            .unwrap()
+            .execute("UPDATE bayes_trained SET trained_at = 0", [])
+            .unwrap();
+        // The old record has expired, so this is new feedback, not a relabel.
+        assert_eq!(
+            bayes.train("t", "m1", &tokens, Label::Ham).unwrap(),
+            Trained::New
+        );
+        assert_eq!(bayes.totals("t").unwrap(), (1, 1));
     }
 
     #[test]
@@ -422,11 +554,47 @@ mod tests {
                 .train("t", &format!("m{i}"), &tokens, Label::Spam)
                 .unwrap();
         }
-        assert!(bayes.token_rows("t").unwrap() <= 50);
+        let rows = bayes.token_rows("t").unwrap();
+        assert!(rows <= 50, "{rows}");
+        // The tracked count matches the table.
+        let tracked: i64 = bayes
+            .writer
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT tokens FROM bayes_messages WHERE tenant_id = 't'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tracked, rows);
         bayes
             .train("other", "m", &strings(&["kept"]), Label::Ham)
             .unwrap();
         assert_eq!(bayes.token_rows("other").unwrap(), 1);
+    }
+
+    #[test]
+    fn scoring_does_not_wait_for_the_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let bayes = std::sync::Arc::new(Bayes::open(&dir.path().join("bayes.sqlite")).unwrap());
+        let spam = strings(&["casino"]);
+        bayes.train("t", "s", &spam, Label::Spam).unwrap();
+        bayes
+            .train("t", "h", &strings(&["roster"]), Label::Ham)
+            .unwrap();
+        // Hold the writer as a long training transaction would.
+        let _writer = bayes.writer.lock().unwrap();
+        let (sent, received) = mpsc::channel();
+        let scorer = std::sync::Arc::clone(&bayes);
+        std::thread::spawn(move || {
+            let _ = sent.send(scorer.score("t", &spam));
+        });
+        let score = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("scoring waited for the writer")
+            .unwrap();
+        assert!(score > 0.5);
     }
 
     #[test]

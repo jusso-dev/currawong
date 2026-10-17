@@ -210,6 +210,112 @@ async fn classify_uses_the_recipient_tenant_for_bayes_and_protected_domains() {
     assert_eq!(unclaimed.spam.as_ref().unwrap().bayes, 0.5);
 }
 
+fn classify_pipeline(dir: &std::path::Path, scanner: bool) -> Pipeline {
+    let mut cfg = Config::default();
+    cfg.spool.dir = dir.join("spool");
+    cfg.scanner.enabled = scanner;
+    cfg.scanner.clamd.address.clear();
+    cfg.scanner.worker_binary = None;
+    cfg.classify.bayes_database = dir.join("bayes.sqlite");
+    let auth = AuthChecker::offline("currawong.example.test").unwrap();
+    Pipeline::new(Arc::new(cfg), auth)
+}
+
+#[tokio::test]
+async fn default_pack_quarantines_and_tags_on_the_spam_score() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pipeline = classify_pipeline(dir.path(), true);
+    // Rules: shouting 1.5, prize 1.5, bulk mailer 1, urgency 1, crypto 2,
+    // IP literal 2, shortener 1 = 10, over the pack's quarantine line of 8.
+    let spam = b"From: promo@promo.example\r\nTo: dest@example.test\r\nSubject: WINNER WINNER\r\nX-Mailer: BulkMail Pro\r\n\r\nAct now: Bitcoin with guaranteed returns at http://192.0.2.10/claim or https://bit.ly/x\r\n";
+    let (report, decision) = pipeline
+        .assess(&envelope("promo@promo.example"), spam, None)
+        .await;
+    assert!(report.spam.as_ref().unwrap().total >= 8.0, "{report:?}");
+    assert_eq!(decision.decisions[0].queue(), Some("spam"), "{decision:?}");
+    assert!(matches!(decision.verdict(), Verdict::Quarantine { .. }));
+
+    // Shouting, prize and crypto = 5: delivered with the [SPAM] header.
+    let tagged = b"From: promo@promo.example\r\nTo: dest@example.test\r\nSubject: WINNER WINNER\r\n\r\nBitcoin with guaranteed returns\r\n";
+    let (report, decision) = pipeline
+        .assess(&envelope("promo@promo.example"), tagged, None)
+        .await;
+    let total = report.spam.as_ref().unwrap().total;
+    assert!((5.0..8.0).contains(&total), "{total}");
+    assert!(
+        matches!(decision.verdict(), Verdict::Deliver),
+        "{decision:?}"
+    );
+    assert!(decision.decisions[0].actions.iter().any(|action| matches!(
+        action,
+        currawong_policy::Action::AddHeader { name, value }
+            if name == "X-Currawong-Spam" && value == "[SPAM]"
+    )));
+}
+
+#[tokio::test]
+async fn lookalike_and_classify_flags_reach_policy_signals() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pipeline = classify_pipeline(dir.path(), true);
+    let raw = b"From: Refunds <refunds@c0mmbank.com.au>\r\nTo: dest@example.test\r\nSubject: refund\r\n\r\nhello\r\n";
+    let (report, _) = pipeline
+        .evaluate(&envelope("bounce@c0mmbank.com.au"), raw, None)
+        .await;
+    let signals = currawong_policy::Signals::from_report(&report);
+    assert!(signals.flags.contains("lookalike"), "{signals:?}");
+    assert_eq!(signals.scores.get("lookalike"), Some(&0.95));
+    assert!(signals.scores.contains_key("spam"));
+
+    let mut body = String::new();
+    for i in 0..600 {
+        body.push_str(&format!("https://site{i}.example.test/\r\n"));
+    }
+    let raw =
+        format!("From: a@example.test\r\nTo: dest@example.test\r\nSubject: links\r\n\r\n{body}");
+    let (report, _) = pipeline
+        .evaluate(&envelope("a@example.test"), raw.as_bytes(), None)
+        .await;
+    let signals = currawong_policy::Signals::from_report(&report);
+    assert!(signals.flags.contains("link_scan_truncated"), "{signals:?}");
+}
+
+#[tokio::test]
+async fn deeply_nested_message_is_held_without_crashing_the_classifier() {
+    let dir = tempfile::tempdir().unwrap();
+    // The scanner is off so only the classifier parses the message here.
+    let mut pipeline = classify_pipeline(dir.path(), false);
+    let mut raw = b"From: a@example.test\r\nTo: dest@example.test\r\nSubject: nest\r\n".to_vec();
+    for _ in 0..50_000 {
+        raw.extend_from_slice(b"Content-Type: message/rfc822\r\n\r\n");
+    }
+    raw.extend_from_slice(b"Subject: inner\r\n\r\nhello\r\n");
+    let (report, verdict) = pipeline
+        .evaluate(&envelope("a@example.test"), &raw, None)
+        .await;
+    assert!(report.fail_closed, "{:?}", report.notes);
+    assert!(report.flags.contains(&"classify_skipped".to_string()));
+    assert!(report.spam.is_none());
+    assert!(matches!(verdict, Verdict::Quarantine { .. }), "{verdict:?}");
+}
+
+#[test]
+fn check_config_opens_the_bayes_store_when_its_directory_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = currawong_core::config::ClassifyConfig {
+        bayes_database: dir.path().join("bayes.sqlite"),
+        ..Default::default()
+    };
+    currawong_classify::check_config(&cfg).unwrap();
+    assert!(cfg.bayes_database.exists());
+    // A path that is not a database fails the check.
+    std::fs::write(dir.path().join("junk.sqlite"), vec![0xffu8; 4096]).unwrap();
+    cfg.bayes_database = dir.path().join("junk.sqlite");
+    assert!(currawong_classify::check_config(&cfg).is_err());
+    // A missing directory is left to the daemon, which scores rules only.
+    cfg.bayes_database = dir.path().join("missing/bayes.sqlite");
+    currawong_classify::check_config(&cfg).unwrap();
+}
+
 #[tokio::test]
 async fn pending_mail_is_not_marked_deliver_before_the_pipeline() {
     let dir = tempfile::tempdir().unwrap();

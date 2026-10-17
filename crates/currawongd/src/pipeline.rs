@@ -274,8 +274,13 @@ impl Pipeline {
         .await
         {
             Ok(result) => {
-                report.spam = Some(result.spam);
+                // A message too nested to parse safely is held, not delivered unscored.
+                if result.flags.iter().any(|flag| flag == "classify_skipped") {
+                    report.fail_closed = true;
+                }
+                report.spam = result.spam;
                 report.lookalikes = result.lookalikes;
+                report.flags.extend(result.flags);
                 report.notes.extend(result.notes);
             }
             Err(err) => report.notes.push(format!("classifier failed: {err}")),
