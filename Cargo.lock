@@ -809,6 +809,7 @@ dependencies = [
  "currawong-smtp",
  "currawong-spool",
  "hex",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",

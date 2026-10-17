@@ -81,7 +81,7 @@ fn policies() -> impl Strategy<Value = Vec<Policy>> {
                         enabled,
                         dry_run,
                         mandatory,
-                        override_floor: false,
+                        override_floor: Vec::new(),
                         conditions,
                         actions,
                     }

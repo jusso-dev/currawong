@@ -1,17 +1,29 @@
 //! Run the pipeline before delivery. Unscanned mail is never handed to the deliverer.
-use currawong_core::{config::Config, Verdict};
+use currawong_core::{config::Config, Direction, MessageId, ScanReport, Verdict};
 use currawong_policy::{canonical_domain, Action, Decision};
 use currawong_quarantine::QuarantineStore;
 use currawong_smtp::delivery::{build_dsn, is_null_sender};
 use currawong_spool::{Envelope, RcptStatus, Spool, SpoolState};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Cursor;
+use std::{io::Cursor, path::PathBuf};
 use time::OffsetDateTime;
 
 use crate::pipeline::{auth_header, Pipeline};
 
-/// Redirect and bcc are skipped on mail that has already made this many hops.
-const MAX_HOPS: usize = 25;
+/// Tenant redirect and bcc are skipped once mail has passed through this
+/// gateway this many times. Platform and mandatory ones always apply.
+const MAX_OWN_HOPS: usize = 3;
+
+/// Everything decided for a message whose recipients must be split. Saved
+/// before any copy is made, so a retry finishes this plan instead of
+/// deciding again under policies that may have changed.
+#[derive(Debug, Serialize, Deserialize)]
+struct Plan {
+    auth: Option<String>,
+    bounce: bool,
+    groups: Vec<Vec<Decision>>,
+}
 
 /// One failing message is logged and skipped; it does not stall the rest.
 pub async fn classify_pending(
@@ -57,18 +69,41 @@ async fn classify_one(
         .read_body(&env.id)
         .await
         .map_err(|err| err.to_string())?;
-    let body_path = spool_body(spool, &env);
-    let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
-    let auth = report.auth.as_ref().map(auth_header);
+    let plan_path = plan_path(spool, &env.id);
+    let plan = match tokio::fs::read(&plan_path).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
+        Err(_) => {
+            let body_path = spool_body(spool, &env);
+            let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            let plan = Plan {
+                auth: report.auth.as_ref().map(auth_header),
+                bounce: bounce_allowed(&env, &report, &raw),
+                groups: decision
+                    .split()
+                    .into_iter()
+                    .map(|group| group.into_iter().cloned().collect())
+                    .collect(),
+            };
+            if plan.groups.len() > 1 {
+                write_atomic(
+                    &plan_path,
+                    &serde_json::to_vec(&plan).map_err(|e| e.to_string())?,
+                )
+                .await?;
+            }
+            plan
+        }
+    };
     let cfg = &pipeline.cfg;
-    let groups = decision.split();
-    if groups.len() > 1 {
+    if plan.groups.len() > 1 {
         // Copies get ids derived from the original and their recipients, so a
-        // retry after an error or crash finds them instead of making more. They
-        // carry this pass's decision and are not scanned again.
-        for group in &groups[1..] {
+        // retry finds them instead of making more. They carry the plan's
+        // decision and are not scanned again.
+        for group in &plan.groups[1..] {
             let rcpts: Vec<String> = group.iter().map(|d| d.recipient.clone()).collect();
-            let id = split_id(&env, &rcpts);
+            let mut sorted = rcpts.clone();
+            sorted.sort();
+            let id = derived_id(&env.id, &sorted.join("\n"));
             if spool.load(&id).await.is_ok() {
                 continue;
             }
@@ -83,13 +118,14 @@ async fn classify_one(
                 .accept(copy.clone(), Cursor::new(raw.clone()))
                 .await
                 .map_err(|err| err.to_string())?;
-            act(spool, quarantine, cfg, copy, &raw, group[0], auth.clone()).await?;
+            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan).await?;
         }
-        let rcpts: Vec<String> = groups[0].iter().map(|d| d.recipient.clone()).collect();
+        let rcpts: Vec<String> = plan.groups[0].iter().map(|d| d.recipient.clone()).collect();
         narrow(&mut env, &rcpts);
         spool.update(&env).await.map_err(|err| err.to_string())?;
+        let _ = tokio::fs::remove_file(&plan_path).await;
     }
-    act(spool, quarantine, cfg, env, &raw, groups[0][0], auth).await
+    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await
 }
 
 async fn act(
@@ -99,10 +135,10 @@ async fn act(
     mut env: Envelope,
     raw: &[u8],
     decision: &Decision,
-    auth: Option<String>,
+    plan: &Plan,
 ) -> Result<(), String> {
     tracing::info!(id = %env.id, explanation = %decision.explanation.join("; "), "policy decision");
-    env.prepend_headers.extend(auth);
+    env.prepend_headers.extend(plan.auth.clone());
     let finish = |env: &Envelope| {
         let id = env.id.clone();
         async move {
@@ -144,9 +180,11 @@ async fn act(
             finish(&env).await?;
             tracing::info!(id = %env.id, %reason, "quarantined");
         }
-        // Mail is already accepted, so a reject is a bounce to the sender.
+        // Mail is already accepted, so a reject is a bounce, and only to a
+        // sender we can trust; anything else would be backscatter.
         Verdict::Reject { code, reason } => {
-            let detail = format!("{code} message refused by policy {reason}");
+            // The policy id stays in our log, not in mail to the sender.
+            let detail = format!("{code} message refused by recipient policy");
             env.rcpt_status = env
                 .rcpt_to
                 .iter()
@@ -156,20 +194,23 @@ async fn act(
                     detail: detail.clone(),
                 })
                 .collect();
-            if !env.dsn_sent && !is_null_sender(&env.mail_from) {
-                spool
-                    .accept(
-                        bounce(&env, cfg),
-                        Cursor::new(build_dsn(&cfg.gateway.hostname, &env, raw, &detail)),
-                    )
-                    .await
-                    .map_err(|err| err.to_string())?;
+            if plan.bounce && !env.dsn_sent {
+                let dsn = bounce(&env, cfg);
+                if spool.load(&dsn.id).await.is_err() {
+                    let body = build_dsn(&cfg.gateway.hostname, &env, raw, &detail);
+                    spool
+                        .accept(dsn, Cursor::new(body))
+                        .await
+                        .map_err(|err| err.to_string())?;
+                }
                 env.dsn_sent = true;
+            } else if !plan.bounce {
+                tracing::info!(id = %env.id, "sender not verified, rejected without a bounce");
             }
             env.pipeline = "reject".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
             finish(&env).await?;
-            tracing::info!(id = %env.id, %detail, "rejected");
+            tracing::info!(id = %env.id, policy = %reason, %detail, "rejected");
         }
         Verdict::Discard => {
             env.pipeline = "discard".into();
@@ -181,10 +222,32 @@ async fn act(
     Ok(())
 }
 
-/// The DSN envelope: from the null sender, back to the original sender.
+/// Bounce only to senders we can stand behind: our own authenticated users,
+/// or a sender SPF or DMARC vouched for. Never to the null sender or to
+/// automatic mail.
+fn bounce_allowed(env: &Envelope, report: &ScanReport, raw: &[u8]) -> bool {
+    if is_null_sender(&env.mail_from) {
+        return false;
+    }
+    let auto = headers(raw).iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("auto-submitted") && !value.trim().eq_ignore_ascii_case("no")
+    });
+    if auto {
+        return false;
+    }
+    let submitted = env.direction == Direction::Outbound || env.tenant_id.is_some();
+    let verified = report.auth.as_ref().is_some_and(|auth| {
+        auth.spf.result.eq_ignore_ascii_case("pass")
+            || auth.dmarc.result.eq_ignore_ascii_case("pass")
+    });
+    submitted || verified
+}
+
+/// The DSN envelope: from the null sender, back to the original sender, under
+/// an id derived from the original so a retry cannot queue a second one.
 fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     let mut dsn = env.clone();
-    dsn.id = Envelope::new_id();
+    dsn.id = derived_id(&env.id, "dsn");
     dsn.mail_from = String::new();
     dsn.rcpt_to = vec![env.mail_from.clone()];
     dsn.received_at = OffsetDateTime::now_utc();
@@ -193,7 +256,7 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     dsn.attempts = 0;
     dsn.next_attempt_at = None;
     dsn.state = SpoolState::Incoming;
-    dsn.direction = currawong_core::Direction::Inbound;
+    dsn.direction = Direction::Inbound;
     dsn.tls_version = None;
     dsn.tls_cipher = None;
     dsn.rcpt_status = Vec::new();
@@ -203,11 +266,32 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     dsn
 }
 
-fn split_id(env: &Envelope, rcpts: &[String]) -> currawong_core::MessageId {
-    let mut sorted = rcpts.to_vec();
-    sorted.sort();
-    let digest = Sha256::digest(format!("{}\n{}", env.id, sorted.join("\n")));
-    currawong_core::MessageId(hex::encode_upper(digest)[..26].to_string())
+/// A spool-safe id (26 upper-case hex characters) derived from another id.
+fn derived_id(id: &MessageId, salt: &str) -> MessageId {
+    let digest = Sha256::digest(format!("{id}\n{salt}"));
+    MessageId(hex::encode_upper(digest)[..26].to_string())
+}
+
+fn plan_path(spool: &Spool, id: &MessageId) -> PathBuf {
+    spool.root().join("split").join(format!("{id}.json"))
+}
+
+async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = path.parent().ok_or("plan path has no parent")?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|err| err.to_string())?;
+    let tmp = path.with_extension("json.tmp");
+    let mut file = tokio::fs::File::create(&tmp)
+        .await
+        .map_err(|err| err.to_string())?;
+    tokio::io::AsyncWriteExt::write_all(&mut file, bytes)
+        .await
+        .map_err(|err| err.to_string())?;
+    file.sync_all().await.map_err(|err| err.to_string())?;
+    tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|err| err.to_string())
 }
 
 fn narrow(env: &mut Envelope, rcpts: &[String]) {
@@ -217,12 +301,13 @@ fn narrow(env: &mut Envelope, rcpts: &[String]) {
 }
 
 /// Header, redirect and bcc actions, applied before delivery. Redirect and bcc
-/// only reach the recipient tenant's domains or `policy.forward_domains`, and
-/// never on mail that looks like it is looping.
+/// only reach the recipient tenant's domains or `policy.forward_domains`.
+/// Tenant ones stop on mail that has looped through this gateway.
 fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u8]) {
+    let looping = own_hops(raw, &cfg.gateway.hostname) >= MAX_OWN_HOPS;
     let mut redirect = Vec::new();
     let mut bcc = Vec::new();
-    for action in &decision.actions {
+    for (action, enforced) in decision.actions.iter().zip(&decision.enforced) {
         match action {
             Action::AddHeader { name, value } => {
                 env.prepend_headers.push(format!("{name}: {value}\r\n"))
@@ -230,8 +315,8 @@ fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u
             Action::Redirect(to) | Action::Bcc(to) => {
                 if !forward_allowed(cfg, decision.tenant_id.as_deref(), to) {
                     tracing::warn!(id = %env.id, %to, "policy forward target not allowed, skipped");
-                } else if hops(raw) >= MAX_HOPS {
-                    tracing::warn!(id = %env.id, %to, "too many hops, policy forward skipped");
+                } else if looping && !enforced {
+                    tracing::warn!(id = %env.id, %to, "mail is looping, policy forward skipped");
                 } else if matches!(action, Action::Redirect(_)) {
                     redirect.push(to.clone());
                 } else {
@@ -299,14 +384,35 @@ fn forward_allowed(cfg: &Config, tenant: Option<&str>, to: &str) -> bool {
             .any(|d| canonical_domain(d) == domain)
 }
 
-fn hops(raw: &[u8]) -> usize {
+/// Unfolded header fields of the message.
+fn headers(raw: &[u8]) -> Vec<(String, String)> {
     let end = raw
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .unwrap_or(raw.len());
-    raw[..end]
-        .split(|b| *b == b'\n')
-        .filter(|line| line.len() >= 9 && line[..9].eq_ignore_ascii_case(b"received:"))
+    let mut out: Vec<(String, String)> = Vec::new();
+    for line in String::from_utf8_lossy(&raw[..end]).split('\n') {
+        let line = line.trim_end_matches('\r');
+        if line.starts_with([' ', '\t']) {
+            if let Some((_, value)) = out.last_mut() {
+                value.push(' ');
+                value.push_str(line.trim());
+            }
+        } else if let Some((name, value)) = line.split_once(':') {
+            out.push((name.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    out
+}
+
+/// `Received` fields this gateway wrote on delivery (`by <hostname> with ESMTP`).
+fn own_hops(raw: &[u8], hostname: &str) -> usize {
+    let marker = format!("by {} with esmtp", hostname.to_ascii_lowercase());
+    headers(raw)
+        .iter()
+        .filter(|(name, value)| {
+            name.eq_ignore_ascii_case("received") && value.to_ascii_lowercase().contains(&marker)
+        })
         .count()
 }
 

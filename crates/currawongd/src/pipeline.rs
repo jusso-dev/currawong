@@ -19,6 +19,7 @@ pub struct Pipeline {
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
     pub policies: PolicySet,
+    policy_stamp: Option<currawong_policy::Stamp>,
 }
 
 impl Pipeline {
@@ -36,6 +37,7 @@ impl Pipeline {
             auth,
             pool,
             policies: default_pack().clone(),
+            policy_stamp: None,
         }
     }
 
@@ -44,11 +46,36 @@ impl Pipeline {
         self
     }
 
-    /// Load the configured policies again. Returns whether they changed.
-    pub fn reload_policies(&mut self) -> Result<bool, String> {
-        let set = currawong_policy::load(&self.cfg.policy).map_err(|err| err.to_string())?;
+    /// Load the configured policies again if their source changed. Runs the
+    /// file and SQLite reads on a blocking thread. Returns whether they changed.
+    pub async fn reload_policies(&mut self) -> Result<bool, String> {
+        let cfg = self.cfg.policy.clone();
+        let last = self.policy_stamp.clone();
+        let loaded = tokio::task::spawn_blocking(move || {
+            let stamp = currawong_policy::stamp(&cfg)?;
+            if last.as_ref() == Some(&stamp) {
+                return Ok(None);
+            }
+            Ok(Some((stamp, currawong_policy::load(&cfg))))
+        })
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err: currawong_policy::PolicyError| err.to_string())?;
+        let Some((stamp, set)) = loaded else {
+            return Ok(false);
+        };
+        // A bad source is reported once, then again only after it changes.
+        self.policy_stamp = Some(stamp);
+        let set = set.map_err(|err| err.to_string())?;
         if set == self.policies {
             return Ok(false);
+        }
+        for policy in set.policies.iter().filter(|p| !p.override_floor.is_empty()) {
+            tracing::warn!(
+                policy = %policy.id,
+                rules = ?policy.override_floor,
+                "policy lifts the built-in floor for the mail it matches"
+            );
         }
         self.policies = set;
         Ok(true)

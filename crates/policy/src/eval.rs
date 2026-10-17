@@ -9,10 +9,12 @@
 //!    are kept, and mandatory policies add theirs afterwards too.
 //! 3. Dry-run policies are explained only.
 use crate::model::{
-    canonical_address, canonical_domain, Action, Condition, Flow, Policy, PolicySet, Scope,
+    canonical_address, canonical_domain, canonical_pattern, Action, Condition, Flow, Policy,
+    PolicySet, Scope,
 };
 use crate::signals::Signals;
 use currawong_core::{Direction, ScanReport, Verdict};
+use serde::{Deserialize, Serialize};
 
 /// One recipient being decided. A message can span tenants and directions,
 /// so both are resolved per recipient.
@@ -28,20 +30,23 @@ pub struct Context<'a> {
     pub recipient: &'a str,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Matched {
     pub id: String,
     pub dry_run: bool,
 }
 
 /// The outcome for one recipient.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Decision {
     pub recipient: String,
     pub tenant_id: Option<String>,
     pub verdict: Verdict,
     /// Every action that took effect, terminal one included, in order.
     pub actions: Vec<Action>,
+    /// Per action: it came from the floor, a platform policy or a mandatory
+    /// policy, so a sender-controlled signal must never skip it.
+    pub enforced: Vec<bool>,
     pub matched: Vec<Matched>,
     pub explanation: Vec<String>,
 }
@@ -56,7 +61,8 @@ impl Decision {
     }
 }
 
-/// Flag, rule id and queue. Order matters: malware wins over a deferred scan.
+/// Flag, rule id (see `FLOOR_RULES`) and queue. Order matters: malware wins
+/// over a deferred scan.
 const FLOOR: [(&str, &str, Option<&str>); 3] = [
     ("malware", "malware", Some("malware")),
     ("defer", "scan-deferred", None),
@@ -88,6 +94,7 @@ fn evaluate_ordered(
 ) -> Decision {
     let mut verdict = None;
     let mut actions = Vec::new();
+    let mut enforced = Vec::new();
     let mut matched = Vec::new();
     let mut explanation = Vec::new();
     let matches = |policy: &Policy| {
@@ -98,33 +105,35 @@ fn evaluate_ordered(
                 .all(|c| holds(c, policy, signals, ctx, set))
     };
 
-    if let Some((_, rule, queue)) = FLOOR
-        .iter()
-        .find(|(flag, ..)| signals.flags.contains(*flag))
-    {
+    // Each set floor rule applies unless a platform policy lifts that rule.
+    for (flag, rule, queue) in FLOOR {
+        if !signals.flags.contains(flag) {
+            continue;
+        }
         let lifted = order.iter().find(|p| {
-            p.override_floor
+            p.override_floor.iter().any(|r| r == rule)
                 && !p.dry_run
                 && p.tenant_id.is_none()
                 && p.scope == Scope::Global
                 && matches(p)
         });
-        match lifted {
-            Some(policy) => explanation.push(format!("floor {rule} lifted by {}", policy.id)),
-            None => {
-                let action = match queue {
-                    Some(queue) => Action::Quarantine(queue.to_string()),
-                    None => Action::Defer,
-                };
-                explanation.push(format!("floor {rule} matched: {}", describe(&action)));
-                matched.push(Matched {
-                    id: format!("floor:{rule}"),
-                    dry_run: false,
-                });
-                verdict = Some(to_verdict(&action, rule));
-                actions.push(action);
-            }
+        if let Some(policy) = lifted {
+            explanation.push(format!("floor {rule} lifted by {}", policy.id));
+            continue;
         }
+        let action = match queue {
+            Some(queue) => Action::Quarantine(queue.to_string()),
+            None => Action::Defer,
+        };
+        explanation.push(format!("floor {rule} matched: {}", describe(&action)));
+        matched.push(Matched {
+            id: format!("floor:{rule}"),
+            dry_run: false,
+        });
+        verdict = Some(to_verdict(&action, rule));
+        actions.push(action);
+        enforced.push(true);
+        break;
     }
 
     for policy in order {
@@ -165,12 +174,15 @@ fn evaluate_ordered(
             continue;
         }
         explanation.push(format!("{label} matched: {}", summary.join(", ")));
+        let enforce = policy.mandatory || policy.tenant_id.is_none();
         for action in &policy.actions {
             if !action.is_terminal() {
                 actions.push(action.clone());
+                enforced.push(enforce);
             } else if verdict.is_none() {
                 verdict = Some(to_verdict(action, &policy.id));
                 actions.push(action.clone());
+                enforced.push(enforce);
             }
         }
     }
@@ -183,6 +195,7 @@ fn evaluate_ordered(
         tenant_id: ctx.tenant_id.map(str::to_string),
         verdict,
         actions,
+        enforced,
         matched,
         explanation,
     }
@@ -217,13 +230,16 @@ pub fn evaluate_signals(
 }
 
 impl MessageDecision {
-    /// Recipients grouped by identical verdict and actions. More than one group
-    /// means the message has to be split.
+    /// Recipients grouped by identical tenant, verdict and actions. More than
+    /// one group means the message has to be split.
     pub fn split(&self) -> Vec<Vec<&Decision>> {
         let mut groups: Vec<Vec<&Decision>> = Vec::new();
         for decision in &self.decisions {
             match groups.iter_mut().find(|group| {
-                group[0].verdict == decision.verdict && group[0].actions == decision.actions
+                group[0].tenant_id == decision.tenant_id
+                    && group[0].verdict == decision.verdict
+                    && group[0].actions == decision.actions
+                    && group[0].enforced == decision.enforced
             }) {
                 Some(group) => group.push(decision),
                 None => groups.push(vec![decision]),
@@ -265,7 +281,7 @@ fn applies(policy: &Policy, ctx: &Context, set: &PolicySet) -> bool {
         }
         (Scope::Group(group), Direction::Inbound) => set.in_group(owner, group, ctx.recipient),
         (Scope::User(user), Direction::Inbound) => {
-            canonical_address(ctx.recipient) == canonical_address(user)
+            canonical_address(ctx.recipient) == canonical_pattern(user)
         }
         // Outbound: the submission service checks the sender domain belongs to
         // the tenant, but not the mailbox, so user and group need the login.
@@ -277,7 +293,7 @@ fn applies(policy: &Policy, ctx: &Context, set: &PolicySet) -> bool {
             .is_some_and(|id| set.in_group(owner, group, id)),
         (Scope::User(user), Direction::Outbound) => ctx
             .sender_identity
-            .is_some_and(|id| canonical_address(id) == canonical_address(user)),
+            .is_some_and(|id| canonical_address(id) == canonical_pattern(user)),
     }
 }
 
@@ -325,7 +341,7 @@ fn address_matches(pattern: &str, address: &str) -> bool {
         .or_else(|| pattern.strip_prefix('@'))
     {
         Some(domain) => domain_of(address) == canonical_domain(domain),
-        None => canonical_address(pattern) == canonical_address(address),
+        None => canonical_pattern(pattern) == canonical_address(address),
     }
 }
 

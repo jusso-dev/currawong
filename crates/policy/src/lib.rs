@@ -10,14 +10,14 @@ pub use eval::{
     evaluate, evaluate_message, evaluate_signals, Context, Decision, Matched, MessageDecision,
 };
 pub use model::{
-    canonical_address, canonical_domain, Action, Condition, Flow, Policy, PolicyError, PolicySet,
-    Scope,
+    canonical_address, canonical_domain, canonical_pattern, valid_name, valid_tenant, Action,
+    Condition, Flow, Policy, PolicyError, PolicySet, Scope, FLOOR_RULES,
 };
 pub use signals::Signals;
 pub use store::PolicyStore;
 
 use currawong_core::{config::PolicyConfig, Direction, ScanReport, Verdict};
-use std::sync::OnceLock;
+use std::{sync::OnceLock, time::SystemTime};
 
 pub const DEFAULT_PACK: &str = include_str!("../../../config/policies/default.toml");
 
@@ -39,15 +39,50 @@ pub fn load_pack(cfg: &PolicyConfig) -> Result<PolicySet, PolicyError> {
 }
 
 /// Policies for the running gateway: the database when configured (seeded
-/// from the pack the first time only), otherwise the pack.
+/// from the pack the first time only), otherwise the pack. Once the database
+/// is seeded the pack file is not read, so a bad pack cannot block it.
 pub fn load(cfg: &PolicyConfig) -> Result<PolicySet, PolicyError> {
-    let pack = load_pack(cfg)?;
     let Some(path) = &cfg.database else {
-        return Ok(pack);
+        return load_pack(cfg);
     };
     let mut store = PolicyStore::open(path)?;
-    store.seed(&pack)?;
+    if !store.seeded()? {
+        store.seed(&load_pack(cfg)?)?;
+    }
     store.load()
+}
+
+/// Changes whenever the configured policy source might have: the pack file's
+/// modification time and size, and the database revision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stamp {
+    pack: Option<(SystemTime, u64)>,
+    revision: Option<i64>,
+}
+
+pub fn stamp(cfg: &PolicyConfig) -> Result<Stamp, PolicyError> {
+    // A configured database is the source; the pack only seeds it once.
+    if let Some(path) = &cfg.database {
+        return Ok(Stamp {
+            pack: None,
+            revision: Some(PolicyStore::open(path)?.revision()?),
+        });
+    }
+    let pack = match &cfg.pack {
+        Some(path) => {
+            let meta = std::fs::metadata(path)
+                .map_err(|err| PolicyError::Toml(format!("{}: {err}", path.display())))?;
+            Some((
+                meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                meta.len(),
+            ))
+        }
+        None => None,
+    };
+    Ok(Stamp {
+        pack,
+        revision: None,
+    })
 }
 
 /// The default pack with no envelope context. Kept for callers that only have a report.

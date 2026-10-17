@@ -179,10 +179,10 @@ pub struct Policy {
     /// Non-terminal actions apply even after a more specific policy set the verdict.
     #[serde(default, skip_serializing_if = "is_false")]
     pub mandatory: bool,
-    /// Platform global policies only: when this matches, the built-in floor
-    /// (malware, scan deferred, scan failed) does not apply.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub override_floor: bool,
+    /// Platform global policies only: floor rules (`malware`, `scan-deferred`,
+    /// `scan-failed`) that do not apply to mail this policy matches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_floor: Vec<String>,
     #[serde(default)]
     pub conditions: Vec<Condition>,
     #[serde(default)]
@@ -219,11 +219,32 @@ const PROTECTED_HEADERS: &[&str] = &[
     "message-id",
 ];
 
+/// Floor rule ids, in the order the engine applies them.
+pub const FLOOR_RULES: [&str; 3] = ["malware", "scan-deferred", "scan-failed"];
+
+/// Policy ids and queue names appear in logs, headers and the quarantine index.
+pub fn valid_name(name: &str) -> bool {
+    (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+pub fn valid_tenant(tenant: &str) -> bool {
+    !tenant.trim().is_empty() && tenant.trim() == tenant
+}
+
 impl Policy {
     pub fn validate(&self) -> Result<(), PolicyError> {
         let bad = |msg: String| Err(PolicyError::Invalid(format!("{}: {msg}", self.id)));
-        if self.id.trim().is_empty() {
-            return Err(PolicyError::Invalid("policy id is empty".into()));
+        if !valid_name(&self.id) {
+            return Err(PolicyError::Invalid(format!(
+                "policy id {:?} must be 1 to 64 of A-Z, a-z, 0-9, '.', '_', '-'",
+                self.id
+            )));
+        }
+        if self.tenant_id.as_deref().is_some_and(|t| !valid_tenant(t)) {
+            return bad("tenant_id is empty".into());
         }
         match (&self.scope, &self.tenant_id) {
             (Scope::Tenant, None) => return bad("tenant scope needs tenant_id".into()),
@@ -232,8 +253,20 @@ impl Policy {
             }
             _ => {}
         }
-        if self.override_floor && (self.tenant_id.is_some() || self.scope != Scope::Global) {
-            return bad("only platform global policies may override the floor".into());
+        if !self.override_floor.is_empty() {
+            if self.tenant_id.is_some() || self.scope != Scope::Global {
+                return bad("only platform global policies may override the floor".into());
+            }
+            if self.conditions.is_empty() {
+                return bad("a floor override needs conditions".into());
+            }
+            if let Some(rule) = self
+                .override_floor
+                .iter()
+                .find(|r| !FLOOR_RULES.contains(&r.as_str()))
+            {
+                return bad(format!("unknown floor rule {rule}"));
+            }
         }
         if self.scope.value().is_some_and(|v| v.trim().is_empty()) {
             return bad("scope value is empty".into());
@@ -285,6 +318,9 @@ impl Policy {
                         return bad(format!("bad address {addr}"));
                     }
                 }
+                Action::Quarantine(queue) if !valid_name(queue) => {
+                    return bad(format!("queue name {queue:?} is not allowed"));
+                }
                 Action::Reject { code } if !(500..600).contains(code) => {
                     return bad(format!("reject code {code} must be 5xx"));
                 }
@@ -326,6 +362,11 @@ impl PolicySet {
     }
 
     pub fn validate(&self) -> Result<(), PolicyError> {
+        if let Some(tenant) = self.tenant_groups.keys().find(|t| !valid_tenant(t)) {
+            return Err(PolicyError::Invalid(format!(
+                "tenant_groups has an empty tenant id {tenant:?}"
+            )));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for policy in &self.policies {
             policy.validate()?;
@@ -349,18 +390,29 @@ impl PolicySet {
         let address = canonical_address(address);
         groups
             .and_then(|groups| groups.get(group))
-            .is_some_and(|members| members.iter().any(|m| canonical_address(m) == address))
+            .is_some_and(|members| members.iter().any(|m| canonical_pattern(m) == address))
     }
 }
 
-/// Lower case, no `+tag` in the local part, no trailing dot on the domain.
+/// A message address: lower case, no `+tag` in the local part, no trailing
+/// dot on the domain, so sub-addressing cannot dodge a policy.
 pub fn canonical_address(address: &str) -> String {
+    let address = canonical_pattern(address);
+    match address.split_once('@') {
+        Some((local, domain)) => match local.split_once('+') {
+            Some((base, _)) => format!("{base}@{domain}"),
+            None => address,
+        },
+        None => address,
+    }
+}
+
+/// An address written in a policy: lower case, no trailing dot. A `+tag`
+/// here is kept, so it only matches mail to that exact tagged address.
+pub fn canonical_pattern(address: &str) -> String {
     let address = address.trim().to_ascii_lowercase();
     match address.rsplit_once('@') {
-        Some((local, domain)) => {
-            let local = local.split_once('+').map_or(local, |(base, _)| base);
-            format!("{local}@{}", domain.trim_end_matches('.'))
-        }
+        Some((local, domain)) => format!("{local}@{}", domain.trim_end_matches('.')),
         None => address,
     }
 }

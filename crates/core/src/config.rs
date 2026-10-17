@@ -617,6 +617,18 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        // An empty tenant id would share the platform's policy namespace.
+        if let Some(tenant) = self
+            .relay
+            .tenants
+            .iter()
+            .find(|t| t.id.trim().is_empty() || t.id.trim() != t.id)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "relay tenant id {:?} must be non-empty with no surrounding spaces",
+                tenant.id
+            )));
+        }
         Ok(())
     }
 
@@ -663,6 +675,19 @@ mod tests {
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
+    }
+
+    #[test]
+    fn blank_tenant_id_is_refused() {
+        for id in ["", " ", " t1"] {
+            let mut cfg = Config::load(&example_path()).unwrap();
+            cfg.relay.tenants.push(TenantConfig {
+                id: id.into(),
+                domains: vec!["example.test".into()],
+                trusted_cidrs: Vec::new(),
+            });
+            assert!(cfg.validate().is_err(), "{id:?}");
+        }
     }
 
     #[test]

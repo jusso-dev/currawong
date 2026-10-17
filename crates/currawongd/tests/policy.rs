@@ -46,7 +46,7 @@ fn policy(id: &str, tenant: Option<&str>, scope: Scope, actions: Vec<Action>) ->
         enabled: true,
         dry_run: false,
         mandatory: false,
-        override_floor: false,
+        override_floor: Vec::new(),
         conditions: Vec::new(),
         actions,
     }
@@ -324,7 +324,7 @@ async fn split_copies_are_decided_once_and_never_duplicated() {
 }
 
 #[tokio::test]
-async fn reject_bounces_and_discard_is_not_quarantined() {
+async fn reject_bounces_only_verified_senders_once_and_discard_is_not_quarantined() {
     let dir = tempfile::tempdir().unwrap();
     let reject = recipient_is(
         policy(
@@ -339,6 +339,7 @@ async fn reject_bounces_and_discard_is_not_quarantined() {
         policy("drop", None, Scope::Global, vec![Action::Discard]),
         "drop@example.test",
     );
+    // Unverified MX sender: no backscatter.
     let (spool, mut pipeline, quarantine) = harness(
         dir.path(),
         config(dir.path()),
@@ -347,7 +348,19 @@ async fn reject_bounces_and_discard_is_not_quarantined() {
         RAW,
     )
     .await;
-    let dropped = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    // Authenticated submission: bounced.
+    let submitted = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+    let mut env = envelope(submitted, &["reject@example.test"]);
+    env.tenant_id = Some("t1".into());
+    spool.accept(env, Cursor::new(RAW.to_vec())).await.unwrap();
+    // Authenticated but automatic: not bounced.
+    let auto = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+    let mut env = envelope(auto, &["reject@example.test"]);
+    env.tenant_id = Some("t1".into());
+    let mut raw = b"Auto-Submitted: auto-replied\r\n".to_vec();
+    raw.extend_from_slice(RAW);
+    spool.accept(env, Cursor::new(raw)).await.unwrap();
+    let dropped = "01ARZ3NDEKTSV4RRFFQ69G5FAY";
     spool
         .accept(
             envelope(dropped, &["drop@example.test"]),
@@ -359,20 +372,39 @@ async fn reject_bounces_and_discard_is_not_quarantined() {
         .await
         .unwrap();
 
-    let rejected = spool.load(&MessageId(ID.into())).await.unwrap();
-    assert_eq!(rejected.state, SpoolState::Done);
-    assert_eq!(rejected.pipeline, "reject");
-    assert!(rejected.dsn_sent);
-    assert!(rejected.rcpt_status[0].detail.starts_with("554"));
-    let dsn = all(&spool)
-        .await
-        .into_iter()
-        .find(|e| e.mail_from.is_empty())
-        .expect("bounce queued");
-    assert_eq!(dsn.rcpt_to, ["sender@sender.test"]);
-    let body = String::from_utf8(spool.read_body(&dsn.id).await.unwrap()).unwrap();
+    let bounces = |all: Vec<Envelope>| {
+        all.into_iter()
+            .filter(|e| e.mail_from.is_empty())
+            .collect::<Vec<_>>()
+    };
+    let dsns = bounces(all(&spool).await);
+    assert_eq!(dsns.len(), 1, "{dsns:?}");
+    let body = String::from_utf8(spool.read_body(&dsns[0].id).await.unwrap()).unwrap();
     assert!(body.contains("554"), "{body}");
+    assert!(!body.contains("no-entry"), "policy id leaked: {body}");
+    for id in [ID, auto] {
+        let env = spool.load(&MessageId(id.into())).await.unwrap();
+        assert_eq!(env.state, SpoolState::Done);
+        assert_eq!(env.pipeline, "reject");
+        assert!(!env.dsn_sent);
+    }
     assert!(quarantine.reason(ID).is_err());
+
+    // A retry after the envelope update was lost does not queue a second DSN.
+    let mut replay = spool.load(&MessageId(submitted.into())).await.unwrap();
+    assert!(replay.dsn_sent);
+    replay.dsn_sent = false;
+    replay.pipeline = "pending".into();
+    replay.rcpt_status.clear();
+    spool.update(&replay).await.unwrap();
+    spool
+        .transition(&replay.id, SpoolState::Incoming)
+        .await
+        .unwrap();
+    classify_pending(&spool, &mut pipeline, &quarantine)
+        .await
+        .unwrap();
+    assert_eq!(bounces(all(&spool).await).len(), 1);
 
     let discarded = spool.load(&MessageId(dropped.into())).await.unwrap();
     assert_eq!(discarded.state, SpoolState::Done);
@@ -403,14 +435,8 @@ async fn redirect_and_bcc_stay_inside_allowed_domains_and_rcpt_status() {
         status: "pending".into(),
         detail: String::new(),
     }];
-    let (spool, mut pipeline, quarantine) = harness(
-        dir.path(),
-        cfg.clone(),
-        with(vec![forward.clone()]),
-        env,
-        RAW,
-    )
-    .await;
+    let (spool, mut pipeline, quarantine) =
+        harness(dir.path(), cfg.clone(), with(vec![forward]), env, RAW).await;
     classify_pending(&spool, &mut pipeline, &quarantine)
         .await
         .unwrap();
@@ -426,10 +452,44 @@ async fn redirect_and_bcc_stay_inside_allowed_domains_and_rcpt_status() {
     );
     let status: Vec<&str> = env.rcpt_status.iter().map(|s| s.address.as_str()).collect();
     assert_eq!(status, env.rcpt_to);
+}
 
-    // Mail that has already made many hops is not forwarded again.
+#[tokio::test]
+async fn forged_received_headers_do_not_stop_forwarding_and_loops_keep_mandatory_bcc() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let tenant_bcc = policy(
+        "tenant-bcc",
+        Some("t1"),
+        Scope::Tenant,
+        vec![Action::Bcc("audit@example.test".into())],
+    );
+    let mut journal = policy(
+        "journal",
+        None,
+        Scope::Global,
+        vec![Action::Bcc("journal@example.test".into())],
+    );
+    journal.mandatory = true;
+    let mut forged = "Received: from hop by relay.attacker.test with ESMTP id x;\r\n\tdate\r\n"
+        .repeat(30)
+        .into_bytes();
+    forged.extend_from_slice(RAW);
+    let (spool, mut pipeline, quarantine) = harness(
+        dir.path(),
+        cfg.clone(),
+        with(vec![tenant_bcc, journal]),
+        envelope(ID, &["a@example.test"]),
+        &forged,
+    )
+    .await;
+    // Mail that has been through this gateway three times already.
     let looped = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
-    let mut raw = "Received: from hop\r\n".repeat(30).into_bytes();
+    let ours = format!(
+        "Received: from hop ([192.0.2.1]) by {} with ESMTP id y;\r\n\tdate\r\n",
+        cfg.gateway.hostname
+    );
+    let mut raw = ours.repeat(3).into_bytes();
     raw.extend_from_slice(RAW);
     spool
         .accept(envelope(looped, &["a@example.test"]), Cursor::new(raw))
@@ -438,24 +498,112 @@ async fn redirect_and_bcc_stay_inside_allowed_domains_and_rcpt_status() {
     classify_pending(&spool, &mut pipeline, &quarantine)
         .await
         .unwrap();
+    let env = spool.load(&MessageId(ID.into())).await.unwrap();
+    assert_eq!(
+        env.rcpt_to,
+        [
+            "a@example.test",
+            "audit@example.test",
+            "journal@example.test"
+        ]
+    );
     let env = spool.load(&MessageId(looped.into())).await.unwrap();
-    assert_eq!(env.rcpt_to, ["a@example.test"]);
+    assert_eq!(env.rcpt_to, ["a@example.test", "journal@example.test"]);
 }
 
 #[tokio::test]
-async fn policies_reload_from_the_pack_file() {
+async fn an_interrupted_split_finishes_its_plan_after_a_policy_change() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = config(dir.path());
+    let hold = recipient_is(
+        policy(
+            "hold-one",
+            None,
+            Scope::Global,
+            vec![Action::Quarantine("review".into())],
+        ),
+        "held@example.test",
+    );
+    let rcpts = ["a@example.test", "held@example.test"];
+    let (spool, mut pipeline, quarantine) = harness(
+        dir.path(),
+        cfg.clone(),
+        with(vec![hold]),
+        envelope(ID, &rcpts),
+        RAW,
+    )
+    .await;
+    // Make writing the copy fail, as a crash would, after the plan is saved.
+    let digest = Sha256::digest(format!("{ID}\nheld@example.test"));
+    let copy_id = hex::encode_upper(digest)[..26].to_string();
+    let blocker = spool
+        .root()
+        .join(SpoolState::Incoming.dir_name())
+        .join(format!("{copy_id}.eml.tmp"));
+    std::fs::create_dir_all(&blocker).unwrap();
+    classify_pending(&spool, &mut pipeline, &quarantine)
+        .await
+        .unwrap();
+    let original = spool.load(&MessageId(ID.into())).await.unwrap();
+    assert_eq!(original.pipeline, "pending");
+    assert_eq!(original.rcpt_to, rcpts);
+
+    // The policy is removed before the retry; the saved plan still applies.
+    pipeline.policies = default_pack().clone();
+    std::fs::remove_dir(&blocker).unwrap();
+    classify_pending(&spool, &mut pipeline, &quarantine)
+        .await
+        .unwrap();
+    assert_eq!(
+        quarantine.reason(&copy_id).unwrap(),
+        "hold-one (queue review)"
+    );
+    let original = spool.load(&MessageId(ID.into())).await.unwrap();
+    assert_eq!(original.rcpt_to, ["a@example.test"]);
+    assert_eq!(original.pipeline, "deliver");
+    assert!(!spool
+        .root()
+        .join("split")
+        .join(format!("{ID}.json"))
+        .exists());
+}
+
+#[tokio::test]
+async fn policies_reload_when_the_source_changes() {
     let dir = tempfile::tempdir().unwrap();
     let pack = dir.path().join("pack.toml");
     std::fs::write(&pack, "[[policy]]\nid = \"one\"\nactions = [\"deliver\"]\n").unwrap();
     let mut cfg = config(dir.path());
     cfg.policy.pack = Some(pack.clone());
-    let mut pipeline = pipeline(cfg, PolicySet::default());
-    assert_eq!(pipeline.reload_policies(), Ok(true));
-    assert_eq!(pipeline.reload_policies(), Ok(false));
+    let mut pipeline = pipeline(cfg.clone(), PolicySet::default());
+    assert_eq!(pipeline.reload_policies().await, Ok(true));
+    assert_eq!(pipeline.reload_policies().await, Ok(false));
     std::fs::write(&pack, "[[policy]]\nid = \"two\"\nactions = [\"discard\"]\n").unwrap();
-    assert_eq!(pipeline.reload_policies(), Ok(true));
+    assert_eq!(pipeline.reload_policies().await, Ok(true));
     assert_eq!(pipeline.policies.policies[0].id, "two");
     std::fs::write(&pack, "[[policy]]\nid = \"\"\n").unwrap();
-    assert!(pipeline.reload_policies().is_err());
+    assert!(pipeline.reload_policies().await.is_err());
     assert_eq!(pipeline.policies.policies[0].id, "two");
+
+    // With a database, a broken pack does not block reloading the database.
+    cfg.policy.database = Some(dir.path().join("policy.db"));
+    std::fs::write(
+        &pack,
+        "[[policy]]\nid = \"seed\"\nactions = [\"deliver\"]\n",
+    )
+    .unwrap();
+    let mut pipeline = self::pipeline(cfg.clone(), PolicySet::default());
+    assert_eq!(pipeline.reload_policies().await, Ok(true));
+    std::fs::write(&pack, "broken [").unwrap();
+    let mut store =
+        currawong_policy::PolicyStore::open(cfg.policy.database.as_ref().unwrap()).unwrap();
+    store
+        .upsert(
+            None,
+            &policy("added", None, Scope::Global, vec![Action::Discard]),
+        )
+        .unwrap();
+    assert_eq!(pipeline.reload_policies().await, Ok(true));
+    assert_eq!(pipeline.policies.policies.len(), 2);
 }

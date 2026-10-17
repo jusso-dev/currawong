@@ -97,7 +97,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
     let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
-    pipeline.reload_policies()?;
+    pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
@@ -115,7 +115,7 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             if shutdown_loop.is_cancelled() {
                 break;
             }
-            match pipeline.reload_policies() {
+            match pipeline.reload_policies().await {
                 Ok(true) => tracing::info!("policies reloaded"),
                 Ok(false) => {}
                 Err(err) => {

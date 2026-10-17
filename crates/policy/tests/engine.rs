@@ -30,7 +30,7 @@ fn policy(id: &str, scope: Scope, priority: i64, actions: Vec<Action>) -> Policy
         enabled: true,
         dry_run: false,
         mandatory: false,
-        override_floor: false,
+        override_floor: Vec::new(),
         conditions: Vec::new(),
         actions,
     }
@@ -169,15 +169,17 @@ fn floor_cannot_be_overridden_by_tenant_policies_or_an_operator_pack() {
     );
 
     let mut tenant_override = policy("t-override", Scope::Tenant, 1, vec![Action::Deliver]);
-    tenant_override.override_floor = true;
+    tenant_override.override_floor = vec!["malware".into()];
+    tenant_override.conditions = vec![Condition::Flag("malware".into())];
     assert!(tenant_override.validate().is_err());
     let mut user_override = policy("u", Scope::User("a@x.test".into()), 1, vec![]);
     user_override.tenant_id = None;
-    user_override.override_floor = true;
+    user_override.override_floor = vec!["malware".into()];
+    user_override.conditions = vec![Condition::Flag("malware".into())];
     assert!(user_override.validate().is_err());
 
     let mut platform = policy("lab", Scope::Global, 1, vec![Action::Deliver]);
-    platform.override_floor = true;
+    platform.override_floor = vec!["malware".into()];
     platform.conditions = vec![Condition::Recipient("malware-lab@example.com.au".into())];
     let pack = set(vec![platform]);
     assert_eq!(
@@ -193,6 +195,161 @@ fn floor_cannot_be_overridden_by_tenant_policies_or_an_operator_pack() {
         evaluate(&flagged("malware"), &ctx("someone@example.com.au"), &pack).verdict,
         Verdict::Quarantine { .. }
     ));
+
+    // Lifting malware does not lift a failed scan on the same message.
+    let mut both = flagged("malware");
+    both.flag("fail_closed");
+    assert_eq!(
+        evaluate(&both, &ctx("malware-lab@example.com.au"), &pack).verdict,
+        quarantine("scan-failed")
+    );
+    // A floor override must say what it matches and which rule it lifts.
+    let mut blanket = policy("blanket", Scope::Global, 1, vec![Action::Deliver]);
+    blanket.override_floor = vec!["malware".into()];
+    assert!(blanket.validate().is_err());
+    blanket.conditions = vec![Condition::Flag("malware".into())];
+    assert!(blanket.validate().is_ok());
+    blanket.override_floor = vec!["everything".into()];
+    assert!(blanket.validate().is_err());
+}
+
+#[test]
+fn enforced_marks_platform_and_mandatory_actions() {
+    let header = |name: &str| Action::AddHeader {
+        name: name.into(),
+        value: "1".into(),
+    };
+    let platform = policy("platform", Scope::Global, 3, vec![header("X-Platform")]);
+    let tenant = policy("tenant", Scope::Tenant, 1, vec![header("X-Tenant")]);
+    let mut locked = policy("locked", Scope::Tenant, 2, vec![header("X-Locked")]);
+    locked.mandatory = true;
+    let decision = evaluate(
+        &Signals::default(),
+        &ctx("a@example.com.au"),
+        &set(vec![platform, tenant, locked]),
+    );
+    assert_eq!(
+        decision.actions,
+        [header("X-Tenant"), header("X-Locked"), header("X-Platform")]
+    );
+    assert_eq!(decision.enforced, [false, true, true]);
+}
+
+#[test]
+fn split_keeps_tenants_apart() {
+    let contexts = [
+        ctx("a@example.com.au"),
+        Context {
+            tenant_id: Some("t2"),
+            ..ctx("b@other.test")
+        },
+    ];
+    let decision = evaluate_signals(&Signals::default(), &contexts, &set(vec![]));
+    assert_eq!(decision.decisions[0].verdict, decision.decisions[1].verdict);
+    assert_eq!(decision.split().len(), 2);
+}
+
+#[test]
+fn tagged_policy_address_is_not_widened() {
+    let pack = set(vec![policy(
+        "vip-tag",
+        Scope::User("ceo+vip@example.com.au".into()),
+        1,
+        vec![Action::Discard],
+    )]);
+    assert_eq!(
+        evaluate(&Signals::default(), &ctx("ceo@example.com.au"), &pack).verdict,
+        Verdict::Deliver
+    );
+    let mut group = PolicySet {
+        groups: [("vip".into(), vec!["ceo+vip@example.com.au".into()])].into(),
+        ..Default::default()
+    };
+    assert!(!group.in_group(None, "vip", "ceo@example.com.au"));
+    group
+        .groups
+        .insert("all".into(), vec!["ceo@example.com.au".into()]);
+    assert!(group.in_group(None, "all", "ceo+news@example.com.au"));
+}
+
+#[test]
+fn ids_queues_and_tenants_are_restricted() {
+    let mut p = policy("ok.id_1-x", Scope::Global, 1, vec![]);
+    assert!(p.validate().is_ok());
+    for id in [
+        "",
+        "has space",
+        "line\r\nbreak",
+        "ünïcode",
+        "a".repeat(65).as_str(),
+    ] {
+        p.id = id.to_string();
+        assert!(p.validate().is_err(), "{id:?}");
+    }
+    let queue = policy(
+        "q",
+        Scope::Global,
+        1,
+        vec![Action::Quarantine("bad queue".into())],
+    );
+    assert!(queue.validate().is_err());
+    for tenant in ["", " ", "t1 "] {
+        let mut p = policy("t", Scope::Tenant, 1, vec![]);
+        p.tenant_id = Some(tenant.into());
+        assert!(p.validate().is_err(), "{tenant:?}");
+        let mut store = PolicyStore::open_in_memory().unwrap();
+        p.tenant_id = None;
+        assert!(store.upsert(Some(tenant), &p).is_err(), "{tenant:?}");
+        assert!(store.set_group(Some(tenant), "g", &[]).is_err());
+        let groups = PolicySet {
+            tenant_groups: [(tenant.to_string(), Default::default())].into(),
+            ..Default::default()
+        };
+        assert!(groups.validate().is_err());
+    }
+}
+
+#[test]
+fn old_layout_database_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("old.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE policies (id TEXT PRIMARY KEY, tenant_id TEXT, scope_kind TEXT NOT NULL, \
+         scope_value TEXT, priority INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, \
+         dry_run INTEGER NOT NULL DEFAULT 0, conditions TEXT NOT NULL, actions TEXT NOT NULL); \
+         PRAGMA user_version = 1;",
+    )
+    .unwrap();
+    drop(conn);
+    let err = PolicyStore::open(&path).err().expect("old layout refused");
+    assert!(err.to_string().contains("old layout"), "{err}");
+}
+
+#[test]
+fn stamp_follows_store_writes_and_a_seeded_database_ignores_the_pack() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = dir.path().join("pack.toml");
+    std::fs::write(&pack, "[[policy]]\nid = \"one\"\nactions = [\"deliver\"]\n").unwrap();
+    let cfg = currawong_core::config::PolicyConfig {
+        pack: Some(pack.clone()),
+        database: Some(dir.path().join("policy.db")),
+        forward_domains: Vec::new(),
+    };
+    assert_eq!(currawong_policy::load(&cfg).unwrap().policies.len(), 1);
+    let before = currawong_policy::stamp(&cfg).unwrap();
+    assert_eq!(currawong_policy::stamp(&cfg).unwrap(), before);
+    // A broken pack no longer matters once the database is seeded.
+    std::fs::write(&pack, "not toml [").unwrap();
+    let mut store = PolicyStore::open(cfg.database.as_ref().unwrap()).unwrap();
+    store
+        .upsert(
+            None,
+            &policy("two", Scope::Global, 1, vec![Action::Discard]),
+        )
+        .unwrap();
+    assert_ne!(currawong_policy::stamp(&cfg).unwrap(), before);
+    assert_eq!(currawong_policy::load(&cfg).unwrap().policies.len(), 2);
 }
 
 #[test]
@@ -591,7 +748,7 @@ fn pack_round_trips_through_toml_and_the_store() {
     drop(store);
 
     // Reopening runs no migration twice and keeps the edits.
-    let store = PolicyStore::open(&path).unwrap();
+    let mut store = PolicyStore::open(&path).unwrap();
     let set = store.load().unwrap();
     assert!(set.policies.iter().all(|p| p.id != "active-content"));
     assert!(
@@ -640,7 +797,8 @@ fn store_namespaces_keep_tenants_apart() {
     assert!(store.upsert(Some("b"), &foreign).is_err());
     let mut lift = policy("l", Scope::Tenant, 1, vec![]);
     lift.tenant_id = None;
-    lift.override_floor = true;
+    lift.override_floor = vec!["malware".into()];
+    lift.conditions = vec![Condition::Flag("malware".into())];
     assert!(store.upsert(Some("b"), &lift).is_err());
     // Groups are per namespace.
     store
@@ -667,7 +825,7 @@ fn load_seeds_the_database_once() {
     };
     let set = currawong_policy::load(&cfg).unwrap();
     assert_eq!(set.policies.len(), default_pack().policies.len());
-    let store = PolicyStore::open(cfg.database.as_ref().unwrap()).unwrap();
+    let mut store = PolicyStore::open(cfg.database.as_ref().unwrap()).unwrap();
     for policy in store.list(None).unwrap() {
         store.delete(None, &policy.id).unwrap();
     }
