@@ -1,5 +1,5 @@
 use currawong_core::{Direction, MessageId};
-use currawong_spool::{next_retry, Envelope, Spool, SpoolState};
+use currawong_spool::{next_retry, Envelope, Spool, SpoolError, SpoolState};
 use std::io::Write;
 use std::{net::IpAddr, time::Duration};
 use time::OffsetDateTime;
@@ -156,6 +156,48 @@ async fn eml_without_any_envelope_is_quarantined_not_deleted() {
     assert!(spool.recover().await.unwrap().is_empty());
     assert_eq!(names(&dir.path().join("bad")), [format!("{ID}.eml")]);
     assert!(names(&dir.path().join("active")).is_empty());
+}
+
+#[tokio::test]
+async fn quarantine_never_overwrites_an_earlier_bad_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    std::fs::write(dir.path().join(format!("bad/{ID}.eml")), b"earlier").unwrap();
+    std::fs::write(dir.path().join(format!("active/{ID}.eml")), BODY).unwrap();
+
+    spool.recover().await.unwrap();
+    let bad = dir.path().join("bad");
+    assert_eq!(names(&bad), [format!("{ID}.eml"), format!("{ID}.eml.1")]);
+    assert_eq!(
+        std::fs::read(bad.join(format!("{ID}.eml"))).unwrap(),
+        b"earlier"
+    );
+    assert_eq!(
+        std::fs::read(bad.join(format!("{ID}.eml.1"))).unwrap(),
+        BODY
+    );
+}
+
+#[tokio::test]
+async fn envelope_naming_another_message_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let spool = Spool::open(dir.path()).await.unwrap();
+    std::fs::write(dir.path().join(format!("incoming/{ID}.eml")), BODY).unwrap();
+    write_json(
+        dir.path().join(format!("incoming/{ID}.json")),
+        &envelope("01ARZ3NDEKTSV4RRFFQ69G5FB9"),
+    );
+
+    assert!(matches!(
+        spool.load(&MessageId(ID.into())).await,
+        Err(SpoolError::IdMismatch { .. })
+    ));
+    assert!(spool.list(SpoolState::Incoming).await.unwrap().is_empty());
+    assert!(spool.recover().await.unwrap().is_empty());
+    assert_eq!(
+        names(&dir.path().join("bad")),
+        [format!("{ID}.eml"), format!("{ID}.json")]
+    );
 }
 
 #[tokio::test]

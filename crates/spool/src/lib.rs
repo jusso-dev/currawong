@@ -38,6 +38,8 @@ pub enum SpoolError {
     UnsafeId(String),
     #[error("task join: {0}")]
     Join(String),
+    #[error("envelope in {file} names message {found}")]
+    IdMismatch { file: String, found: String },
 }
 
 pub type Result<T> = std::result::Result<T, SpoolError>;
@@ -138,6 +140,14 @@ impl Spool {
             create_private_dir(&root.join(state.dir_name()), true).await?;
         }
         create_private_dir(&root.join(BAD_DIR), true).await?;
+        // Make the new directory entries durable before the first 250. The
+        // parent may not be ours to open, so that sync is best effort.
+        sync_dir(&root).await?;
+        if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Err(err) = sync_dir(parent).await {
+                tracing::warn!(%err, dir = %parent.display(), "could not sync spool parent directory");
+            }
+        }
         Ok(Self {
             root,
             #[cfg(test)]
@@ -323,19 +333,23 @@ impl Spool {
         Ok(())
     }
 
+    /// Every step leaves a state from which a rerun picks the same home, so a
+    /// crash during recovery is repaired by the next recovery.
     async fn repair_one(&self, id: &str) -> Result<()> {
-        let mut home = None;
+        let eml = format!("{id}.eml");
+        let json = format!("{id}.json");
+        let mut emls = Vec::new();
         let mut jsons = Vec::new();
         for state in STATES {
             let dir = self.state_dir(state);
-            if home.is_none() && tokio::fs::try_exists(dir.join(format!("{id}.eml"))).await? {
-                home = Some(state);
+            if tokio::fs::try_exists(dir.join(&eml)).await? {
+                emls.push(state);
             }
-            if tokio::fs::try_exists(dir.join(format!("{id}.json"))).await? {
+            if tokio::fs::try_exists(dir.join(&json)).await? {
                 jsons.push(state);
             }
         }
-        let Some(home) = home else {
+        if emls.is_empty() {
             // Only a crash inside `accept` leaves a JSON with no eml, and that
             // was before the 250, so there is no message to keep.
             for state in jsons {
@@ -343,17 +357,31 @@ impl Spool {
                 self.remove_json(state, id).await?;
             }
             return Ok(());
-        };
-        let home_dir = self.state_dir(home);
-        if jsons.contains(&home) {
-            if let Err(err) = read_envelope(&home_dir, id, home).await {
-                tracing::warn!(%id, %err, "quarantining unreadable spool entry");
-                self.quarantine(home, id).await?;
-                return Ok(());
+        }
+        // Home is the first eml with a readable envelope beside it, else the
+        // first eml.
+        let mut home = emls[0];
+        let mut paired = false;
+        for &state in &emls {
+            if jsons.contains(&state)
+                && read_envelope(&self.state_dir(state), id, state)
+                    .await
+                    .is_ok()
+            {
+                home = state;
+                paired = true;
+                break;
             }
-        } else {
-            // Written by an older spool that moved the eml before the JSON:
-            // adopt the first readable envelope from another directory.
+        }
+        if !paired {
+            if jsons.contains(&home) {
+                tracing::warn!(%id, state = home.dir_name(), "quarantining unreadable envelope");
+                self.quarantine(home, &json).await?;
+                jsons.retain(|&state| state != home);
+            }
+            // Split by an older spool that moved the eml before the JSON, or
+            // the envelope beside the eml was unreadable: adopt the first
+            // readable envelope from another directory.
             let mut adopted = None;
             for &state in &jsons {
                 if let Ok(env) = read_envelope(&self.state_dir(state), id, state).await {
@@ -363,14 +391,31 @@ impl Spool {
             }
             let Some(mut env) = adopted else {
                 tracing::warn!(%id, state = home.dir_name(), "quarantining message with no envelope");
-                self.quarantine(home, id).await?;
+                for state in emls {
+                    self.quarantine(state, &eml).await?;
+                }
+                for state in jsons {
+                    self.quarantine(state, &json).await?;
+                }
                 return Ok(());
             };
             tracing::warn!(%id, state = home.dir_name(), "rejoining envelope with its message");
             env.state = home;
+            let home_dir = self.state_dir(home);
             self.write_json(&home_dir, &env).await?;
             sync_dir(&home_dir).await?;
             self.step();
+        }
+        // A second copy of the message is kept for an operator, out of the queue.
+        for state in emls {
+            if state != home {
+                tracing::warn!(%id, state = state.dir_name(), "quarantining duplicate message");
+                if jsons.contains(&state) {
+                    self.quarantine(state, &json).await?;
+                    jsons.retain(|&other| other != state);
+                }
+                self.quarantine(state, &eml).await?;
+            }
         }
         for state in jsons {
             if state != home {
@@ -388,16 +433,19 @@ impl Spool {
         Ok(())
     }
 
-    async fn quarantine(&self, state: SpoolState, id: &str) -> Result<()> {
+    /// Move `name` from a state directory into `bad/`, never over an
+    /// earlier quarantined file.
+    async fn quarantine(&self, state: SpoolState, name: &str) -> Result<()> {
         let dir = self.state_dir(state);
         let bad = self.root.join(BAD_DIR);
-        for name in [format!("{id}.json"), format!("{id}.eml")] {
-            match tokio::fs::rename(dir.join(&name), bad.join(&name)).await {
-                Ok(()) => self.step(),
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
+        let mut target = bad.join(name);
+        let mut n = 1;
+        while tokio::fs::try_exists(&target).await? {
+            target = bad.join(format!("{name}.{n}"));
+            n += 1;
         }
+        tokio::fs::rename(dir.join(name), target).await?;
+        self.step();
         sync_dir(&bad).await?;
         sync_dir(&dir).await?;
         Ok(())
@@ -486,6 +534,12 @@ pub fn is_safe_id(id: &str) -> bool {
 async fn read_envelope(dir: &Path, id: &str, state: SpoolState) -> Result<Envelope> {
     let bytes = tokio::fs::read(dir.join(format!("{id}.json"))).await?;
     let mut env: Envelope = serde_json::from_slice(&bytes)?;
+    if env.id.as_str() != id {
+        return Err(SpoolError::IdMismatch {
+            file: format!("{}/{id}.json", state.dir_name()),
+            found: env.id.0,
+        });
+    }
     env.state = state;
     Ok(env)
 }

@@ -70,7 +70,7 @@ fn after_recovery(state: SpoolState) -> SpoolState {
     }
 }
 
-fn assert_clean(root: &Path) {
+fn assert_tmp_free(root: &Path) {
     for state in STATES {
         let names = files(&root.join(state.dir_name()));
         assert!(
@@ -79,6 +79,10 @@ fn assert_clean(root: &Path) {
             state.dir_name()
         );
     }
+}
+
+fn assert_clean(root: &Path) {
+    assert_tmp_free(root);
     assert!(
         files(&root.join(BAD_DIR)).is_empty(),
         "nothing should be quarantined"
@@ -87,6 +91,7 @@ fn assert_clean(root: &Path) {
 
 /// The message is one eml and JSON pair in one allowed state, with the
 /// expected envelope and body, and is handed back for processing unless done.
+/// Quarantine is checked by the caller.
 async fn assert_whole(
     spool: &Spool,
     recovered: &[Envelope],
@@ -94,7 +99,7 @@ async fn assert_whole(
     allowed: &[SpoolState],
 ) {
     let root = spool.root();
-    assert_clean(root);
+    assert_tmp_free(root);
     let holding = |suffix: &str| -> Vec<SpoolState> {
         STATES
             .into_iter()
@@ -157,9 +162,9 @@ async fn crash_at_every_step_of_accept() {
             kept += 1;
             assert_whole(&spool, &recovered, &envelope(), &[SpoolState::Incoming]).await;
         } else {
-            assert_clean(dir.path());
             assert!(recovered.is_empty());
         }
+        assert_clean(dir.path());
     }
     assert!(
         crash_points >= 7,
@@ -200,6 +205,7 @@ async fn crash_transition(from: SpoolState, to: SpoolState) -> usize {
         let recovered = spool.recover().await.unwrap();
         let allowed = [after_recovery(from), after_recovery(to)];
         assert_whole(&spool, &recovered, &expected, &allowed).await;
+        assert_clean(dir.path());
     }
     unreachable!()
 }
@@ -222,43 +228,198 @@ async fn crash_at_every_step_of_every_transition() {
 
 /// Recovery itself can be interrupted: crash mid-transition, crash again at
 /// every step of the first recovery, then recover once more.
-#[tokio::test]
-async fn crash_during_recovery_after_a_crashed_transition() {
-    for (from, to) in [
-        (SpoolState::Incoming, SpoolState::Deferred),
-        (SpoolState::Active, SpoolState::Done),
-    ] {
-        for transition_steps in 0..8 {
-            for recover_steps in 0.. {
-                let dir = tempfile::tempdir().unwrap();
-                let spool = Spool::open(dir.path()).await.unwrap();
-                spool
-                    .accept(envelope(), std::io::Cursor::new(BODY))
-                    .await
-                    .unwrap();
-                spool.transition(&MessageId(ID.into()), from).await.unwrap();
-                let spool = spool_crashing_after(dir.path(), transition_steps).await;
-                assert!(
-                    crashed(spool, move |spool| async move {
-                        spool.transition(&MessageId(ID.into()), to).await
-                    })
-                    .await
-                );
-                let spool = spool_crashing_after(dir.path(), recover_steps).await;
-                let hit = crashed(
-                    spool,
-                    |spool| async move { spool.recover().await.map(|_| ()) },
-                )
-                .await;
-
-                let spool = Spool::open(dir.path()).await.unwrap();
-                let recovered = spool.recover().await.unwrap();
-                let allowed = [after_recovery(from), after_recovery(to)];
-                assert_whole(&spool, &recovered, &envelope(), &allowed).await;
-                if !hit {
-                    break;
-                }
+#[tokio::test(flavor = "multi_thread")]
+async fn crash_during_recovery_after_every_crashed_transition() {
+    let mut pairs = tokio::task::JoinSet::new();
+    for from in STATES {
+        for to in STATES {
+            if from != to {
+                pairs.spawn(crash_recovery_after_transition(from, to));
             }
         }
+    }
+    while let Some(done) = pairs.join_next().await {
+        done.unwrap();
+    }
+}
+
+async fn crash_recovery_after_transition(from: SpoolState, to: SpoolState) {
+    for transition_steps in 0.. {
+        for recover_steps in 0.. {
+            let dir = tempfile::tempdir().unwrap();
+            let spool = Spool::open(dir.path()).await.unwrap();
+            spool
+                .accept(envelope(), std::io::Cursor::new(BODY))
+                .await
+                .unwrap();
+            spool.transition(&MessageId(ID.into()), from).await.unwrap();
+            let spool = spool_crashing_after(dir.path(), transition_steps).await;
+            let transition_hit = crashed(spool, move |spool| async move {
+                spool.transition(&MessageId(ID.into()), to).await
+            })
+            .await;
+            if !transition_hit {
+                return;
+            }
+            let spool = spool_crashing_after(dir.path(), recover_steps).await;
+            let recover_hit = crashed(
+                spool,
+                |spool| async move { spool.recover().await.map(|_| ()) },
+            )
+            .await;
+
+            let spool = Spool::open(dir.path()).await.unwrap();
+            let recovered = spool.recover().await.unwrap();
+            let allowed = [after_recovery(from), after_recovery(to)];
+            assert_whole(&spool, &recovered, &envelope(), &allowed).await;
+            assert_clean(dir.path());
+            if !recover_hit {
+                break;
+            }
+        }
+    }
+}
+
+/// On-disk states only an older spool, a duplicate copy or corruption can
+/// produce. Recovery quarantines or adopts, and must survive a crash at each
+/// of those steps too.
+#[derive(Debug, Clone, Copy)]
+enum Damage {
+    /// eml in `active/`, its envelope left in `incoming/`.
+    Split,
+    /// Unreadable envelope beside the eml, a good one in another directory.
+    UnreadableBesideEml,
+    /// Two complete copies of the message.
+    Duplicate,
+    /// A copy with an unreadable envelope ahead of a complete copy.
+    DuplicateUnreadableFirst,
+    /// The envelope names a different message.
+    WrongId,
+    /// An eml with no envelope anywhere.
+    NoEnvelope,
+}
+
+impl Damage {
+    const ALL: [Damage; 6] = [
+        Damage::Split,
+        Damage::UnreadableBesideEml,
+        Damage::Duplicate,
+        Damage::DuplicateUnreadableFirst,
+        Damage::WrongId,
+        Damage::NoEnvelope,
+    ];
+
+    fn with_attempts(attempts: u32) -> Envelope {
+        let mut env = envelope();
+        env.attempts = attempts;
+        env
+    }
+
+    fn write(root: &Path, state: SpoolState, suffix: &str, bytes: &[u8]) {
+        std::fs::write(
+            root.join(state.dir_name()).join(format!("{ID}{suffix}")),
+            bytes,
+        )
+        .unwrap();
+    }
+
+    fn write_env(root: &Path, state: SpoolState, env: &Envelope) {
+        Self::write(root, state, ".json", &serde_json::to_vec(env).unwrap());
+    }
+
+    fn apply(self, root: &Path) {
+        use SpoolState::*;
+        match self {
+            Damage::Split => {
+                Self::write(root, Active, ".eml", BODY);
+                Self::write_env(root, Incoming, &Self::with_attempts(3));
+            }
+            Damage::UnreadableBesideEml => {
+                Self::write(root, Deferred, ".eml", BODY);
+                Self::write(root, Deferred, ".json", b"{not json");
+                Self::write_env(root, Incoming, &Self::with_attempts(3));
+            }
+            Damage::Duplicate => {
+                Self::write(root, Incoming, ".eml", BODY);
+                Self::write_env(root, Incoming, &Self::with_attempts(1));
+                Self::write(root, Deferred, ".eml", BODY);
+                Self::write_env(root, Deferred, &Self::with_attempts(9));
+            }
+            Damage::DuplicateUnreadableFirst => {
+                Self::write(root, Incoming, ".eml", BODY);
+                Self::write(root, Incoming, ".json", b"{not json");
+                Self::write(root, Deferred, ".eml", BODY);
+                Self::write_env(root, Deferred, &Self::with_attempts(9));
+            }
+            Damage::WrongId => {
+                let mut env = envelope();
+                env.id = MessageId("01ARZ3NDEKTSV4RRFFQ69G5FB9".into());
+                Self::write(root, Incoming, ".eml", BODY);
+                Self::write_env(root, Incoming, &env);
+            }
+            Damage::NoEnvelope => Self::write(root, Active, ".eml", BODY),
+        }
+    }
+
+    /// Where the message ends up, with which envelope, and how many files
+    /// are set aside in `bad/`.
+    fn outcome(self) -> (Option<(SpoolState, Envelope)>, usize) {
+        use SpoolState::*;
+        match self {
+            Damage::Split => (Some((Incoming, Self::with_attempts(3))), 0),
+            Damage::UnreadableBesideEml => (Some((Deferred, Self::with_attempts(3))), 1),
+            Damage::Duplicate => (Some((Incoming, Self::with_attempts(1))), 2),
+            Damage::DuplicateUnreadableFirst => (Some((Deferred, Self::with_attempts(9))), 2),
+            Damage::WrongId => (None, 2),
+            Damage::NoEnvelope => (None, 1),
+        }
+    }
+}
+
+#[tokio::test]
+async fn crash_at_every_step_of_repair() {
+    for damage in Damage::ALL {
+        let (want, bad) = damage.outcome();
+        let mut crash_points = 0;
+        for steps in 0.. {
+            let dir = tempfile::tempdir().unwrap();
+            Spool::open(dir.path()).await.unwrap();
+            damage.apply(dir.path());
+            let spool = spool_crashing_after(dir.path(), steps).await;
+            let hit = crashed(
+                spool,
+                |spool| async move { spool.recover().await.map(|_| ()) },
+            )
+            .await;
+
+            let spool = Spool::open(dir.path()).await.unwrap();
+            let recovered = spool.recover().await.unwrap();
+            assert_tmp_free(dir.path());
+            let quarantined = files(&dir.path().join(BAD_DIR));
+            assert_eq!(
+                quarantined.len(),
+                bad,
+                "{damage:?} after {steps} steps: {quarantined:?}"
+            );
+            match &want {
+                Some((state, env)) => {
+                    assert_whole(&spool, &recovered, env, &[*state]).await;
+                }
+                None => {
+                    for state in STATES {
+                        assert!(files(&dir.path().join(state.dir_name())).is_empty());
+                    }
+                    assert!(recovered.is_empty());
+                }
+            }
+            if !hit {
+                break;
+            }
+            crash_points += 1;
+        }
+        assert!(
+            crash_points >= bad.max(1),
+            "{damage:?} only had {crash_points} crash points"
+        );
     }
 }
