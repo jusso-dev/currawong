@@ -37,6 +37,7 @@ pub struct Config {
     pub relay: RelayConfig,
     pub dkim: DkimConfig,
     pub auth: AuthConfig,
+    pub policy: PolicyConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +130,7 @@ pub struct ScannerConfig {
     pub job_timeout_secs: u64,
     pub worker_binary: Option<PathBuf>,
     pub clamd: ClamdConfig,
+    pub yara: YaraConfig,
     /// Directories of supplemental on-premises signatures (the SaneSecurity
     /// approach). Currawong does not upload mail. Point `clamd` at these
     /// paths as well; they are recorded and checked locally.
@@ -147,6 +149,26 @@ pub struct ClamdConfig {
     pub address: String,
     /// When the address is set, an unreachable engine fails closed.
     pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct YaraConfig {
+    /// Directory of `*.yar` and `*.yara` files, recompiled when it changes.
+    /// Empty disables the engine.
+    pub rules_dir: PathBuf,
+    /// Time a parser worker may take to load a rules generation. Loading
+    /// recompiles the rules, so large sets need far longer than one job.
+    pub load_timeout_secs: u64,
+}
+
+impl Default for YaraConfig {
+    fn default() -> Self {
+        Self {
+            rules_dir: PathBuf::new(),
+            load_timeout_secs: 120,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +298,18 @@ pub struct AuthConfig {
     pub authserv_id: String,
 }
 
+/// Policy engine. With neither set, the built-in default pack applies.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PolicyConfig {
+    /// TOML policy pack. Seeds the database when the database has no policies.
+    pub pack: Option<PathBuf>,
+    /// SQLite policy store. When set, policies are read from it.
+    pub database: Option<PathBuf>,
+    /// Domains outside the tenant's own that redirect and bcc may send to.
+    pub forward_domains: Vec<String>,
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
@@ -320,6 +354,7 @@ impl Default for ScannerConfig {
             job_timeout_secs: 30,
             worker_binary: None,
             clamd: ClamdConfig::default(),
+            yara: YaraConfig::default(),
             extra_signature_dirs: Vec::new(),
             extra_database_paths: Vec::new(),
             blocked_extensions: default_blocked_extensions(),
@@ -492,6 +527,7 @@ impl Default for Config {
             relay: RelayConfig::default(),
             dkim: DkimConfig::default(),
             auth: AuthConfig::default(),
+            policy: PolicyConfig::default(),
         }
     }
 }
@@ -614,6 +650,18 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        // An empty tenant id would share the platform's policy namespace.
+        if let Some(tenant) = self
+            .relay
+            .tenants
+            .iter()
+            .find(|t| t.id.trim().is_empty() || t.id.trim() != t.id)
+        {
+            return Err(ConfigError::Invalid(format!(
+                "relay tenant id {:?} must be non-empty with no surrounding spaces",
+                tenant.id
+            )));
+        }
         Ok(())
     }
 
@@ -660,6 +708,19 @@ mod tests {
         cfg.validate().expect("example config is valid");
         assert!(cfg.limits.max_message_bytes >= 1024 * 1024);
         assert_eq!(cfg.residency.mode, "au");
+    }
+
+    #[test]
+    fn blank_tenant_id_is_refused() {
+        for id in ["", " ", " t1"] {
+            let mut cfg = Config::load(&example_path()).unwrap();
+            cfg.relay.tenants.push(TenantConfig {
+                id: id.into(),
+                domains: vec!["example.test".into()],
+                trusted_cidrs: Vec::new(),
+            });
+            assert!(cfg.validate().is_err(), "{id:?}");
+        }
     }
 
     #[test]

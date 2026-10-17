@@ -595,6 +595,12 @@ impl Session<'_> {
         let mut drained = 0usize;
         let mut too_large = false;
         let mut spool_failed = false;
+        // In the header section each field (with its folded lines) is held
+        // until the next one starts, so forged Authentication-Results can be
+        // removed before anything is spooled while memory stays at one field.
+        let authserv_id = &self.ctx.cfg.auth.authserv_id;
+        let mut in_header = true;
+        let mut field: Vec<u8> = Vec::new();
         loop {
             let Ok(next) = tokio::time::timeout_at(deadline, conn.line()).await else {
                 metrics::counter!(MESSAGES_REJECTED_TOTAL).increment(1);
@@ -627,9 +633,32 @@ impl Session<'_> {
                 Ok(Some(_)) if spool_failed => {}
                 Ok(Some(chunk)) => {
                     size += chunk.len() + 2;
-                    let written = match body.write(chunk).await {
-                        Ok(()) => body.write(b"\r\n").await,
-                        Err(err) => Err(err),
+                    let folded = chunk.first().is_some_and(|b| *b == b' ' || *b == b'\t');
+                    let written = if in_header && folded {
+                        field.extend_from_slice(chunk);
+                        field.extend_from_slice(b"\r\n");
+                        Ok(())
+                    } else if in_header {
+                        let held = std::mem::take(&mut field);
+                        let flushed = body
+                            .write(&currawong_auth::strip_forged(&held, authserv_id))
+                            .await;
+                        if chunk.is_empty() {
+                            in_header = false;
+                            match flushed {
+                                Ok(()) => body.write(b"\r\n").await,
+                                Err(err) => Err(err),
+                            }
+                        } else {
+                            field.extend_from_slice(chunk);
+                            field.extend_from_slice(b"\r\n");
+                            flushed
+                        }
+                    } else {
+                        match body.write(chunk).await {
+                            Ok(()) => body.write(b"\r\n").await,
+                            Err(err) => Err(err),
+                        }
                     };
                     if let Err(err) = written {
                         tracing::error!(%err, "spool write failed");
@@ -651,6 +680,16 @@ impl Session<'_> {
             metrics::counter!(MESSAGES_REJECTED_TOTAL).increment(1);
             conn.reply("552 5.3.4 message size exceeds limit").await?;
             return Ok(Flow::Continue);
+        }
+        // The last field of a message with no blank line is still held.
+        if !field.is_empty() {
+            if let Err(err) = body
+                .write(&currawong_auth::strip_forged(&field, authserv_id))
+                .await
+            {
+                tracing::error!(%err, "spool write failed");
+                spool_failed = true;
+            }
         }
         if spool_failed {
             conn.reply("451 4.3.0 spool unavailable").await?;

@@ -1,6 +1,7 @@
 //! Bounded archive extraction. Limits stop zip bombs before they expand.
 use crate::filetype::{self, FileKind};
 use crate::office::{self, password_candidates};
+use crate::yara::YaraScan;
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use std::io::{Cursor, Read};
@@ -17,6 +18,17 @@ pub fn extract(
     limits: &ExtractLimits,
     passwords: &[String],
 ) -> Extracted {
+    extract_with(bytes, filename, limits, passwords, None)
+}
+
+/// Same as [`extract`], and matches YARA rules against every member.
+pub fn extract_with(
+    bytes: &[u8],
+    filename: Option<&str>,
+    limits: &ExtractLimits,
+    passwords: &[String],
+    yara: Option<&mut YaraScan<'_>>,
+) -> Extracted {
     let mut out = Extracted::default();
     let mut budget = Budget {
         depth: 0,
@@ -24,6 +36,7 @@ pub fn extract(
         bytes: 0,
         limits: limits.clone(),
         hit: false,
+        yara,
     };
     walk(bytes, filename, passwords, &mut budget, &mut out.parts);
     out.limit_hit = budget.hit;
@@ -37,12 +50,13 @@ pub fn extract(
     out
 }
 
-struct Budget {
+struct Budget<'a, 'r> {
     depth: u32,
     files: u32,
     bytes: u64,
     limits: ExtractLimits,
     hit: bool,
+    yara: Option<&'a mut YaraScan<'r>>,
 }
 
 fn walk(
@@ -54,6 +68,12 @@ fn walk(
 ) {
     if budget.hit {
         return;
+    }
+    // Depth 0 is the attachment itself, already matched by the caller.
+    if budget.depth > 0 {
+        if let Some(yara) = budget.yara.as_mut() {
+            yara.scan(filename.unwrap_or("archive member"), bytes);
+        }
     }
     let kind = filetype::detect(bytes);
     let mut flags = filetype::flags_for(bytes, filename, &kind);

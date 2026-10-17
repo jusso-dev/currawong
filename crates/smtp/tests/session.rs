@@ -1829,3 +1829,26 @@ async fn tls_starttls_discards_plaintext_sent_after_the_command() {
         "needs a fresh EHLO"
     );
 }
+
+/// Forged Authentication-Results are removed while the body streams, folded
+/// lines included, and nothing after the header section is touched.
+#[tokio::test]
+async fn data_strips_folded_forged_authentication_results_while_streaming() {
+    let h = harness().await;
+    let id = h.cfg.auth.authserv_id.clone();
+    let (mut c, _, _) = start(h.ctx(ListenerRole::Inbound), peer([203, 0, 113, 96])).await;
+    begin_transaction(&mut c).await;
+    let data = format!(
+        "Received: from x\r\n\tby y\r\nAuthentication-Results: {id};\r\n\tdkim=pass\r\n\theader.d=bank.test\r\nSubject: hi\r\n\r\nAuthentication-Results: {id}; body text stays\r\n.\r\n"
+    );
+    c.send(data.as_bytes()).await;
+    assert!(c.reply().await.starts_with("250"));
+    let stored = h.incoming().await;
+    let body = h.spool.read_body(&stored[0].id).await.unwrap();
+    assert_eq!(
+        String::from_utf8(body).unwrap(),
+        format!(
+            "Received: from x\r\n\tby y\r\nSubject: hi\r\n\r\nAuthentication-Results: {id}; body text stays\r\n"
+        )
+    );
+}
