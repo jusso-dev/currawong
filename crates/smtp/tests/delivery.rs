@@ -148,6 +148,7 @@ async fn harness() -> Harness {
     let mut cfg = Config::default();
     cfg.spool.dir = dir.path().join("spool");
     cfg.gateway.hostname = "mx.example.test".into();
+    cfg.delivery.tls_database = dir.path().join("tls.sqlite");
     let spool = Arc::new(Spool::open(&cfg.spool.dir).await.unwrap());
     Harness {
         cfg,
@@ -220,7 +221,7 @@ fn status<'a>(env: &'a Envelope, rcpt: &str) -> &'a RcptStatus {
         .unwrap()
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 async fn poll_due_honours_next_attempt_and_skips_unscanned() {
     let h = harness().await;
     let busy = sink(Script::rcpt(|_| b"450 4.2.0 busy\r\n".to_vec())).await;
@@ -234,14 +235,18 @@ async fn poll_due_honours_next_attempt_and_skips_unscanned() {
 
     deliverer.poll_due().await.unwrap();
     assert_eq!(busy.hits.load(Ordering::SeqCst), 1);
-    let stored = h.spool.load(&env.id).await.unwrap();
+    let mut stored = h.spool.load(&env.id).await.unwrap();
     assert_eq!(stored.state, SpoolState::Deferred);
     assert_eq!(stored.attempts, 1);
+    let wait = stored.next_attempt_at.unwrap() - time::OffsetDateTime::now_utc();
+    assert!(wait > time::Duration::minutes(4), "{wait}");
 
     deliverer.poll_due().await.unwrap();
     assert_eq!(busy.hits.load(Ordering::SeqCst), 1, "not due yet");
 
-    tokio::time::advance(Duration::from_secs(5 * 60 + 1)).await;
+    // The retry time passes.
+    stored.next_attempt_at = Some(time::OffsetDateTime::now_utc() - time::Duration::seconds(1));
+    h.spool.update(&stored).await.unwrap();
     deliverer.poll_due().await.unwrap();
     assert_eq!(busy.hits.load(Ordering::SeqCst), 2);
     assert_eq!(h.spool.load(&env.id).await.unwrap().attempts, 2);

@@ -1,18 +1,27 @@
-//! Outbound delivery, retries and DSNs.
+//! Outbound delivery, retries and DSNs. TLS precedence for MX delivery is
+//! DANE, then MTA-STS, then opportunistic STARTTLS.
 pub mod client;
+pub mod dane;
 mod dsn;
+pub mod mta_sts;
+pub mod outbound_tls;
 pub mod route;
 
-use crate::dns::DnsLookup;
+use crate::{dns::DnsLookup, tlsrpt::TlsRpt};
 pub use dsn::{build_dsn, status_code};
+pub use outbound_tls::OutboundTls;
 pub use route::{resolve_route, RouteError};
 
-use client::{HostFailure, Transaction};
+use client::{HostFailure, Starttls, Transaction};
 use currawong_core::{config::Config, MessageId};
 use currawong_spool::{next_retry, Envelope, RcptStatus, Spool, SpoolError, SpoolState};
 use futures::{FutureExt, StreamExt};
+use mail_auth::report::tlsrpt::{PolicyDetails, PolicyType, ResultType};
+use mta_sts::{Discovery, HttpsFetcher, Mode, MtaSts};
+use route::Hop;
+use rustls::pki_types::ServerName;
 use sha2::{Digest, Sha256};
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::time::Instant;
 
@@ -63,17 +72,74 @@ pub struct Deliverer<D: DnsLookup> {
     pub clock: TokioClock,
     /// Port for MX-routed hops. Always 25 outside tests.
     pub mx_port: u16,
+    /// Trust roots for STARTTLS and HTTPS.
+    pub tls: OutboundTls,
+    /// `None` when `delivery.mta_sts` is off.
+    pub mta_sts: Option<Arc<MtaSts>>,
+    /// `None` when `delivery.tls_rpt.enabled` is off.
+    pub tlsrpt: Option<Arc<TlsRpt>>,
+    /// For TLS-RPT uploads to `https:` report addresses.
+    pub http: Option<reqwest::Client>,
+}
+
+/// The TLS rule for one MX host, chosen in RFC 7672 / RFC 8461 order.
+enum Plan {
+    Dane(Vec<crate::dns::Tlsa>),
+    Sts(Arc<mta_sts::Policy>),
+    Opportunistic,
 }
 
 impl<D: DnsLookup> Deliverer<D> {
     pub fn new(spool: Arc<Spool>, cfg: Arc<Config>, dns: Arc<D>) -> Self {
+        let tls = OutboundTls::webpki();
+        let http = match tls.http_client() {
+            Ok(client) => Some(client),
+            Err(err) => {
+                tracing::error!(%err, "HTTPS client for MTA-STS and TLS-RPT failed");
+                None
+            }
+        };
+        let db = cfg.delivery.tls_database.clone();
+        let mta_sts = match (&http, cfg.delivery.mta_sts) {
+            (Some(client), true) => Some(Arc::new(MtaSts::new(
+                Box::new(HttpsFetcher::new(client.clone())),
+                db.clone(),
+            ))),
+            _ => None,
+        };
+        let tlsrpt = cfg
+            .delivery
+            .tls_rpt
+            .enabled
+            .then(|| Arc::new(TlsRpt::new(db)));
         Self {
             spool,
             cfg,
             dns,
             clock: TokioClock::new(),
             mx_port: 25,
+            tls,
+            mta_sts,
+            tlsrpt,
+            http,
         }
+    }
+
+    /// Send TLS-RPT reports for finished days. The daemon calls this after
+    /// each delivery pass.
+    pub async fn send_tls_reports(&self) -> Result<usize, String> {
+        let Some(tlsrpt) = &self.tlsrpt else {
+            return Ok(0);
+        };
+        tlsrpt
+            .send_due(
+                &self.cfg,
+                self.dns.as_ref(),
+                &self.spool,
+                self.http.as_ref(),
+                self.clock.now().date(),
+            )
+            .await
     }
 
     /// One delivery attempt for every recipient still pending. Permanent
@@ -259,17 +325,29 @@ impl<D: DnsLookup> Deliverer<D> {
             rcpts,
             message,
         };
-        let mut last = HostFailure {
-            detail: format!("4.4.1 no host accepted mail for {domain}"),
-            permanent: false,
+        let sts = match (&self.mta_sts, route.via_mx) {
+            (Some(sts), true) => {
+                let now = self.clock.now().unix_timestamp();
+                sts.discover(domain, self.dns.as_ref(), now).await
+            }
+            _ => Discovery::NoPolicy,
         };
+        if let Discovery::Failed { result, .. } = &sts {
+            let policy = PolicyDetails::new(PolicyType::Sts, domain);
+            self.record(&policy, Some(failure(*result, "", None))).await;
+        }
+        let mut last = HostFailure::temp(format!("4.4.1 no host accepted mail for {domain}"));
         for hop in &route.hops {
+            let plan = match self.plan(domain, &route, hop, &sts).await {
+                Ok(plan) => plan,
+                Err(failure) => {
+                    tracing::info!(host = %hop.host, detail = %failure.detail, "MX host ruled out");
+                    last = failure;
+                    continue;
+                }
+            };
             for addr in &hop.addrs {
-                let attempt = match client::connect(*addr).await {
-                    Ok(stream) => client::send(stream, &tx).await,
-                    Err(failure) => Err(failure),
-                };
-                match attempt {
+                match self.attempt(domain, hop, *addr, &plan, &tx).await {
                     Ok(results) => return results,
                     Err(failure) => {
                         tracing::debug!(host = %hop.host, %addr, detail = %failure.detail, "delivery attempt failed");
@@ -282,6 +360,162 @@ impl<D: DnsLookup> Deliverer<D> {
             all(DeliveryOutcome::PermFail(last.detail))
         } else {
             all(DeliveryOutcome::TempFail(last.detail))
+        }
+    }
+
+    /// DANE when the MX and address answers are DNSSEC-secure and usable
+    /// TLSA records exist (RFC 7672 section 2.2), else MTA-STS, else
+    /// opportunistic. Configured routes skip both policies.
+    async fn plan(
+        &self,
+        domain: &str,
+        route: &route::Route,
+        hop: &Hop,
+        sts: &Discovery,
+    ) -> Result<Plan, HostFailure> {
+        if !route.via_mx {
+            return Ok(Plan::Opportunistic);
+        }
+        if self.cfg.delivery.dane && route.mx_secure && hop.secure {
+            let name = format!("_25._tcp.{}", hop.host);
+            match self.dns.resolve_tlsa(&name).await {
+                Ok(answer) if answer.secure => {
+                    let usable = dane::usable(&answer.records);
+                    if !usable.is_empty() {
+                        return Ok(Plan::Dane(usable));
+                    }
+                }
+                Ok(_) | Err(crate::dns::LookupError::NxDomain) => {}
+                // Fail closed: a TLSA answer that cannot be trusted rules the
+                // host out rather than letting delivery fall back.
+                Err(err) => {
+                    let result = if err == crate::dns::LookupError::Bogus {
+                        ResultType::DnssecInvalid
+                    } else {
+                        ResultType::TlsaInvalid
+                    };
+                    let mut policy = PolicyDetails::new(PolicyType::Tlsa, domain);
+                    policy.mx_host = vec![hop.host.clone()];
+                    self.record(&policy, Some(failure(result, &hop.host, None)))
+                        .await;
+                    return Err(HostFailure {
+                        detail: format!("4.7.5 DANE: TLSA lookup for {name} failed: {err}"),
+                        permanent: false,
+                        tls: Some(result),
+                    });
+                }
+            }
+        }
+        let Discovery::Found(policy) = sts else {
+            return Ok(Plan::Opportunistic);
+        };
+        if policy.allows(&hop.host) {
+            return Ok(Plan::Sts(Arc::clone(policy)));
+        }
+        let details = sts_policy(domain, policy);
+        let result = ResultType::ValidationFailure;
+        self.record(&details, Some(failure(result, &hop.host, None)))
+            .await;
+        if policy.mode == Mode::Enforce {
+            return Err(HostFailure {
+                detail: format!(
+                    "4.7.5 MTA-STS policy for {domain} does not list MX host {}",
+                    hop.host
+                ),
+                permanent: false,
+                tls: Some(result),
+            });
+        }
+        Ok(Plan::Opportunistic)
+    }
+
+    /// One session to `addr` under `plan`. TLS is verified or not used: when
+    /// verification fails and the plan allows it (opportunistic, or an
+    /// MTA-STS policy in testing mode), the message goes on a fresh
+    /// connection without TLS, never over unverified TLS.
+    async fn attempt(
+        &self,
+        domain: &str,
+        hop: &Hop,
+        addr: SocketAddr,
+        plan: &Plan,
+        tx: &Transaction<'_>,
+    ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure> {
+        let server_name = ServerName::try_from(hop.host.clone())
+            .map_err(|_| HostFailure::temp(format!("4.7.5 bad host name {}", hop.host)))?;
+        let webpki = || self.tls.webpki_config().map_err(HostFailure::temp);
+        let (starttls, fallback, report) = match plan {
+            Plan::Dane(records) => {
+                let names = [hop.host.as_str(), domain]
+                    .iter()
+                    .filter_map(|name| ServerName::try_from(name.to_string()).ok())
+                    .collect();
+                let config = self
+                    .tls
+                    .dane_config(records.clone(), names)
+                    .map_err(HostFailure::temp)?;
+                let mut policy = PolicyDetails::new(PolicyType::Tlsa, domain);
+                policy.policy_string = records.iter().map(ToString::to_string).collect();
+                policy.mx_host = vec![hop.host.clone()];
+                let starttls = Starttls {
+                    config,
+                    server_name,
+                    required: true,
+                    policy: format!("DANE for {}", hop.host),
+                };
+                (starttls, false, Some(policy))
+            }
+            Plan::Sts(policy) => {
+                let starttls = Starttls {
+                    config: webpki()?,
+                    server_name,
+                    required: true,
+                    policy: format!("MTA-STS policy for {domain}"),
+                };
+                let testing = policy.mode == Mode::Testing;
+                (starttls, testing, Some(sts_policy(domain, policy)))
+            }
+            Plan::Opportunistic => {
+                let required = self.cfg.delivery.require_tls;
+                let starttls = Starttls {
+                    config: webpki()?,
+                    server_name,
+                    required,
+                    policy: "delivery.require_tls".into(),
+                };
+                (starttls, !required, None)
+            }
+        };
+        let stream = client::connect(addr).await?;
+        let result = client::send(stream, tx, Some(&starttls)).await;
+        if let Some(policy) = &report {
+            match &result {
+                Ok(_) => self.record(policy, None).await,
+                Err(HostFailure {
+                    tls: Some(result), ..
+                }) => {
+                    let failed = failure(*result, &hop.host, Some(addr));
+                    self.record(policy, Some(failed)).await;
+                }
+                Err(_) => {}
+            }
+        }
+        match result {
+            Err(failure) if failure.tls.is_some() && fallback => {
+                tracing::info!(host = %hop.host, detail = %failure.detail, "TLS did not verify; delivering without TLS");
+                let stream = client::connect(addr).await?;
+                client::send(stream, tx, None).await
+            }
+            other => other,
+        }
+    }
+
+    async fn record(&self, policy: &PolicyDetails, failure: Option<crate::tlsrpt::Failure>) {
+        if let Some(store) = &self.tlsrpt {
+            let day = self.clock.now().date();
+            if let Err(err) = store.record(day, policy, failure.as_ref()).await {
+                tracing::warn!(%err, "TLS-RPT result not recorded");
+            }
         }
     }
 
@@ -315,6 +549,21 @@ impl<D: DnsLookup> Deliverer<D> {
             .await;
         Ok(())
     }
+}
+
+fn failure(result: ResultType, mx: &str, ip: Option<SocketAddr>) -> crate::tlsrpt::Failure {
+    crate::tlsrpt::Failure {
+        result,
+        receiving_mx: mx.to_string(),
+        receiving_ip: ip.map(|addr| addr.ip()),
+    }
+}
+
+fn sts_policy(domain: &str, policy: &mta_sts::Policy) -> PolicyDetails {
+    let mut details = PolicyDetails::new(PolicyType::Sts, domain);
+    details.policy_string = policy.lines();
+    details.mx_host = policy.mx.clone();
+    details
 }
 
 /// Scanned (`pipeline == "deliver"`) and past its retry time.

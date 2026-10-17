@@ -99,10 +99,16 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
+    // DANE needs DNSSEC-validated answers for MX, address and TLSA lookups.
+    let delivery_dns = if cfg.delivery.dane {
+        HickoryDns::validating()
+    } else {
+        HickoryDns::system()
+    };
     let deliverer = Deliverer::new(
         Arc::clone(&spool),
         Arc::clone(&cfg),
-        Arc::new(HickoryDns::system().map_err(|err| err.to_string())?),
+        Arc::new(delivery_dns.map_err(|err| err.to_string())?),
     );
     let spool_loop = Arc::clone(&spool);
     let shutdown_loop = shutdown.clone();
@@ -118,6 +124,9 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             }
             if let Err(err) = deliverer.poll_due().await {
                 tracing::error!(%err, "delivery pass failed");
+            }
+            if let Err(err) = deliverer.send_tls_reports().await {
+                tracing::error!(%err, "TLS-RPT pass failed");
             }
             tokio::select! {
                 _ = shutdown_loop.cancelled() => break,

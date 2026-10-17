@@ -9,6 +9,8 @@ use std::net::{IpAddr, SocketAddr};
 pub struct Hop {
     pub host: String,
     pub addrs: Vec<SocketAddr>,
+    /// The address records were DNSSEC-validated.
+    pub secure: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,6 +18,8 @@ pub struct Route {
     pub hops: Vec<Hop>,
     /// True when the hops came from DNS rather than `domains.routes`.
     pub via_mx: bool,
+    /// The MX answer (or, for an implicit MX, its absence) was DNSSEC-validated.
+    pub mx_secure: bool,
 }
 
 /// Details start with an RFC 3463 enhanced status code.
@@ -41,10 +45,11 @@ pub async fn resolve_route(
         return Ok(Route {
             hops: vec![hop],
             via_mx: false,
+            mx_secure: false,
         });
     }
-    let mx = match dns.resolve_mx(&domain_l).await {
-        Ok(answer) => answer.records,
+    let (mx, mx_secure) = match dns.resolve_mx(&domain_l).await {
+        Ok(answer) => (answer.records, answer.secure),
         Err(LookupError::NxDomain) => {
             return Err(RouteError::Perm(format!(
                 "5.1.2 domain {domain_l} does not exist"
@@ -85,7 +90,11 @@ pub async fn resolve_route(
                         )));
                     }
                 } else {
-                    hops.push(Hop { host, addrs });
+                    hops.push(Hop {
+                        host,
+                        addrs,
+                        secure: answer.secure,
+                    });
                 }
             }
             Err(LookupError::NxDomain) if implicit => {
@@ -104,7 +113,11 @@ pub async fn resolve_route(
             "4.4.3 no reachable MX host for {domain_l}: {last}"
         )));
     }
-    Ok(Route { hops, via_mx: true })
+    Ok(Route {
+        hops,
+        via_mx: true,
+        mx_secure,
+    })
 }
 
 /// Addresses an MX answer may point at. Loopback, private, link-local and
@@ -145,12 +158,14 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
         return Ok(Hop {
             host: addr.ip().to_string(),
             addrs: vec![addr],
+            secure: false,
         });
     }
     if let Ok(ip) = next_hop.parse::<IpAddr>() {
         return Ok(Hop {
             host: ip.to_string(),
             addrs: vec![SocketAddr::new(ip, 25)],
+            secure: false,
         });
     }
     let (host, port) = match next_hop.rsplit_once(':') {
@@ -163,11 +178,11 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
         _ => (next_hop, 25),
     };
     let host = normalise(host);
-    let ips = dns
+    let answer = dns
         .resolve_ips(&host)
         .await
-        .map_err(|err| RouteError::Temp(format!("4.4.3 next hop {host}: {err}")))?
-        .records;
+        .map_err(|err| RouteError::Temp(format!("4.4.3 next hop {host}: {err}")))?;
+    let ips = answer.records;
     if ips.is_empty() {
         return Err(RouteError::Temp(format!("4.4.3 no address for {host}")));
     }
@@ -177,6 +192,7 @@ async fn resolve_hop(next_hop: &str, dns: &dyn DnsLookup) -> Result<Hop, RouteEr
             .map(|ip| SocketAddr::new(ip, port))
             .collect(),
         host,
+        secure: answer.secure,
     })
 }
 

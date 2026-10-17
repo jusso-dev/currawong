@@ -2,12 +2,15 @@
 //! in time and size, results kept per recipient.
 use super::DeliveryOutcome;
 use crate::delivery::is_null_sender;
-use std::{future::Future, net::SocketAddr, time::Duration};
+use mail_auth::report::tlsrpt::ResultType;
+use rustls::{pki_types::ServerName, CertificateError, ClientConfig};
+use std::{future::Future, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::{
     io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::TcpStream,
     time::timeout,
 };
+use tokio_rustls::TlsConnector;
 
 /// RFC 5321 section 4.5.3.2 timeouts, connect excepted.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,21 +27,48 @@ const MAX_REPLY_TEXT: usize = 1024;
 pub struct HostFailure {
     pub detail: String,
     pub permanent: bool,
+    /// Set when TLS could not be negotiated or authenticated.
+    pub tls: Option<ResultType>,
 }
 
 impl HostFailure {
-    fn temp(detail: impl Into<String>) -> Self {
+    pub fn temp(detail: impl Into<String>) -> Self {
         Self {
             detail: detail.into(),
             permanent: false,
+            tls: None,
         }
     }
+
+    fn tls(starttls: &Starttls, result: ResultType, reason: &str) -> Self {
+        Self {
+            detail: format!(
+                "4.7.5 {} requires TLS with {}: {reason}",
+                starttls.policy,
+                starttls.server_name.to_str()
+            ),
+            permanent: false,
+            tls: Some(result),
+        }
+    }
+}
+
+/// STARTTLS for one session. Certificates are always verified by `config`.
+pub struct Starttls {
+    pub config: Arc<ClientConfig>,
+    pub server_name: ServerName<'static>,
+    /// Without TLS the session fails. When false, a server that does not
+    /// offer STARTTLS gets the message in clear text.
+    pub required: bool,
+    /// Named in failure details, for example "MTA-STS policy for example.test".
+    pub policy: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Reply {
     pub code: u16,
     pub text: String,
+    pub lines: Vec<String>,
 }
 
 impl Reply {
@@ -80,11 +110,12 @@ pub async fn connect(addr: SocketAddr) -> Result<TcpStream, HostFailure> {
 pub async fn send<S>(
     stream: S,
     tx: &Transaction<'_>,
+    tls: Option<&Starttls>,
 ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
 {
-    match timeout(SESSION_TIMEOUT, send_inner(BufReader::new(stream), tx)).await {
+    match timeout(SESSION_TIMEOUT, send_inner(BufReader::new(stream), tx, tls)).await {
         Ok(result) => result,
         Err(_) => Err(HostFailure::temp("4.4.2 session timed out")),
     }
@@ -93,6 +124,7 @@ where
 async fn send_inner<S>(
     mut conn: BufReader<S>,
     tx: &Transaction<'_>,
+    tls: Option<&Starttls>,
 ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure>
 where
     S: tokio::io::AsyncRead + AsyncWrite + Unpin + Send,
@@ -101,7 +133,89 @@ where
     expect_2xx(&greeting, "greeting")?;
     let ehlo = command(&mut conn, &format!("EHLO {}\r\n", tx.helo)).await?;
     expect_2xx(&ehlo, "EHLO")?;
+    let Some(starttls) = tls else {
+        return finish(conn, tx).await;
+    };
+    if !offers(&ehlo, "STARTTLS") {
+        if starttls.required {
+            return Err(HostFailure::tls(
+                starttls,
+                ResultType::StartTlsNotSupported,
+                "STARTTLS not offered",
+            ));
+        }
+        return finish(conn, tx).await;
+    }
+    let reply = command(&mut conn, "STARTTLS\r\n").await?;
+    if reply.code != 220 {
+        if starttls.required {
+            let reason = format!("STARTTLS refused: {}", reply.detail());
+            return Err(HostFailure::tls(
+                starttls,
+                ResultType::StartTlsNotSupported,
+                &reason,
+            ));
+        }
+        return finish(conn, tx).await;
+    }
+    // Bytes already buffered arrived before TLS; reading them as if they
+    // came over TLS is the classic STARTTLS injection.
+    if !conn.buffer().is_empty() {
+        return Err(HostFailure::tls(
+            starttls,
+            ResultType::ValidationFailure,
+            "data arrived before the TLS handshake",
+        ));
+    }
+    let connector = TlsConnector::from(Arc::clone(&starttls.config));
+    let handshake = connector.connect(starttls.server_name.clone(), conn.into_inner());
+    let stream = match timeout(COMMAND_TIMEOUT, handshake).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            let (result, reason) = handshake_failure(&err);
+            return Err(HostFailure::tls(starttls, result, &reason));
+        }
+        Err(_) => {
+            return Err(HostFailure::tls(
+                starttls,
+                ResultType::ValidationFailure,
+                "TLS handshake timed out",
+            ))
+        }
+    };
+    let mut conn = BufReader::new(stream);
+    let ehlo = command(&mut conn, &format!("EHLO {}\r\n", tx.helo)).await?;
+    expect_2xx(&ehlo, "EHLO after STARTTLS")?;
     finish(conn, tx).await
+}
+
+fn offers(ehlo: &Reply, keyword: &str) -> bool {
+    ehlo.lines.iter().skip(1).any(|line| {
+        line.split_whitespace()
+            .next()
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+    })
+}
+
+/// RFC 8460 result type and a readable reason for a failed handshake.
+fn handshake_failure(err: &std::io::Error) -> (ResultType, String) {
+    let result = match err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::InvalidCertificate(cert)) => match cert {
+            CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+                ResultType::CertificateHostMismatch
+            }
+            CertificateError::Expired
+            | CertificateError::ExpiredContext { .. }
+            | CertificateError::NotValidYet
+            | CertificateError::NotValidYetContext { .. } => ResultType::CertificateExpired,
+            _ => ResultType::CertificateNotTrusted,
+        },
+        _ => ResultType::ValidationFailure,
+    };
+    (result, sanitise(&err.to_string()))
 }
 
 /// MAIL, RCPT, DATA and QUIT on an established, greeted session.
@@ -156,6 +270,7 @@ where
         Reply {
             code: 451,
             text: format!("4.5.0 unexpected reply to DATA: {}", data.detail()),
+            lines: Vec::new(),
         }
     } else {
         data
@@ -181,6 +296,7 @@ fn expect_2xx(reply: &Reply, stage: &str) -> Result<(), HostFailure> {
         Err(HostFailure {
             detail: format!("{} (at {stage})", reply.detail()),
             permanent: reply.code >= 500,
+            tls: None,
         })
     }
 }
@@ -250,6 +366,7 @@ where
     R: AsyncBufRead + Unpin + Send,
 {
     let mut text = String::new();
+    let mut lines = Vec::new();
     let mut first = None;
     for _ in 0..MAX_REPLY_LINES {
         let mut line = Vec::new();
@@ -271,15 +388,17 @@ where
         if *first.get_or_insert(code) != code {
             return Err("reply lines disagree on the code".into());
         }
-        if let Some(rest) = line.get(4..) {
+        let rest = sanitise(&String::from_utf8_lossy(line.get(4..).unwrap_or_default()));
+        if !rest.is_empty() && text.len() < MAX_REPLY_TEXT {
             if !text.is_empty() {
                 text.push(' ');
             }
-            text.push_str(&sanitise(&String::from_utf8_lossy(rest)));
-            text.truncate(MAX_REPLY_TEXT);
+            // Cut on a character boundary; `String::truncate` would panic.
+            text.extend(rest.chars().take(MAX_REPLY_TEXT - text.len()));
         }
+        lines.push(rest);
         if line.get(3) != Some(&b'-') {
-            return Ok(Reply { code, text });
+            return Ok(Reply { code, text, lines });
         }
     }
     Err("reply has too many lines".into())
@@ -370,6 +489,24 @@ mod tests {
         assert_eq!(reply.text, "first second");
         let long = [b"250 ".as_slice(), &[b'a'; 5000], b"\r\n"].concat();
         assert!(parse(&long).await.is_err());
+        let wide = format!(
+            "250-{}\r\n250 {}\r\n",
+            "\u{e9}".repeat(700),
+            "\u{e9}".repeat(700)
+        );
+        let reply = parse(wide.as_bytes()).await.unwrap();
+        assert!(
+            reply.text.len() <= 2 * MAX_REPLY_TEXT,
+            "capped without panicking"
+        );
+        assert!(offers(
+            &parse(b"250-mx\r\n250 STARTTLS\r\n").await.unwrap(),
+            "STARTTLS"
+        ));
+        assert!(!offers(
+            &parse(b"250 STARTTLS\r\n").await.unwrap(),
+            "STARTTLS"
+        ));
         let many = b"250-x\r\n".repeat(100);
         assert!(parse(&many).await.is_err());
         assert!(parse(b"25\r\n").await.is_err());
