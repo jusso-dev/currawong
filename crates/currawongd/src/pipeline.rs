@@ -1,6 +1,8 @@
 //! Auth, parse, scan and the M1 policy decision.
-use currawong_auth::AuthChecker;
-use currawong_core::{config::Config, AuthResults, EngineFinding, PartFlag, ScanReport, Verdict};
+use currawong_auth::{AuthChecker, DmarcEventStore};
+use currawong_core::{
+    config::Config, AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+};
 use currawong_parser::{parse::parse_bytes, ParseResponse};
 use currawong_policy::decide;
 use currawong_scan::{
@@ -14,6 +16,8 @@ pub struct Pipeline {
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
+    /// Where inbound DMARC results go for aggregate reports.
+    pub dmarc_events: Option<DmarcEventStore>,
 }
 
 impl Pipeline {
@@ -26,7 +30,17 @@ impl Pipeline {
             )
             .with_limits(cfg.scanner.worker_memory_mib, cfg.scanner.worker_cpu_secs)
         });
-        Self { cfg, auth, pool }
+        Self {
+            cfg,
+            auth,
+            pool,
+            dmarc_events: None,
+        }
+    }
+
+    pub fn with_dmarc_events(mut self, store: DmarcEventStore) -> Self {
+        self.dmarc_events = Some(store);
+        self
     }
 
     pub async fn evaluate(
@@ -36,8 +50,15 @@ impl Pipeline {
         body_path: Option<&Path>,
     ) -> (ScanReport, Verdict) {
         let mut report = ScanReport::new(env.id.clone());
-        let auth = self.auth.check(raw, env).await;
-        report.auth = Some(auth);
+        let auth = self.auth.evaluate(raw, env).await;
+        if let (Some(store), Some(event)) = (&self.dmarc_events, &auth.dmarc_event) {
+            if env.direction == Direction::Inbound {
+                if let Err(err) = store.record(event) {
+                    tracing::warn!(id = %env.id, %err, "dmarc event not recorded");
+                }
+            }
+        }
+        report.auth = Some(auth.results);
         if !self.cfg.scanner.enabled {
             let verdict = decide(&report);
             return (report, verdict);

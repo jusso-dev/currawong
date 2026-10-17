@@ -1,13 +1,13 @@
 //! currawongd: SMTP listeners, the scan pipeline and outbound delivery.
 use clap::Parser;
-use currawong_auth::AuthChecker;
+use currawong_auth::{AuthChecker, DmarcEventStore};
 use currawong_core::residency::{load_or_create_signing_key, sign_report, ResidencyGuard};
 use currawong_smtp::{
     checks::CheckStack, delivery::Deliverer, dns::HickoryDns, relay::Relay, server::SmtpServer,
     session::SessionContext, tls::TlsManager,
 };
 use currawong_spool::Spool;
-use currawongd::{check_config, checks_for, classify_pending, Pipeline};
+use currawongd::{check_config, checks_for, classify_pending, send_dmarc_reports, Pipeline};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -96,7 +96,14 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         checks_for(&cfg),
     );
     let auth = AuthChecker::new(&cfg.auth.authserv_id)?;
-    let pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let mut pipeline = Pipeline::new(Arc::clone(&cfg), auth);
+    let dmarc_reports = if cfg.auth.dmarc_reports.enabled {
+        let store = DmarcEventStore::open(&cfg.auth.dmarc_reports.database)?;
+        pipeline = pipeline.with_dmarc_events(store.clone());
+        Some(store)
+    } else {
+        None
+    };
     let quarantine = currawong_quarantine::QuarantineStore::open(cfg.spool.dir.join("quarantine"))
         .map_err(|err| err.to_string())?;
     let deliverer = Deliverer::new(
@@ -115,6 +122,15 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             }
             if let Err(err) = classify_pending(&spool_loop, &mut pipeline, &quarantine).await {
                 tracing::error!(%err, "pipeline pass failed");
+            }
+            if let Some(store) = &dmarc_reports {
+                let now = time::OffsetDateTime::now_utc();
+                let reports = &pipeline.cfg.auth.dmarc_reports;
+                if let Err(err) =
+                    send_dmarc_reports(&spool_loop, &pipeline.auth, store, reports, now).await
+                {
+                    tracing::error!(%err, "dmarc report pass failed");
+                }
             }
             if let Err(err) = deliver_ready(&deliverer).await {
                 tracing::error!(%err, "delivery pass failed");

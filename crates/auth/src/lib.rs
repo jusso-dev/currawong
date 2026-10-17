@@ -1,10 +1,14 @@
 //! SPF, DKIM, DMARC and ARC. DNS answers in tests come from [`TxtCache`].
+pub mod bimi;
 mod cache;
+pub mod dmarc_report;
 mod keys;
 mod sign;
 mod strip;
 
+pub use bimi::{Bimi, VmcStatus};
 pub use cache::TxtCache;
+pub use dmarc_report::{DmarcEvent, DmarcEventStore, OutgoingReport};
 pub use keys::{publishable, KeyStore, StoredKey};
 pub use sign::{ed25519_key, rsa_key, seal_arc, sign_message};
 pub use strip::strip_forged;
@@ -50,9 +54,17 @@ impl AuthChecker {
     }
 
     pub async fn check(&self, raw: &[u8], env: &Envelope) -> AuthResults {
+        self.evaluate(raw, env).await.results
+    }
+
+    /// Results plus the aggregate report row when the author domain publishes DMARC.
+    pub async fn evaluate(&self, raw: &[u8], env: &Envelope) -> Evaluation {
         let stripped = strip_forged(raw, &self.authserv_id);
         let Some(message) = AuthenticatedMessage::parse(&stripped) else {
-            return empty(&self.authserv_id);
+            return Evaluation {
+                results: empty(&self.authserv_id),
+                dmarc_event: None,
+            };
         };
         let dkim_params = Parameters::new(&message).with_txt_cache(&self.cache);
         let dkim = self.resolver.verify_dkim(dkim_params).await;
@@ -85,7 +97,15 @@ impl AuthChecker {
             .with_spf_mailfrom_result(&spf, env.remote_ip, sender, helo)
             .with_dmarc_result(&dmarc)
             .with_arc_result(&arc, env.remote_ip);
-        AuthResults {
+        let envelope_from = if env.mail_from.is_empty() {
+            helo
+        } else {
+            mail_from_domain
+        };
+        let dmarc_event = self
+            .dmarc_event(env, envelope_from, &dkim, &spf, &dmarc)
+            .await;
+        let results = AuthResults {
             spf: spf_method(spf.result()),
             dkim: dkim
                 .iter()
@@ -101,8 +121,18 @@ impl AuthChecker {
             },
             dmarc_policy: policy_label(&built),
             header: built.to_header(),
+        };
+        Evaluation {
+            results,
+            dmarc_event,
         }
     }
+}
+
+pub struct Evaluation {
+    pub results: AuthResults,
+    /// Present when the author domain publishes a DMARC record.
+    pub dmarc_event: Option<DmarcEvent>,
 }
 
 fn empty(authserv_id: &str) -> AuthResults {

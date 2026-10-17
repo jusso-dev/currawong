@@ -580,6 +580,7 @@ dependencies = [
  "currawong-core",
  "currawong-spool",
  "ed25519-dalek",
+ "flate2",
  "mail-auth",
  "mail-parser",
  "pkcs8",

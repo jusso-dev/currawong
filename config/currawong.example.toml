@@ -182,5 +182,19 @@ sign_outbound = true
 seal_arc = true
 
 # auth.authserv_id: Authentication-Results identity. Forged copies are removed.
+# auth.bimi: look up BIMI logos (default._bimi.<domain>) for quarantined mail
+# that passes DMARC at p=quarantine or p=reject. VMC certificates are flagged,
+# not verified.
 [auth]
 authserv_id = "currawong.example.test"
+bimi = false
+
+# auth.dmarc_reports: daily DMARC aggregate (RUA) reports for each sending
+# domain, gzipped XML per RFC 9990. A rua address outside the policy domain is
+# only used when it publishes <domain>._report._dmarc.<host>. Failure (RUF)
+# reports are never sent, for privacy.
+[auth.dmarc_reports]
+enabled = false
+database = "/var/lib/currawong/dmarc.sqlite"
+org_name = "Example Pty Ltd"
+email = "dmarc-reports@currawong.example.test"

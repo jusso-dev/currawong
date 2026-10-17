@@ -268,6 +268,32 @@ pub struct DkimConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     pub authserv_id: String,
+    pub dmarc_reports: DmarcReportConfig,
+    /// Look up BIMI logos for quarantined mail that passes DMARC at enforcement.
+    pub bimi: bool,
+}
+
+/// Daily DMARC aggregate (RUA) reports. Failure (RUF) reports are never sent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DmarcReportConfig {
+    pub enabled: bool,
+    /// SQLite file holding the `dmarc_events` table.
+    pub database: PathBuf,
+    pub org_name: String,
+    /// Report sender. Its domain is the report submitter.
+    pub email: String,
+}
+
+impl Default for DmarcReportConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database: PathBuf::from("/var/lib/currawong/dmarc.sqlite"),
+            org_name: "Currawong".into(),
+            email: String::new(),
+        }
+    }
 }
 
 impl Default for LogConfig {
@@ -436,6 +462,8 @@ impl Default for AuthConfig {
     fn default() -> Self {
         Self {
             authserv_id: "currawong.local".into(),
+            dmarc_reports: DmarcReportConfig::default(),
+            bimi: false,
         }
     }
 }
@@ -603,6 +631,12 @@ impl Config {
                 self.metrics.listen
             ))
         })?;
+        let reports = &self.auth.dmarc_reports;
+        if reports.enabled && !reports.email.contains('@') {
+            return Err(ConfigError::Invalid(
+                "auth.dmarc_reports.email must be an address when reports are enabled".into(),
+            ));
+        }
         Ok(())
     }
 

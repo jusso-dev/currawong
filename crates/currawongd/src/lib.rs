@@ -1,7 +1,10 @@
 //! Gateway daemon library. The binary is `currawongd`.
+mod dmarc;
 mod health;
 mod pipeline;
 mod scheduler;
+
+pub use dmarc::{annotate_bimi, send_dmarc_reports};
 
 pub use health::{checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable};
 pub use pipeline::Pipeline;
