@@ -5,7 +5,7 @@
 use askama::Template;
 use currawong_core::config::{Config, ExchangeVersion, MailboxPlatform};
 use ipnet::IpNet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// What the wizard collects for one Exchange organisation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,10 +75,11 @@ impl ExchangeOnboarding {
         };
         let mut servers: Vec<String> = Vec::new();
         for host in mailbox_hosts {
-            let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
-            if host.parse::<IpAddr>().is_ok() {
+            // An address (`10.1.1.5`, `[2001:db8::5]:2525`) names no server.
+            if host.parse::<SocketAddr>().is_ok() || host.parse::<IpAddr>().is_ok() {
                 continue;
             }
+            let host = host.rsplit_once(':').map_or(host.as_str(), |(h, _)| h);
             let name = host
                 .split('.')
                 .next()
