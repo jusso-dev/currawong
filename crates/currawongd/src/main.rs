@@ -359,6 +359,19 @@ where
     });
 }
 
+/// Wait for `signal`, or for ever when it could not be registered: a missing
+/// handler must not read as a signal (an instant shutdown, or a SIGHUP reload
+/// in a busy loop).
+#[cfg(unix)]
+async fn recv_or_pending(signal: Option<&mut tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_for_signals(
     shutdown: CancellationToken,
     tls: Option<Arc<TlsManager>>,
@@ -376,15 +389,11 @@ async fn wait_for_signals(
                     shutdown.cancel();
                     break;
                 }
-                _ = async {
-                    if let Some(sig) = terminate.as_mut() { sig.recv().await; }
-                } => {
+                _ = recv_or_pending(terminate.as_mut()) => {
                     shutdown.cancel();
                     break;
                 }
-                _ = async {
-                    if let Some(sig) = hangup.as_mut() { sig.recv().await; }
-                } => {
+                _ = recv_or_pending(hangup.as_mut()) => {
                     if let (Some(tls), Some(cert), Some(key)) = (&tls, &cert, &key) {
                         if let Err(err) = currawongd::reload_certificates(tls, cert, key) {
                             tracing::error!(%err, "SIGHUP certificate reload failed");
