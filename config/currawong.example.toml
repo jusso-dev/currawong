@@ -58,11 +58,29 @@ bind = "0.0.0.0:465"
 mode = "implicit"
 role = "submission"
 
-# tls.cert and tls.key: PEM paths. Reloaded on SIGHUP.
-# tls.acme is not implemented yet. --check-config refuses a config that sets it.
+# tls.cert and tls.key: PEM paths. Reloaded on SIGHUP without closing a
+# listener; if the new files do not load, the old certificate stays in use.
+# tls.acme (off unless present): get the certificate from an ACME CA instead
+# of tls.cert and tls.key (set one or the other). HTTP-01 only: the CA must
+# reach http_bind as port 80 on every name in domains. Setting it accepts the
+# CA's terms of service. With no usable cached certificate, start-up waits for
+# issuance before any SMTP listener opens and fails if the CA cannot issue.
+# Renewal is checked every 12 hours and starts once a third of the lifetime is
+# left, swapping the certificate in place like SIGHUP; a failed renewal keeps
+# the cached certificate and is retried. The
+# account key, cert.pem and key.pem are kept 0600 in cache_dir. Only the names
+# and a CSR go to the CA; no mail does. To use it, delete cert and key below
+# and uncomment the [tls.acme] block.
 [tls]
 cert = "/etc/currawong/cert.pem"
 key = "/etc/currawong/key.pem"
+
+# [tls.acme]
+# directory_url = "https://acme-v02.api.letsencrypt.org/directory"
+# domains = ["mx.example.com.au"]
+# contact = "mailto:postmaster@example.com.au"
+# cache_dir = "/var/lib/currawong/acme"
+# http_bind = "0.0.0.0:80"
 
 # scanner.enabled: isolated parser workers and the malware engines.
 # scanner.worker_*: ADR 0002 resource limits. macOS dev builds skip seccomp

@@ -16,7 +16,7 @@ It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint 
 
 | Area | What it does |
 | --- | --- |
-| SMTP gateway | Inbound and outbound relay on tokio, STARTTLS, MTA-STS, DANE, TLS-RPT, greylisting, rate limits, DNSBLs, connection reputation |
+| SMTP gateway | Inbound and outbound relay on tokio, STARTTLS and implicit TLS (TLS 1.2 and 1.3 only), certificate reload on SIGHUP, optional ACME certificates (HTTP-01), MTA-STS, DANE, TLS-RPT, greylisting, rate limits, DNSBLs, connection reputation |
 | Sender authentication | SPF, DKIM, DMARC and ARC via Stalwart's `mail-auth`, daily DMARC aggregate (RUA) reports, BIMI logo lookup |
 | Malware | ClamAV (clamd), YARA, true file type checks, nested archive extraction with limits, macro and OLE detection, sandbox detonation hook |
 | Phishing | URL rewriting with time-of-click checks, lookalike and homoglyph domains, HTML smuggling, QR code phishing |

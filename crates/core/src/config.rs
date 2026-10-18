@@ -113,13 +113,78 @@ pub struct TlsConfig {
     pub acme: Option<AcmeConfig>,
 }
 
+/// Optional ACME (RFC 8555) certificates, used instead of `tls.cert` and
+/// `tls.key`. Off unless the section is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
+    /// The CA's directory, for example Let's Encrypt's
+    /// `https://acme-v02.api.letsencrypt.org/directory`.
     pub directory_url: String,
+    /// Names on the certificate. HTTP-01 cannot validate wildcards.
     pub domains: Vec<String>,
+    /// `mailto:` address the CA may send expiry notices to.
     pub contact: String,
+    /// The account key, certificate and private key are kept here.
     pub cache_dir: PathBuf,
+    /// HTTP-01 challenge listener. The CA connects to port 80 on every name
+    /// in `domains`, so this must be reachable as port 80.
+    #[serde(default = "default_acme_http_bind")]
+    pub http_bind: String,
+}
+
+fn default_acme_http_bind() -> String {
+    "0.0.0.0:80".into()
+}
+
+impl AcmeConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |text: String| Err(ConfigError::Invalid(format!("tls.acme: {text}")));
+        if !self.directory_url.starts_with("https://") {
+            return invalid("directory_url must be an https:// URL".into());
+        }
+        if self.domains.is_empty() {
+            return invalid("domains must name at least one host".into());
+        }
+        for domain in &self.domains {
+            if !is_host_name(domain) {
+                return invalid(format!(
+                    "'{domain}' is not a host name (HTTP-01 cannot issue wildcards)"
+                ));
+            }
+        }
+        if self
+            .contact
+            .strip_prefix("mailto:")
+            .is_none_or(str::is_empty)
+        {
+            return invalid("contact must be a mailto: address".into());
+        }
+        if !self.cache_dir.is_absolute() {
+            return invalid("cache_dir must be an absolute path".into());
+        }
+        match self.http_bind.parse::<SocketAddr>() {
+            Ok(addr) if addr.port() != 0 => Ok(()),
+            _ => invalid(format!(
+                "http_bind '{}' is not a socket address with a port",
+                self.http_bind
+            )),
+        }
+    }
+}
+
+fn is_host_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.contains('.')
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -952,14 +1017,16 @@ impl Config {
                 "max_recipients must be at least 1".into(),
             ));
         }
-        if self.tls.acme.is_some() {
+        if let Some(acme) = &self.tls.acme {
+            if self.tls.cert.is_some() || self.tls.key.is_some() {
+                return Err(ConfigError::Invalid(
+                    "set tls.cert and tls.key, or tls.acme, not both".into(),
+                ));
+            }
+            acme.validate()?;
+        } else if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
             return Err(ConfigError::Invalid(
-                "tls.acme is not implemented yet: set tls.cert and tls.key".into(),
-            ));
-        }
-        if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
-            return Err(ConfigError::Invalid(
-                "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
+                "STARTTLS or implicit TLS requires tls.cert and tls.key, or tls.acme".into(),
             ));
         }
         if self.limits.max_connections == 0 {
@@ -1188,19 +1255,79 @@ mod tests {
         assert_eq!(cfg.limits.max_recipients, 5);
     }
 
-    #[test]
-    fn acme_is_refused_until_implemented() {
-        let mut cfg = Config::default();
-        cfg.tls.cert = None;
-        cfg.tls.key = None;
-        cfg.tls.acme = Some(AcmeConfig {
+    fn acme_config() -> AcmeConfig {
+        AcmeConfig {
             directory_url: "https://acme.example.test/directory".into(),
             domains: vec!["mx.example.test".into()],
             contact: "mailto:ops@example.test".into(),
             cache_dir: PathBuf::from("/var/lib/currawong/acme"),
-        });
+            http_bind: default_acme_http_bind(),
+        }
+    }
+
+    #[test]
+    fn acme_replaces_the_certificate_files() {
+        let mut cfg = Config::default();
+        assert!(cfg.tls.acme.is_none(), "ACME is off by default");
+        cfg.tls.acme = Some(acme_config());
         let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("tls.acme"), "{err}");
+        assert!(err.to_string().contains("not both"), "{err}");
+        cfg.tls.cert = None;
+        cfg.tls.key = None;
+        cfg.validate().unwrap();
+        cfg.tls.acme = None;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("tls.cert"), "{err}");
+    }
+
+    #[test]
+    fn acme_settings_are_checked() {
+        type Edit = fn(&mut AcmeConfig);
+        let cases: [(Edit, &str); 8] = [
+            (
+                |a| a.directory_url = "http://acme.example.test/d".into(),
+                "https://",
+            ),
+            (|a| a.domains.clear(), "at least one"),
+            (|a| a.domains = vec!["*.example.test".into()], "wildcards"),
+            (
+                |a| a.domains = vec!["bad host.example".into()],
+                "not a host",
+            ),
+            (|a| a.contact = "ops@example.test".into(), "mailto:"),
+            (|a| a.contact = "mailto:".into(), "mailto:"),
+            (|a| a.cache_dir = PathBuf::from("acme"), "absolute"),
+            (|a| a.http_bind = "0.0.0.0:0".into(), "http_bind"),
+        ];
+        for (edit, expected) in cases {
+            let mut cfg = Config::default();
+            cfg.tls.cert = None;
+            cfg.tls.key = None;
+            let mut acme = acme_config();
+            edit(&mut acme);
+            cfg.tls.acme = Some(acme);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("tls.acme") && err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn acme_section_loads_with_a_default_challenge_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.toml");
+        std::fs::write(
+            &path,
+            "[tls.acme]\n\
+             directory_url = \"https://acme.example.test/directory\"\n\
+             domains = [\"mx.example.test\"]\n\
+             contact = \"mailto:ops@example.test\"\n\
+             cache_dir = \"/var/lib/currawong/acme\"\n",
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert!(cfg.tls.cert.is_none());
+        assert_eq!(cfg.tls.acme.as_ref().unwrap().http_bind, "0.0.0.0:80");
+        cfg.validate().unwrap();
     }
 
     #[test]
