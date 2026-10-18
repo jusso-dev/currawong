@@ -1,6 +1,7 @@
 //! Length-prefixed JSON frames shared by the worker and the supervisor.
 use crate::text::DlpText;
 use currawong_core::config::ExtractLimits;
+pub use currawong_core::{FoundUrl, UrlSource};
 use currawong_core::{PartInfo, YaraMatch};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -53,7 +54,12 @@ impl LoadRules {
 pub struct ParseResponse {
     pub id: String,
     pub parts: Vec<PartInfo>,
+    /// Every distinct URL, QR codes included, for link analysis.
     pub urls: Vec<String>,
+    /// The same URLs with where each was found. A URL found in two places
+    /// is listed once per source.
+    #[serde(default)]
+    pub url_sources: Vec<FoundUrl>,
     pub error: Option<String>,
     /// Sandbox warnings, sent once in the `ready` frame.
     #[serde(default)]
@@ -76,6 +82,7 @@ impl ParseResponse {
             id: id.into(),
             parts: Vec::new(),
             urls: Vec::new(),
+            url_sources: Vec::new(),
             error: Some(reason.into()),
             warnings: Vec::new(),
             dlp: DlpText::default(),

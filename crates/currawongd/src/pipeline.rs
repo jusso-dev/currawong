@@ -382,6 +382,7 @@ impl Pipeline {
         };
         report.parts = parsed.parts.clone();
         report.urls = parsed.urls.clone();
+        report.url_sources = parsed.url_sources.clone();
         report.yara = parsed.yara.clone();
         self.scan_dlp(env, &parsed.dlp, &mut report);
         if let Some(err) = parsed.error.filter(|_| parser_failed) {
@@ -589,11 +590,14 @@ impl Pipeline {
                     PartFlag::Encrypted => (true, format!("encrypted archive {name}")),
                     PartFlag::HasOleObject => (true, format!("embedded OLE object {name}")),
                     PartFlag::ExtMismatch => (true, format!("type does not match name {name}")),
-                    PartFlag::LimitExceeded => {
-                        (false, "archive extraction limit exceeded".to_string())
-                    }
+                    PartFlag::LimitExceeded => (false, format!("extraction limit exceeded {name}")),
                     PartFlag::Unscannable => (false, format!("could not inspect {name}")),
-                    PartFlag::Executable | PartFlag::HasMacro => continue,
+                    // Policy acts on these through its signals.
+                    PartFlag::Executable
+                    | PartFlag::HasMacro
+                    | PartFlag::HtmlSmuggling
+                    | PartFlag::QrCode
+                    | PartFlag::QrSkipped => continue,
                 };
                 if active {
                     report.active_content = true;

@@ -35,6 +35,7 @@ impl RulesCache {
                     id: LoadRules::REPLY_ID.into(),
                     parts: Vec::new(),
                     urls: Vec::new(),
+                    url_sources: Vec::new(),
                     error: None,
                     warnings: Vec::new(),
                     yara: Vec::new(),
