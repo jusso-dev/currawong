@@ -14,13 +14,8 @@ use currawong_spool::{Envelope, Spool, SpoolState};
 use std::{io::Cursor, sync::Arc};
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    /// S/MIME when every recipient has a certificate, else the portal.
-    Auto,
-    Smime,
-    Portal,
-}
+/// Kept on quarantine index rows, so a release encrypts as the policy asked.
+pub use currawong_quarantine::EncryptMode as Mode;
 
 /// The encryption a decision asks for. `encrypt`, or both specific
 /// actions together, means either will do.

@@ -7,7 +7,7 @@ use currawong_core::{
 };
 use currawong_dlp::encrypt::{PortalStore, Route};
 use currawong_policy::{default_pack, Action, Condition, Policy, PolicySet, Scope};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{EncryptMode, LinkAction, Principal, QuarantineStore, Role};
 use currawong_spool::{Envelope, Spool, SpoolState};
 use currawongd::{classify_pending, Pipeline, SpoolMailer};
 use std::{io::Cursor, sync::Arc};
@@ -250,8 +250,8 @@ async fn encrypt_with_neither_a_certificate_nor_the_portal_is_quarantined() {
     }
 }
 
-#[tokio::test]
-async fn encrypt_sends_smime_when_the_recipient_certificate_is_known() {
+/// A self-signed RSA certificate PEM for S/MIME to the recipient.
+fn smime_cert() -> String {
     use rsa::pkcs8::EncodePrivateKey;
     let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
     let pem = key.to_pkcs8_pem(Default::default()).unwrap();
@@ -259,11 +259,16 @@ async fn encrypt_sends_smime_when_the_recipient_certificate_is_known() {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.not_before = rcgen::date_time_ymd(2025, 1, 1);
     params.not_after = rcgen::date_time_ymd(2045, 1, 1);
-    let cert = params.self_signed(&pair).unwrap();
+    params.self_signed(&pair).unwrap().pem()
+}
+
+#[tokio::test]
+async fn encrypt_sends_smime_when_the_recipient_certificate_is_known() {
+    let cert = smime_cert();
     let mut h = Harness::new(vec![Action::Encrypt], |cfg, dir| {
         let certs = dir.join("certs");
         std::fs::create_dir_all(&certs).unwrap();
-        std::fs::write(certs.join("ops@partner.test.pem"), cert.pem()).unwrap();
+        std::fs::write(certs.join("ops@partner.test.pem"), &cert).unwrap();
         cfg.encrypt.smime_certs_dir = Some(certs);
     })
     .await;
@@ -278,4 +283,148 @@ async fn encrypt_sends_smime_when_the_recipient_certificate_is_known() {
     assert!(text.contains("Subject: Payroll\r\n"));
     assert!(text.contains("application/pkcs7-mime; smime-type=enveloped-data"));
     assert!(!text.contains("Payroll run attached"));
+}
+
+impl Harness {
+    /// Release the held item of `message` as a platform administrator.
+    async fn release(&self, message: &str) -> MessageId {
+        let admin = Principal {
+            actor: "admin@example.test".into(),
+            role: Role::PlatformAdmin,
+            tenant_id: None,
+        };
+        let item = self
+            .quarantine
+            .list(&admin, &Default::default())
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.message_id == message)
+            .expect("held item");
+        self.quarantine
+            .act(
+                &self.spool,
+                &admin,
+                &item.id,
+                LinkAction::Release,
+                Some("checked"),
+                OffsetDateTime::now_utc(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+    }
+}
+
+#[tokio::test]
+async fn a_release_keeps_the_policy_encryption_and_tls() {
+    let cert = smime_cert();
+    let mut h = Harness::new(
+        vec![
+            Action::Encrypt,
+            Action::RequireTls,
+            Action::Quarantine("dlp".into()),
+        ],
+        |cfg, dir| {
+            let certs = dir.join("certs");
+            std::fs::create_dir_all(&certs).unwrap();
+            std::fs::write(certs.join("ops@partner.test.pem"), &cert).unwrap();
+            cfg.encrypt.smime_certs_dir = Some(certs);
+        },
+    )
+    .await;
+    h.classify().await;
+    assert_eq!(h.original().await.pipeline, "quarantine");
+    let released = h.release(ID).await;
+    let env = h.spool.load(&released).await.unwrap();
+    assert_eq!(env.tls, TlsRequirement::Required);
+    assert!(h.outgoing().await.is_empty());
+
+    h.classify().await;
+    let env = h.spool.load(&released).await.unwrap();
+    assert_eq!(
+        (env.state, env.pipeline.as_str()),
+        (SpoolState::Done, "encrypted")
+    );
+    let outgoing = h.outgoing().await;
+    assert_eq!(outgoing.len(), 1, "only the encrypted form goes out");
+    let (sent, body) = &outgoing[0];
+    assert_ne!(sent.id, released);
+    assert_eq!(sent.rcpt_to, ["ops@partner.test"]);
+    assert_eq!(sent.tls, TlsRequirement::Required);
+    let text = String::from_utf8_lossy(body);
+    assert!(text.contains("application/pkcs7-mime; smime-type=enveloped-data"));
+    assert!(!text.contains("Payroll run attached"), "{text}");
+}
+
+#[tokio::test]
+async fn a_message_held_because_it_could_not_be_encrypted_is_never_released_in_clear() {
+    let mut h = Harness::new(
+        vec![Action::EncryptSmime, Action::RequireDane],
+        |cfg, dir| {
+            cfg.encrypt.smime_certs_dir = Some(dir.join("certs"));
+        },
+    )
+    .await;
+    h.classify().await;
+    assert_eq!(h.original().await.pipeline, "quarantine");
+    let admin = Principal {
+        actor: "admin@example.test".into(),
+        role: Role::PlatformAdmin,
+        tenant_id: None,
+    };
+    let item = h
+        .quarantine
+        .list(&admin, &Default::default())
+        .unwrap()
+        .items[0]
+        .clone();
+    assert_eq!(item.encrypt, Some(EncryptMode::Smime));
+    assert_eq!(item.tls, TlsRequirement::Dane);
+
+    // Still no certificate: the release is held again, not sent.
+    let released = h.release(ID).await;
+    h.classify().await;
+    assert!(h.outgoing().await.is_empty());
+    let env = h.spool.load(&released).await.unwrap();
+    assert_eq!(
+        (env.state, env.pipeline.as_str()),
+        (SpoolState::Done, "quarantine")
+    );
+    let reason = h.quarantine.reason(released.as_str()).unwrap();
+    assert!(
+        reason.starts_with("encrypt_smime: no S/MIME certificate"),
+        "{reason}"
+    );
+    let events = h.quarantine.audit_table().events().unwrap();
+    let actions: Vec<&str> = events.iter().map(|e| e.action.as_str()).collect();
+    assert_eq!(actions, ["release_started", "release", "release_failed"]);
+    assert_eq!(events[2].item_id, item.id);
+    assert_eq!(events[2].reason.as_deref(), Some(reason.as_str()));
+    assert_eq!(events[2].detail.as_deref(), Some(released.as_str()));
+
+    // The new hold keeps the requirements; once a certificate exists its
+    // release goes out encrypted.
+    let again = h
+        .quarantine
+        .list(&admin, &Default::default())
+        .unwrap()
+        .items
+        .into_iter()
+        .find(|i| i.message_id == released.as_str())
+        .unwrap();
+    assert_eq!(again.encrypt, Some(EncryptMode::Smime));
+    assert_eq!(again.tls, TlsRequirement::Dane);
+    let certs = h.cfg.encrypt.smime_certs_dir.clone().unwrap();
+    std::fs::create_dir_all(&certs).unwrap();
+    std::fs::write(certs.join("ops@partner.test.pem"), smime_cert()).unwrap();
+    h.release(released.as_str()).await;
+    h.classify().await;
+    let outgoing = h.outgoing().await;
+    assert_eq!(outgoing.len(), 1);
+    let (sent, body) = &outgoing[0];
+    assert_eq!(sent.tls, TlsRequirement::Dane);
+    let text = String::from_utf8_lossy(body);
+    assert!(text.contains("smime-type=enveloped-data"));
+    assert!(!text.contains("Payroll run attached"), "{text}");
 }

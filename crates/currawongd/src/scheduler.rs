@@ -86,7 +86,7 @@ pub async fn classify_pending(
         .await;
     for env in released {
         let id = env.id.clone();
-        if let Err(err) = deliver_released(spool, pipeline, env).await {
+        if let Err(err) = deliver_released(spool, pipeline, quarantine, env).await {
             tracing::error!(%id, %err, "released message not queued for delivery, will retry");
         }
     }
@@ -98,26 +98,68 @@ fn is_release(env: &Envelope) -> bool {
 }
 
 /// A message released from quarantine is delivered without running policy
-/// again, so this one release cannot be quarantined a second time. The
+/// again, so this one release cannot be quarantined a second time, but with
+/// what the decision that held it required: its TLS requirement, and the
+/// same encrypt step as first delivery when it asked for encryption. Mail
+/// that still cannot be encrypted is held again, never sent in clear, and
+/// the item it was released from gets a `release_failed` audit row. The
 /// release itself is in the quarantine audit trail; a spam release trains
 /// the Bayes classifier as ham. Inbound mail keeps the headers it was held
 /// with; outbound mail is signed now.
 async fn deliver_released(
     spool: &Spool,
     pipeline: &Pipeline,
+    quarantine: &QuarantineStore,
     mut env: Envelope,
 ) -> Result<(), String> {
+    // Without its item there is no telling what the policy required.
+    let item = quarantine
+        .released_item(&env)
+        .map_err(|err| err.to_string())?
+        .ok_or("quarantine item of this release not found")?;
     let raw = spool
         .read_body(&env.id)
         .await
         .map_err(|err| err.to_string())?;
-    if env.direction == Direction::Outbound {
-        let report = ScanReport::new(env.id.clone());
-        env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
-    }
     // Only a spam release says the classifier was wrong about spam.
     if env.pipeline == RELEASE_HAM_PIPELINE {
         pipeline.learn_released(&env, &raw).await;
+    }
+    env.tls = env.tls.max(item.tls);
+    if let Some(mode) = item.encrypt {
+        let id = env.id.clone();
+        let fallback = encrypt::Fallback {
+            store: quarantine,
+            hold: Hold {
+                message_id: id.clone(),
+                tenant_id: item.tenant_id.clone(),
+                queue: item.queue.clone(),
+                reason: String::new(),
+                reasons: item.reasons.clone(),
+                sender: env.mail_from.clone(),
+                recipients: env.rcpt_to.clone(),
+                score: item.score,
+                direction: env.direction,
+                headers: env.prepend_headers.clone(),
+                tls: env.tls,
+                encrypt: Some(mode),
+            },
+        };
+        // Released mail is not rewritten (#29): recipients get the held bytes.
+        encrypt::deliver_encrypted(spool, &fallback, pipeline, env, &raw, &raw, mode).await?;
+        let held = spool.load(&id).await.map_err(|err| err.to_string())?;
+        if held.pipeline == "quarantine" {
+            let reason = quarantine.reason(id.as_str()).unwrap_or_default();
+            let now = OffsetDateTime::now_utc();
+            if let Err(err) = quarantine.release_failed(&item, &reason, &id, now) {
+                tracing::error!(%id, item = %item.id, %err, "release_failed audit row not written");
+            }
+        }
+        return Ok(());
+    }
+    if env.direction == Direction::Outbound {
+        let report = ScanReport::new(env.id.clone());
+        env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
     }
     env.pipeline = "deliver".into();
     spool.update(&env).await.map_err(|err| err.to_string())?;
@@ -531,7 +573,22 @@ fn hold_for(
         score: plan.score,
         direction: env.direction,
         headers: env.prepend_headers.clone(),
+        tls: policy_tls(env.tls, decision),
+        encrypt: encrypt::requested(decision),
     }
+}
+
+/// The stronger of `tls` and what the decision's require_tls and
+/// require_dane actions ask for.
+fn policy_tls(tls: TlsRequirement, decision: &Decision) -> TlsRequirement {
+    decision
+        .actions
+        .iter()
+        .fold(tls, |tls, action| match action {
+            Action::RequireTls => tls.max(TlsRequirement::Required),
+            Action::RequireDane => tls.max(TlsRequirement::Dane),
+            _ => tls,
+        })
 }
 
 /// A spool-safe id (26 upper-case hex characters) derived from another id.
@@ -581,6 +638,8 @@ fn narrow(env: &mut Envelope, rcpts: &[String]) {
 /// Tenant ones stop on mail that has looped through this gateway.
 fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u8]) {
     let looping = own_hops(raw, &cfg.gateway.hostname) >= MAX_OWN_HOPS;
+    // Delivery defers rather than send this message without it.
+    env.tls = policy_tls(env.tls, decision);
     let mut redirect = Vec::new();
     let mut bcc = Vec::new();
     for (action, enforced) in decision.actions.iter().zip(&decision.enforced) {
@@ -588,9 +647,6 @@ fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u
             Action::AddHeader { name, value } => {
                 env.prepend_headers.push(format!("{name}: {value}\r\n"))
             }
-            // Delivery defers rather than send this message without it.
-            Action::RequireTls => env.tls = env.tls.max(TlsRequirement::Required),
-            Action::RequireDane => env.tls = env.tls.max(TlsRequirement::Dane),
             Action::Redirect(to) | Action::Bcc(to) => {
                 if !forward_allowed(cfg, decision.tenant_id.as_deref(), to) {
                     tracing::warn!(id = %env.id, %to, "policy forward target not allowed, skipped");
