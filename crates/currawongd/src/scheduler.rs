@@ -1,5 +1,5 @@
 //! Run the pipeline before delivery. Unscanned mail is never handed to the deliverer.
-use currawong_core::{config::Config, Direction, MessageId, ScanReport, Verdict};
+use currawong_core::{config::Config, Direction, MessageId, ScanReport, TlsRequirement, Verdict};
 use currawong_policy::{canonical_domain, Action, Decision};
 use currawong_quarantine::{Hold, QuarantineStore, RELEASE_HAM_PIPELINE, RELEASE_PIPELINE};
 use currawong_smtp::delivery::{build_dsn, is_null_sender};
@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::{io::Cursor, path::PathBuf};
 use time::OffsetDateTime;
 
-use crate::pipeline::Pipeline;
+use crate::{encrypt, pipeline::Pipeline};
 
 /// A copy made from a split plan and not yet acted on. Neither classified
 /// nor delivered; the original's retry finishes it.
@@ -242,7 +242,6 @@ async fn classify_one(
         .history_sender
         .clone()
         .map(|sender| (env.clone(), sender));
-    let cfg = &pipeline.cfg;
     if plan.groups.len() > 1 {
         // Copies get ids derived from the original and their recipients, so a
         // retry finds them instead of making more. They carry the plan's
@@ -258,7 +257,7 @@ async fn classify_one(
                 // classified on its own (its body may carry rewritten links).
                 if existing.pipeline == SPLIT {
                     act(
-                        spool, quarantine, cfg, existing, &raw, &group[0], &plan, None,
+                        spool, quarantine, pipeline, existing, &raw, &group[0], &plan, None,
                     )
                     .await?;
                 }
@@ -279,7 +278,10 @@ async fn classify_one(
                 .accept(copy.clone(), Cursor::new(body))
                 .await
                 .map_err(|err| err.to_string())?;
-            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan, None).await?;
+            act(
+                spool, quarantine, pipeline, copy, &raw, &group[0], &plan, None,
+            )
+            .await?;
         }
         let rcpts: Vec<String> = plan.groups[0].iter().map(|d| d.recipient.clone()).collect();
         narrow(&mut env, &rcpts);
@@ -292,7 +294,7 @@ async fn classify_one(
     act(
         spool,
         quarantine,
-        cfg,
+        pipeline,
         env,
         &raw,
         &plan.groups[0][0],
@@ -315,13 +317,14 @@ async fn classify_one(
 async fn act(
     spool: &Spool,
     quarantine: &QuarantineStore,
-    cfg: &Config,
+    pipeline: &Pipeline,
     mut env: Envelope,
     raw: &[u8],
     decision: &Decision,
     plan: &Plan,
     rewritten: Option<&[u8]>,
 ) -> Result<(), String> {
+    let cfg = &pipeline.cfg;
     tracing::info!(id = %env.id, explanation = %decision.explanation.join("; "), "policy decision");
     // Replace, never extend: a re-evaluated deferred message must not
     // carry a second set of our headers.
@@ -348,6 +351,20 @@ async fn act(
     };
     match verdict {
         Verdict::Deliver => {
+            // Never delivered as is: the encrypted form, with any rewritten
+            // links, goes out as new mail. The spooled body stays the original.
+            if let Some(mode) = encrypt::requested(decision) {
+                apply_actions(&mut env, decision, cfg, raw);
+                let sent = rewritten.unwrap_or(raw);
+                let fallback = encrypt::Fallback {
+                    store: quarantine,
+                    hold: hold_for(&env, decision, plan, decision.queue(), String::new()),
+                };
+                return encrypt::deliver_encrypted(
+                    spool, &fallback, pipeline, env, raw, sent, mode,
+                )
+                .await;
+            }
             let original = original_path(spool, &env.id);
             if let Some(body) = rewritten {
                 let path = spool_body(spool, &env).ok_or("spool body missing")?;
@@ -388,18 +405,7 @@ async fn act(
                 Some(queue) => format!("{reason} (queue {queue})"),
                 None => reason.clone(),
             };
-            let hold = Hold {
-                message_id: env.id.clone(),
-                tenant_id: decision.tenant_id.clone(),
-                queue: queue.unwrap_or("policy").to_string(),
-                reason: reason.clone(),
-                reasons: decision.explanation.clone(),
-                sender: env.mail_from.clone(),
-                recipients: env.rcpt_to.clone(),
-                score: plan.score,
-                direction: env.direction,
-                headers: env.prepend_headers.clone(),
-            };
+            let hold = hold_for(&env, decision, plan, queue, reason.clone());
             quarantine
                 .hold(&hold, raw, OffsetDateTime::now_utc())
                 .await
@@ -501,12 +507,35 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     dsn.rcpt_status = Vec::new();
     dsn.prepend_headers = Vec::new();
     dsn.dsn_sent = true;
+    dsn.tls = TlsRequirement::None;
     dsn.pipeline = "pending".into();
     dsn
 }
 
+/// The quarantine index entry for `env` under `decision`.
+fn hold_for(
+    env: &Envelope,
+    decision: &Decision,
+    plan: &Plan,
+    queue: Option<&str>,
+    reason: String,
+) -> Hold {
+    Hold {
+        message_id: env.id.clone(),
+        tenant_id: decision.tenant_id.clone(),
+        queue: queue.unwrap_or("policy").to_string(),
+        reason,
+        reasons: decision.explanation.clone(),
+        sender: env.mail_from.clone(),
+        recipients: env.rcpt_to.clone(),
+        score: plan.score,
+        direction: env.direction,
+        headers: env.prepend_headers.clone(),
+    }
+}
+
 /// A spool-safe id (26 upper-case hex characters) derived from another id.
-fn derived_id(id: &MessageId, salt: &str) -> MessageId {
+pub(crate) fn derived_id(id: &MessageId, salt: &str) -> MessageId {
     let digest = Sha256::digest(format!("{id}\n{salt}"));
     MessageId(hex::encode_upper(digest)[..26].to_string())
 }
@@ -547,7 +576,7 @@ fn narrow(env: &mut Envelope, rcpts: &[String]) {
         .retain(|status| rcpts.contains(&status.address));
 }
 
-/// Header, redirect and bcc actions, applied before delivery. Redirect and bcc
+/// Header, TLS, redirect and bcc actions, applied before delivery. Redirect and bcc
 /// only reach the recipient tenant's domains or `policy.forward_domains`.
 /// Tenant ones stop on mail that has looped through this gateway.
 fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u8]) {
@@ -559,6 +588,9 @@ fn apply_actions(env: &mut Envelope, decision: &Decision, cfg: &Config, raw: &[u
             Action::AddHeader { name, value } => {
                 env.prepend_headers.push(format!("{name}: {value}\r\n"))
             }
+            // Delivery defers rather than send this message without it.
+            Action::RequireTls => env.tls = env.tls.max(TlsRequirement::Required),
+            Action::RequireDane => env.tls = env.tls.max(TlsRequirement::Dane),
             Action::Redirect(to) | Action::Bcc(to) => {
                 if !forward_allowed(cfg, decision.tenant_id.as_deref(), to) {
                     tracing::warn!(id = %env.id, %to, "policy forward target not allowed, skipped");

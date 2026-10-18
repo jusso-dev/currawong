@@ -6,8 +6,11 @@ license.workspace = true
 
 [dependencies]
 currawong-core = { path = "../core" }
+currawong-dlp = { path = "../dlp" }
 currawong-scan = { path = "../scan" }
 currawong-integrations = { path = "../integrations" }
+async-trait = { workspace = true }
+governor = { workspace = true }
 ipnet = { workspace = true }
 sha2 = { workspace = true }
 axum = { workspace = true }
@@ -20,4 +23,5 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+tower = { workspace = true }
 mail-parser = { workspace = true }

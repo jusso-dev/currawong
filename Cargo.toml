@@ -83,6 +83,8 @@ pin-project-lite = "0.2"
 rsa = { version = "0.9", features = ["sha2", "pem"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 pkcs8 = { version = "0.10", features = ["pem"] }
+cms = { version = "0.2", features = ["builder"] }
+x509-cert = "0.2"
 zeroize = "1"
 pdf-extract = "0.12"
 calamine = { version = "0.36", default-features = false }

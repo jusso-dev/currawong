@@ -17,7 +17,7 @@ pub use route::{resolve_route, RouteError};
 use client::{HostFailure, Starttls, Transaction};
 use currawong_core::{
     config::{Config, MailboxPlatform},
-    MessageId,
+    MessageId, TlsRequirement,
 };
 use currawong_spool::{next_retry, Envelope, RcptStatus, Spool, SpoolError, SpoolState};
 use futures::{FutureExt, StreamExt};
@@ -352,6 +352,7 @@ impl<D: DnsLookup> Deliverer<D> {
                     rcpt_status: Vec::new(),
                     prepend_headers: Vec::new(),
                     dsn_sent: true,
+                    tls: Default::default(),
                     pipeline: "pending".into(),
                 };
                 self.spool
@@ -467,7 +468,7 @@ impl<D: DnsLookup> Deliverer<D> {
         let mut last = HostFailure::temp(format!("4.4.1 no host accepted mail for {domain}"));
         let mut all_permanent = true;
         'hosts: for hop in &route.hops {
-            let plan = match self.plan(domain, &route, hop, &sts, report).await {
+            let plan = match self.plan(domain, &route, hop, &sts, env.tls, report).await {
                 Ok(plan) => plan,
                 Err(failure) => {
                     tracing::info!(host = %hop.host, detail = %failure.detail, "MX host ruled out");
@@ -485,7 +486,10 @@ impl<D: DnsLookup> Deliverer<D> {
                     received_clear: &message.received_clear,
                     message: &message.rest,
                 };
-                match self.attempt(domain, hop, *addr, &plan, &tx, report).await {
+                match self
+                    .attempt(domain, hop, *addr, &plan, env.tls, &tx, report)
+                    .await
+                {
                     Ok(results) => {
                         all_permanent = false;
                         remaining.clear();
@@ -527,8 +531,35 @@ impl<D: DnsLookup> Deliverer<D> {
 
     /// DANE when the MX and address answers are DNSSEC-secure and usable
     /// TLSA records exist (RFC 7672 section 2.2), else MTA-STS, else
-    /// opportunistic. Configured routes skip both policies.
+    /// opportunistic. Configured routes skip both policies. A message whose
+    /// policy wants DANE only goes to a host with a DANE plan.
     async fn plan(
+        &self,
+        domain: &str,
+        route: &route::Route,
+        hop: &Hop,
+        sts: &Discovery,
+        wanted: TlsRequirement,
+        report: bool,
+    ) -> Result<Plan, HostFailure> {
+        let plan = self.plan_for_host(domain, route, hop, sts, report).await?;
+        if wanted == TlsRequirement::Dane && !matches!(plan, Plan::Dane(..)) {
+            let why = if !self.cfg.delivery.dane {
+                "delivery.dane is off"
+            } else if !route.via_mx {
+                "the next hop is a configured route"
+            } else {
+                "no DNSSEC-secure TLSA records were found"
+            };
+            return Err(HostFailure::temp(format!(
+                "4.7.5 policy require_dane for {domain}: {} cannot be verified with DANE, {why}",
+                hop.host
+            )));
+        }
+        Ok(plan)
+    }
+
+    async fn plan_for_host(
         &self,
         domain: &str,
         route: &route::Route,
@@ -619,15 +650,19 @@ impl<D: DnsLookup> Deliverer<D> {
     /// verification fails and the plan allows it (opportunistic, or an
     /// MTA-STS policy in testing mode), the message goes on a fresh
     /// connection without TLS, never over unverified TLS.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         domain: &str,
         hop: &Hop,
         addr: SocketAddr,
         plan: &Plan,
+        wanted: TlsRequirement,
         tx: &Transaction<'_>,
         record: bool,
     ) -> Result<Vec<(String, DeliveryOutcome)>, HostFailure> {
+        // A policy's require_tls turns every fallback to clear text off.
+        let policy_tls = wanted >= TlsRequirement::Required;
         let server_name = ServerName::try_from(hop.host.clone())
             .map_err(|_| HostFailure::temp(format!("4.7.5 bad host name {}", hop.host)))?;
         let webpki = || self.tls.webpki_config().map_err(HostFailure::temp);
@@ -679,16 +714,21 @@ impl<D: DnsLookup> Deliverer<D> {
                     required: true,
                     policy: format!("MTA-STS policy for {domain}"),
                 };
-                let testing = policy.mode == Mode::Testing;
+                let testing = policy.mode == Mode::Testing && !policy_tls;
                 (starttls, testing, Some(sts_policy(domain, policy)))
             }
             Plan::Opportunistic => {
-                let required = self.cfg.delivery.require_tls;
+                let required = self.cfg.delivery.require_tls || policy_tls;
+                let policy = if self.cfg.delivery.require_tls {
+                    "delivery.require_tls".into()
+                } else {
+                    format!("policy require_tls for {domain}")
+                };
                 let starttls = Starttls {
                     config: webpki()?,
                     server_name,
                     required,
-                    policy: "delivery.require_tls".into(),
+                    policy,
                 };
                 (starttls, !required, None)
             }

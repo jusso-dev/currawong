@@ -988,6 +988,7 @@ fn release_envelope(item: &Item, now: i64) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: item.headers.clone(),
         dsn_sent: false,
+        tls: Default::default(),
         pipeline: if item.queue == "spam" {
             RELEASE_HAM_PIPELINE
         } else {

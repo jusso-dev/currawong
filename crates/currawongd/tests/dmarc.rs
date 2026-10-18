@@ -44,6 +44,7 @@ fn envelope(id: &str, direction: Direction) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: Vec::new(),
         dsn_sent: false,
+        tls: Default::default(),
         pipeline: "pending".into(),
     }
 }

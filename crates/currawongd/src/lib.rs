@@ -1,12 +1,14 @@
 //! Gateway daemon library. The binary is `currawongd`.
 pub mod dkim;
 mod dmarc;
+mod encrypt;
 mod health;
 mod periodic;
 mod pipeline;
 mod scheduler;
 
 pub use dmarc::{is_public, send_dmarc_reports, supervise, BimiJob, BimiWorker, BIMI_QUEUE};
+pub use encrypt::SpoolMailer;
 
 pub use health::{
     checks_for, reload_certificates, ClamdReady, SignaturesReady, SpoolWritable, WorkerReady,

@@ -41,6 +41,9 @@ axum = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+rcgen = { workspace = true }
+rsa = { workspace = true }
+rand = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
 sevenz-rust2 = { workspace = true, features = ["compress"] }
@@ -51,7 +54,6 @@ base64 = { workspace = true }
 toml = { workspace = true }
 tower = { workspace = true }
 mail-parser = { workspace = true }
-rcgen = { workspace = true }
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 libc = { workspace = true }

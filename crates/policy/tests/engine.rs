@@ -741,8 +741,6 @@ fn invalid_policies_are_refused() {
         auth,
         with(Action::Redirect("not an address".into())),
         with(Action::Banner("External sender".into())),
-        with(Action::Encrypt),
-        with(Action::RequireTls),
         score(Some(f64::NAN), None),
         score(None, Some(f64::INFINITY)),
         score(Some(8.0), Some(5.0)),
@@ -939,6 +937,56 @@ fn yara_matches_are_signals_policies_can_act_on() {
         &pack,
     );
     assert_eq!(clean.verdict, Verdict::Deliver);
+}
+
+#[test]
+fn require_tls_and_encrypt_actions_load_and_apply() {
+    let pack = PolicySet::from_toml(
+        r#"
+[[policy]]
+id = "partner-tls"
+conditions = [{ direction = "outbound" }, { recipient = "*@partner.example.com.au" }]
+actions = ["require_tls", "encrypt"]
+
+[[policy]]
+id = "sensitive"
+priority = 50
+conditions = [{ direction = "outbound" }, { marking = "OFFICIAL:Sensitive" }]
+actions = ["require_dane", "encrypt_smime", "encrypt_portal"]
+"#,
+    )
+    .expect("require_tls and encrypt are accepted at load");
+    let outbound = Context {
+        direction: Direction::Outbound,
+        ..ctx("ops@partner.example.com.au")
+    };
+    let decision = evaluate(&Signals::default(), &outbound, &pack);
+    assert_eq!(decision.verdict, Verdict::Deliver);
+    assert_eq!(decision.actions, vec![Action::RequireTls, Action::Encrypt]);
+    assert!(decision.explanation[0].contains("require TLS, encrypt"));
+
+    let marked = Signals {
+        marking: Some("OFFICIAL:Sensitive".into()),
+        ..Default::default()
+    };
+    let decision = evaluate(&marked, &outbound, &pack);
+    assert_eq!(
+        decision.actions,
+        vec![
+            Action::RequireDane,
+            Action::EncryptSmime,
+            Action::EncryptPortal,
+            Action::RequireTls,
+            Action::Encrypt
+        ]
+    );
+    let text = pack.to_toml().unwrap();
+    assert_eq!(PolicySet::from_toml(&text).unwrap(), pack);
+    let mut store = PolicyStore::open_in_memory().unwrap();
+    store.import(None, &pack).unwrap();
+    let mut loaded = store.load().unwrap();
+    loaded.policies.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(loaded.policies, pack.policies);
 }
 
 fn government_pack() -> PolicySet {

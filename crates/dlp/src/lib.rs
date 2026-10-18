@@ -3,7 +3,11 @@
 //!
 //! `scan` returns counts and redacted samples only. Full identifiers stay in
 //! memory for the length of the scan and are never logged or stored.
+//!
+//! `encrypt` carries out the policy encryption actions: S/MIME to a known
+//! recipient certificate, or the secure pull portal.
 pub mod detectors;
+pub mod encrypt;
 pub mod pspf;
 
 pub use currawong_core::config::DlpProfile;

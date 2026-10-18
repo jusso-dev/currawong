@@ -416,6 +416,32 @@ enabled = true
 scan_inbound = false
 min_confidence = 50
 
+# encrypt: what the encrypt, encrypt_smime and encrypt_portal policy actions
+# use. `encrypt` sends S/MIME when every recipient has a certificate in
+# smime_certs_dir (`<address>.pem`, RSA), else holds the message in the
+# portal. Mail a policy asks to encrypt is quarantined, never sent in clear,
+# when neither works. require_tls and require_dane need no settings here.
+[encrypt]
+# smime_certs_dir = "/etc/currawong/smime"
+
+# encrypt.portal: held messages are sealed with AES-256-GCM under key_path
+# (created on first start; back it up). The recipient gets a link to
+# base_url; opening it takes a six digit code mailed to them, valid for ten
+# minutes. Five wrong codes lock the message. listen is plain HTTP for a TLS
+# reverse proxy.
+[encrypt.portal]
+enabled = false
+dir = "/var/lib/currawong/portal"
+key_path = "/etc/currawong/portal.key"
+listen = "127.0.0.1:8026"
+base_url = "https://secure.example.com.au"
+from = ""
+retention_days = 30
+# Per client address and per held message. The client address comes from
+# X-Forwarded-For only when the peer is one of trusted_proxies.
+requests_per_minute = 10
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+
 # quarantine.dir: index (quarantine.sqlite) and fs blobs. Empty uses <spool.dir>/quarantine.
 # quarantine.retention_days: kept this long, then purged hourly from the index
 # and the blob store. queue_retention_days overrides it per queue.

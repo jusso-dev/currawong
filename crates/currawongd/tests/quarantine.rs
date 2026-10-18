@@ -134,6 +134,7 @@ async fn spam_released_from_a_digest_link_is_delivered_and_audited() {
         rcpt_status: Vec::new(),
         prepend_headers: Vec::new(),
         dsn_sent: false,
+        tls: Default::default(),
         pipeline: "pending".into(),
     };
     spool.accept(env, Cursor::new(RAW.to_vec())).await.unwrap();

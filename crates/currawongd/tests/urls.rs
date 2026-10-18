@@ -2,7 +2,7 @@
 //! rewritten links and an ARC seal over them, and a link blocked after
 //! delivery is refused by the click service built from the same config.
 use currawong_auth::{generate, seed_txt, AuthChecker, KeyStore, GATEWAY_TENANT};
-use currawong_core::{config::Config, Direction, MessageId};
+use currawong_core::{config::Config, Direction, MessageId, TlsRequirement};
 use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
 use currawongd::{classify_pending, url_protection, Pipeline};
@@ -32,6 +32,7 @@ fn envelope(id: &str, direction: Direction) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: Vec::new(),
         dsn_sent: false,
+        tls: TlsRequirement::None,
         pipeline: "pending".into(),
     }
 }

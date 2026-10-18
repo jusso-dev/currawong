@@ -42,6 +42,25 @@ pub enum Direction {
     Outbound,
 }
 
+/// Transport security a policy asked for on outbound delivery of one message.
+/// Delivery applies the stronger of this and its own DANE, MTA-STS and
+/// `delivery.require_tls` rules, so a policy can only raise the bar.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsRequirement {
+    /// No policy asked for anything.
+    #[default]
+    None,
+    /// STARTTLS when offered, as delivery does anyway.
+    Opportunistic,
+    /// STARTTLS with a verified certificate, or the message defers.
+    Required,
+    /// DANE-verified STARTTLS (RFC 7672), or the message defers.
+    Dane,
+}
+
 /// Final decision produced by the policy engine for one message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Verdict {
