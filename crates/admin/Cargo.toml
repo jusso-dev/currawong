@@ -6,3 +6,18 @@ license.workspace = true
 
 [dependencies]
 currawong-core = { path = "../core" }
+currawong-scan = { path = "../scan" }
+currawong-integrations = { path = "../integrations" }
+ipnet = { workspace = true }
+sha2 = { workspace = true }
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+askama = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+mail-parser = { workspace = true }

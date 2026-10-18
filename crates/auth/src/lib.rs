@@ -125,7 +125,23 @@ impl AuthChecker {
         env: &Envelope,
         sealer: Option<&StoredKey>,
     ) -> AuthResults {
-        self.evaluate_and_seal(raw, env, sealer, false)
+        self.evaluate_and_seal(raw, env, sealer.map(|key| (key, raw)), false)
+            .await
+            .results
+    }
+
+    /// Verify the message as it arrived (`raw`) and seal the copy a stage
+    /// changed (`delivered`). The results and the ARC chain validation are
+    /// those of `raw`, so a rewritten body does not turn a DKIM pass into
+    /// a fail in our Authentication-Results or ARC-Authentication-Results.
+    pub async fn seal_delivered(
+        &self,
+        raw: &[u8],
+        delivered: &[u8],
+        env: &Envelope,
+        sealer: &StoredKey,
+    ) -> AuthResults {
+        self.evaluate_and_seal(raw, env, Some((sealer, delivered)), false)
             .await
             .results
     }
@@ -141,7 +157,7 @@ impl AuthChecker {
         &self,
         raw: &[u8],
         env: &Envelope,
-        sealer: Option<&StoredKey>,
+        sealer: Option<(&StoredKey, &[u8])>,
         report: bool,
     ) -> Evaluation {
         let stripped = strip_forged(raw, &self.authserv_id);
@@ -185,10 +201,14 @@ impl AuthChecker {
             .with_dmarc_result(&dmarc)
             .with_arc_result(&arc, env.remote_ip);
         let mut header = built.to_header();
-        if let Some(key) = sealer {
-            match sign::seal_arc_set(&message, &built, &arc, key) {
-                Ok(set) => header.push_str(&set),
-                Err(err) => tracing::warn!(%err, "ARC seal skipped"),
+        if let Some((key, delivered)) = sealer {
+            let delivered = strip_forged(delivered, &self.authserv_id);
+            match AuthenticatedMessage::parse(&delivered) {
+                Some(target) => match sign::seal_arc_set(&target, &built, &arc, key) {
+                    Ok(set) => header.push_str(&set),
+                    Err(err) => tracing::warn!(%err, "ARC seal skipped"),
+                },
+                None => tracing::warn!("ARC seal skipped: delivered copy does not parse"),
             }
         }
         // The domain only: a bare local part must not reach a report.

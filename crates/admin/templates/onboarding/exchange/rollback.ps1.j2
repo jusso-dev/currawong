@@ -1,0 +1,40 @@
+# Currawong rollback for {{ c.version }}.
+# Point the MX records back at the previous host first, or inbound mail will
+# queue at senders. Then run this in the Exchange Management Shell. It
+# removes the Currawong connectors and undoes only what the Currawong
+# scripts changed, using the copies they saved.
+{% for server in c.servers -%}
+if (Get-ReceiveConnector "{{ server }}\Currawong Inbound" -ErrorAction SilentlyContinue) {
+    Remove-ReceiveConnector "{{ server }}\Currawong Inbound" -Confirm:$false
+}
+$saved = Join-Path $env:USERPROFILE "currawong-frontend-{{ server }}.xml"
+if (Test-Path $saved) {
+    # Default Frontend was locked down: put back the ranges it had before.
+    Set-ReceiveConnector "{{ server }}\Default Frontend {{ server }}" -RemoteIPRanges (Import-Clixml -Path $saved)
+    Remove-Item -Path $saved
+}
+{%- if c.lockdown %} else {
+    Write-Warning "$saved was not found (run rollback as the account that ran receive.ps1). Set the RemoteIPRanges of {{ server }}\Default Frontend {{ server }} back by hand."
+}
+{%- endif %}
+{% endfor -%}
+if (Get-SendConnector "Currawong Outbound" -ErrorAction SilentlyContinue) {
+    Remove-SendConnector "Currawong Outbound" -Confirm:$false
+}
+$backup = Join-Path $env:USERPROFILE "currawong-transport-backup.xml"
+if (Test-Path $backup) {
+    # Saved values read like "10 MB (10,485,760 bytes)"; the part before the bracket is enough.
+    $previous = Import-Clixml -Path $backup
+    Set-TransportConfig -MaxReceiveSize ($previous.MaxReceiveSize -replace '\s*\(.*$', '') -MaxSendSize ($previous.MaxSendSize -replace '\s*\(.*$', '')
+    # Take Currawong off a domain secure list only if it was not there before.
+    $config = Get-TransportConfig
+    if ($previous.ReceiveSecure -eq $false -and @($config.TLSReceiveDomainSecureList | ForEach-Object { $_.ToString() }) -contains "{{ c.fqdn }}") {
+        Set-TransportConfig -TLSReceiveDomainSecureList @{Remove="{{ c.fqdn }}"}
+    }
+    if ($previous.SendSecure -eq $false -and @($config.TLSSendDomainSecureList | ForEach-Object { $_.ToString() }) -contains "{{ c.fqdn }}") {
+        Set-TransportConfig -TLSSendDomainSecureList @{Remove="{{ c.fqdn }}"}
+    }
+    Remove-Item -Path $backup
+} else {
+    Write-Warning "$backup was not found. Set MaxReceiveSize and MaxSendSize back by hand, and check the domain secure lists."
+}

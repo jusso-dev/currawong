@@ -41,7 +41,9 @@ The package (`[package.metadata.deb]` in `crates/currawongd/Cargo.toml`):
 - generates a self-signed P-256 certificate for `hostname -f` if `/etc/currawong/cert.pem` and `key.pem` are both missing, so the daemon starts;
 - enables and starts `currawongd.service` (`packaging/systemd/currawongd.service`).
 
-The unit runs as `currawong` with only `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict` (only the spool and `/var/lib/currawong` are writable), `NoNewPrivileges=yes`, private `/tmp` and `/dev`, kernel and cgroup protection, `MemoryDenyWriteExecute=yes`, `RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` and `SystemCallFilter=@system-service seccomp` minus `@privileged` and friends. `seccomp` is allowed so the parser worker can install its own, tighter filter. Check the result with `systemd-analyze security currawongd.service`.
+The unit runs as `currawong` with only `CAP_NET_BIND_SERVICE`, `ProtectSystem=strict` (only the spool and `/var/lib/currawong` are writable), `NoNewPrivileges=yes`, private `/tmp` and `/dev`, kernel and cgroup protection, `MemoryDenyWriteExecute=yes`, `RestrictNamespaces=yes`, `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK` and `SystemCallFilter=@system-service seccomp landlock_create_ruleset landlock_add_rule landlock_restrict_self` minus `@privileged` and friends. `seccomp` and the three Landlock calls are allowed so the parser worker can apply Landlock and install its own, tighter filter. Check the result with `systemd-analyze security currawongd.service`.
+
+`systemctl reload currawongd` sends SIGHUP, which reloads the certificate and key without closing a listener; if the new files do not load, the old certificate stays in use and the error is logged. To use an ACME CA instead of the self-signed certificate, replace `tls.cert` and `tls.key` with a `[tls.acme]` section (see the example config) and keep `cache_dir` under `/var/lib/currawong` so the unit can write it. The HTTP-01 listener on port 80 works with the existing `CAP_NET_BIND_SERVICE`. Open port 80 to the CA as well as 25, 465 and 587.
 
 Then run `sudo currawong-setup` to write a real config.
 

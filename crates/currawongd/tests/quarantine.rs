@@ -98,6 +98,7 @@ async fn spam_released_from_a_digest_link_is_delivered_and_audited() {
     cfg.domains.routes = vec![DomainRoute {
         domain: "example.test".into(),
         next_hop: mx.to_string(),
+        platform: None,
     }];
     cfg.quarantine.link_base_url = "https://quarantine.example.test".into();
     // Stands in for the spam score the classifier will report.

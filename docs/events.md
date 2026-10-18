@@ -17,7 +17,7 @@ Every event is a JSON object with these common fields and a `type` tag.
 | `type` | Fields |
 | --- | --- |
 | `message_verdict` | `message_id`, `direction` (`inbound` or `outbound`), `mail_from`, `rcpt_to` (array), `verdict` (`deliver`, `quarantine`, `reject`, `discard` or `defer`), `reason` (optional) |
-| `url_click` | `message_id`, `recipient`, `url`, `action` (`allowed` or `blocked`) |
+| `url_click` | `message_id`, `recipient` (the copy's recipients, comma separated; empty when there were too many), `url`, `action` (`allowed`, `warned` or `blocked`) |
 | `quarantine_release` | `message_id`, `released_by`, `rcpt_to` (array) |
 | `admin_action` | `actor`, `action`, `target` |
 | `verdict_changed` | `message_id`, `from`, `to`, `changed_by` |

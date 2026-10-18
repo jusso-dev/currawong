@@ -37,6 +37,29 @@ impl OutboundTls {
         }
     }
 
+    /// These roots plus the CA certificates in a PEM file, for a route to a
+    /// private PKI (an Exchange server's internal CA).
+    pub fn with_ca_file(&self, path: &std::path::Path) -> Result<Self, String> {
+        let certs = crate::tls::load_certs(path)
+            .map_err(|err| format!("4.7.5 ca_file {}: {err}", path.display()))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "4.7.5 ca_file {} holds no certificates",
+                path.display()
+            ));
+        }
+        let mut roots = (*self.roots).clone();
+        for cert in certs {
+            roots
+                .add(cert)
+                .map_err(|err| format!("4.7.5 ca_file {}: {err}", path.display()))?;
+        }
+        Ok(Self {
+            roots: Arc::new(roots),
+            provider: Arc::clone(&self.provider),
+        })
+    }
+
     /// WebPKI: the chain must lead to a trusted root and name the host.
     pub fn webpki_config(&self) -> Result<Arc<ClientConfig>, String> {
         let config = ClientConfig::builder_with_provider(Arc::clone(&self.provider))
@@ -44,6 +67,32 @@ impl OutboundTls {
             .map_err(|err| err.to_string())?
             .with_root_certificates(Arc::clone(&self.roots))
             .with_no_client_auth();
+        Ok(Arc::new(config))
+    }
+
+    /// WebPKI, presenting the certificate chain and key in two PEM files when
+    /// the server asks for one (Exchange domain secure mail).
+    pub fn webpki_client_config(
+        &self,
+        cert: &std::path::Path,
+        key: &std::path::Path,
+    ) -> Result<Arc<ClientConfig>, String> {
+        let certs = crate::tls::load_certs(cert)
+            .map_err(|err| format!("4.7.5 client_cert {}: {err}", cert.display()))?;
+        if certs.is_empty() {
+            return Err(format!(
+                "4.7.5 client_cert {} holds no certificates",
+                cert.display()
+            ));
+        }
+        let key = crate::tls::load_key(key)
+            .map_err(|err| format!("4.7.5 client_key {}: {err}", key.display()))?;
+        let config = ClientConfig::builder_with_provider(Arc::clone(&self.provider))
+            .with_protocol_versions(&[&TLS13, &TLS12])
+            .map_err(|err| err.to_string())?
+            .with_root_certificates(Arc::clone(&self.roots))
+            .with_client_auth_cert(certs, key)
+            .map_err(|err| format!("4.7.5 client certificate: {err}"))?;
         Ok(Arc::new(config))
     }
 

@@ -1,0 +1,8 @@
+; DNS for Currawong in front of Exchange Server 2019.
+; Currawong does not change DNS for you. Publish these once the connectors
+; are in place and the wizard's checks pass.
+; agency.example: replace the existing MX records with
+agency.example. IN MX 10 gw.currawong.example.
+; agency.example: if it has an SPF record, add "ip4:203.0.113.10 ip4:203.0.113.11" before its "all"
+; term. If it has none, publish
+agency.example. IN TXT "v=spf1 ip4:203.0.113.10 ip4:203.0.113.11 -all"

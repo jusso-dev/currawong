@@ -1,0 +1,15 @@
+# Currawong outbound Send connector for {{ c.version }}.
+# Run in the Exchange Management Shell; it is safe to run again. All outbound
+# mail from {{ c.source_servers }} goes to {{ c.fqdn }} on port {{ c.port }} over TLS,
+# and Exchange checks that Currawong's certificate is valid for {{ c.fqdn }}.
+{%- if c.smtp_auth %}
+# SMTP AUTH: enter the Currawong relay user name and password when asked.
+if (-not (Get-SendConnector "Currawong Outbound" -ErrorAction SilentlyContinue)) {
+    New-SendConnector -Name "Currawong Outbound" -Usage Custom -AddressSpaces "SMTP:*;1" -IsScopedConnector $false -SourceTransportServers {{ c.source_servers }} -SmartHosts {{ c.fqdn }} -SmartHostAuthMechanism BasicAuthRequireTLS -AuthenticationCredential (Get-Credential) -DNSRoutingEnabled $false -RequireTLS $true -TlsAuthLevel DomainValidation -TlsDomain {{ c.fqdn }} -Port 587 -MaxMessageSize {{ c.size }}
+}
+{%- else %}
+# Currawong trusts these servers' addresses as a relay; no password is sent.
+if (-not (Get-SendConnector "Currawong Outbound" -ErrorAction SilentlyContinue)) {
+    New-SendConnector -Name "Currawong Outbound" -Usage Custom -AddressSpaces "SMTP:*;1" -IsScopedConnector $false -SourceTransportServers {{ c.source_servers }} -SmartHosts {{ c.fqdn }} -SmartHostAuthMechanism None -DNSRoutingEnabled $false -RequireTLS $true -TlsAuthLevel DomainValidation -TlsDomain {{ c.fqdn }} -Port 25 -MaxMessageSize {{ c.size }}
+}
+{%- endif %}

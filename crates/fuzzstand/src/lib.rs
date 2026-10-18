@@ -78,9 +78,7 @@ pub fn dlp_scan(data: &[u8]) {
 }
 
 pub fn url_rewrite(data: &[u8]) {
-    let input = text(data);
-    let _ = currawong_scan::url_rewrite::find_urls(&input);
-    let _ = currawong_scan::url_rewrite::rewrite(&input, "https://rewrite.local/");
+    currawong_scan::urls::fuzz(data);
     let _ = currawong_parser::fuzz::urls_in(data);
 }
 

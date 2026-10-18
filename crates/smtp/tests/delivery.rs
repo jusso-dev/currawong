@@ -165,6 +165,7 @@ fn route(cfg: &mut Config, domain: &str, addr: SocketAddr) {
     cfg.domains.routes.push(DomainRoute {
         domain: domain.into(),
         next_hop: addr.to_string(),
+        platform: None,
     });
 }
 
