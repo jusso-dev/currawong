@@ -512,7 +512,10 @@ async fn hung_worker_mid_job_times_out_and_is_replaced() {
         max_ratio: u32::MAX,
         ..limits()
     };
-    let pool = WorkerPool::new(worker_bin(), 1, 500);
+    // Address space for the whole 1 GiB inflate. Under the default 512 MiB
+    // `RLIMIT_AS` the allocation fails part way and the worker answers
+    // quickly with `LimitExceeded` (correct, but not a busy worker).
+    let pool = WorkerPool::new(worker_bin(), 1, 500).with_limits(4096, 30);
     let outcome = pool.scan_file("slow", &slow, &slow_limits).await;
     assert!(
         matches!(&outcome, ScanOutcome::Failed { reason } if reason.contains("timed out")),
