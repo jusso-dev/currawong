@@ -87,6 +87,11 @@ ratatui = { version = "0.30", default-features = false, features = ["crossterm"]
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
 notify = "8"
+# QR decoding (parser worker) and QR fixtures (tests). Only formats seen in mail.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+rqrr = { version = "0.11", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+pdfium-render = "0.9"
 proptest = "1"
 
 # Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
