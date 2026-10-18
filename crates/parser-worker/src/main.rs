@@ -39,10 +39,9 @@ fn main() {
         println!("{}", serde_json::Value::Object(report));
         return;
     }
-    let runtime = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    {
+    // No I/O driver: stdin and stdout run on the blocking pool, and the I/O
+    // driver brings tokio's signal driver, whose socketpair seccomp denies.
+    let runtime = match tokio::runtime::Builder::new_current_thread().build() {
         Ok(runtime) => runtime,
         Err(_) => std::process::exit(1),
     };

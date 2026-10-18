@@ -8,6 +8,14 @@ edition = "2021"
 license = "MIT"
 repository = "https://github.com/jusso-dev/currawong"
 
+# Release binaries ship in the container image, which must stay under 80 MB
+# (#46). Whole-program LTO with one codegen unit and stripped symbols keep
+# currawongd and the parser worker (both carry YARA-X and Cranelift) small.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+
 # DLP scans every outbound message. Optimise it in dev builds too so the
 # hostile-input time bounds in its tests hold; debug assertions stay on.
 [profile.dev.package.currawong-dlp]
