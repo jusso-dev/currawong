@@ -109,6 +109,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with: { name: deb, path: debs }
       - name: Boot Debian 12 with systemd as PID 1
@@ -170,6 +171,61 @@ jobs:
           for port in 25 465 587; do
             grep -q ":$port " listeners.txt || { echo "::error::nothing listening on $port"; exit 1; }
           done
+      # yara-x runs rules on the Pulley interpreter, so the unit keeps
+      # MemoryDenyWriteExecute=yes. A JIT build panics in --check-config here
+      # and the unit restart-loops.
+      - name: YARA under the shipped unit loads rules and quarantines a marker
+        run: |
+          docker cp rules/yara deb12:/etc/currawong/yara
+          # clamd is switched off, so a malware verdict can only come from the
+          # YARA starter rule for the EICAR marker. No greylisting, so the
+          # first attempt is accepted. The scheduler polls every 30 s.
+          docker exec deb12 sh -c '
+            set -e
+            chown -R root:currawong /etc/currawong/yara
+            chmod 0750 /etc/currawong/yara
+            chmod 0640 /etc/currawong/yara/*.yar
+            cfg=/etc/currawong/currawong.toml
+            sed -i -e "s|^rules_dir = \"\"|rules_dir = \"/etc/currawong/yara\"|" \
+                   -e "s|^address = \"tcp:127.0.0.1:3310\"|address = \"\"|" \
+                   -e "s|^required = true|required = false|" \
+                   -e "s|^greylist_enabled = true|greylist_enabled = false|" "$cfg"
+            grep -q "^rules_dir = \"/etc/currawong/yara\"" "$cfg"
+            systemctl restart currawongd'
+          fail() {
+            docker exec deb12 systemctl status currawongd --no-pager || true
+            docker exec deb12 journalctl -u currawongd --no-pager -n 200 || true
+            echo "::error::$1"
+            exit 1
+          }
+          active=no
+          for _ in $(seq 1 30); do
+            docker exec deb12 systemctl is-active --quiet currawongd && { active=yes; break; }
+            sleep 1
+          done
+          [ "$active" = yes ] || fail "currawongd is not active with yara rules_dir set"
+          loaded=no
+          for _ in $(seq 1 30); do
+            docker exec deb12 journalctl -u currawongd --no-pager | grep -q "yara rules loaded" && { loaded=yes; break; }
+            sleep 1
+          done
+          [ "$loaded" = yes ] || fail "no 'yara rules loaded' line in the journal"
+          docker exec deb12 journalctl -u currawongd --no-pager | grep "yara rules loaded" | tail -1
+          printf '%s\r\n' 'From: <sender@ci.invalid>' 'To: <user@example.test>' 'Subject: yara marker' \
+            'Message-ID: <yara-marker@ci.invalid>' '' 'EICAR-STANDARD-ANTIVIRUS-TEST-FILE' > marker.eml
+          docker cp marker.eml deb12:/tmp/marker.eml
+          docker exec deb12 curl -sS --url smtp://127.0.0.1:25 --mail-from sender@ci.invalid \
+            --mail-rcpt user@example.test --upload-file /tmp/marker.eml \
+            || fail "SMTP submission of the marker message failed"
+          held=no
+          for _ in $(seq 1 90); do
+            docker exec deb12 journalctl -u currawongd --no-pager | grep '"quarantined"' \
+              | grep -q '"reason":"malware' && { held=yes; break; }
+            sleep 1
+          done
+          [ "$held" = yes ] || fail "the marker message was not quarantined by the YARA rule"
+          docker exec deb12 journalctl -u currawongd --no-pager | grep '"quarantined"' | tail -1
+          docker exec deb12 systemctl is-active --quiet currawongd || fail "currawongd stopped after the scan"
       - name: Unit hardening report (informational)
         run: |
           docker exec deb12 systemd-analyze verify /usr/lib/systemd/system/currawongd.service || true

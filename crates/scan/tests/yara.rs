@@ -450,6 +450,71 @@ async fn yara_matches_every_part_and_archive_member_in_the_worker() {
     assert!(response.yara.is_empty());
 }
 
+/// Nested loops over every byte: cheap to write, slow on the Pulley
+/// interpreter that rules run on (so the unit can keep
+/// `MemoryDenyWriteExecute`). `uint8` never exceeds 255, so `all` never
+/// short-circuits and every iteration runs.
+const SLOW_RULE: &str = "rule Slow : malware { condition: \
+    for all i in (0..filesize) : ( for all j in (0..1000) : ( uint8(i) != 256 + j ) ) }";
+
+fn slow_rules() -> (tempfile::TempDir, YaraEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("slow.yar"), SLOW_RULE).unwrap();
+    let engine = YaraEngine::new(dir.path()).unwrap();
+    (dir, engine)
+}
+
+/// yara-x epoch interruption works under Pulley: the per-message budget
+/// stops a loop-heavy condition on hostile input instead of running for
+/// minutes. The heartbeat ticks once a second, so allow a few.
+#[test]
+fn yara_loop_heavy_rule_is_stopped_by_the_time_budget() {
+    let (_dir, engine) = slow_rules();
+    let compiled = engine.current();
+    let hostile = vec![b'a'; 4 * 1024 * 1024];
+    // The budget clock starts with the scanner; on a loaded machine a
+    // one-second budget can run out before the scan starts.
+    let mut scan = YaraScan::with_budget(
+        &compiled.rules,
+        YaraBudget {
+            time: Duration::from_secs(3),
+            ..YaraBudget::default()
+        },
+    );
+    let start = Instant::now();
+    scan.scan("hostile.bin", &hostile);
+    let elapsed = start.elapsed();
+    let err = scan.error.expect("the slow scan is interrupted");
+    assert!(err.contains("hostile.bin"), "{err}");
+    assert!(err.to_lowercase().contains("timeout"), "{err}");
+    assert!(scan.matches.is_empty(), "{:?}", scan.matches);
+    assert!(elapsed < Duration::from_secs(15), "took {elapsed:?}");
+}
+
+/// The worker's per-job timeout bounds the same rule end to end: the job
+/// fails (the pipeline quarantines on `Failed`) and the worker is replaced.
+#[tokio::test]
+async fn yara_loop_heavy_rule_times_out_the_worker_job() {
+    let (_rules, engine) = slow_rules();
+    let compiled = engine.current();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("msg.eml");
+    let mut raw = b"From: a@example.test\r\nTo: b@example.test\r\nSubject: slow\r\n\r\n".to_vec();
+    raw.extend(std::iter::repeat_n(b'a', 4 * 1024 * 1024));
+    std::fs::write(&path, &raw).unwrap();
+    let pool = WorkerPool::new(worker_binary(), 2, 500).with_rules_load_timeout(60);
+    let start = Instant::now();
+    let outcome = pool
+        .scan_file_with_rules("slow", &path, &limits(), Some(&compiled))
+        .await;
+    let elapsed = start.elapsed();
+    let ScanOutcome::Failed { reason } = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(reason.contains("timed out"), "{reason}");
+    assert!(elapsed < Duration::from_secs(30), "took {elapsed:?}");
+}
+
 /// Load cost for a large set. Run in release:
 /// `cargo test --release -p currawong-scan --test yara -- --ignored --nocapture`
 #[test]

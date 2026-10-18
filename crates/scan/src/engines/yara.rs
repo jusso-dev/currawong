@@ -251,7 +251,7 @@ pub fn compile_dir(dir: &Path) -> Result<(Rules, RuleSummary), String> {
             .add_source(SourceCode::from(source.as_str()).with_origin(path.display().to_string()))
             .map_err(|err| format!("{}: {err}", path.display()))?;
     }
-    let rules = compiler.build();
+    let rules = build_rules(compiler)?;
     let mut summary = RuleSummary {
         files: files.len(),
         rules: rules.iter().len(),
@@ -271,6 +271,36 @@ pub fn compile_dir(dir: &Path) -> Result<(Rules, RuleSummary), String> {
         }
     }
     Ok((rules, summary))
+}
+
+/// `Compiler::build` has no error return: it panics when wasmtime cannot
+/// compile the generated module (yara-x `expect("WASM module is not valid")`).
+/// Under `MemoryDenyWriteExecute` a native JIT fails that way, and a panic
+/// here would stop `--check-config` and the daemon, or kill the reload
+/// watcher, instead of failing closed. Catch it and return an error.
+///
+/// The workspace builds yara-x with `pulley` (the wasmtime interpreter), so
+/// nothing is mapped executable and this should not fire in practice.
+fn build_rules(compiler: Compiler<'_>) -> Result<Rules, String> {
+    catch_build(move || {
+        #[cfg(test)]
+        tests::maybe_fail_build();
+        compiler.build()
+    })
+}
+
+fn catch_build(build: impl FnOnce() -> Rules) -> Result<Rules, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).map_err(|panic| {
+        let cause = panic
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".into());
+        format!(
+            "yara rules did not compile to wasm code: {cause} (a yara-x JIT build fails like \
+             this under MemoryDenyWriteExecute; currawong builds yara-x with pulley)"
+        )
+    })
 }
 
 /// The action tag `tag` was probably meant to be, if it is not exactly one.
@@ -320,4 +350,82 @@ pub fn result_for(matches: &[YaraMatch]) -> EngineResult {
         };
     }
     EngineResult::Clean
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_BUILD: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Panic like yara-x does when wasmtime rejects the module.
+    pub(super) fn maybe_fail_build() {
+        if FAIL_BUILD.with(Cell::get) {
+            panic!("WASM module is not valid: injected for a test");
+        }
+    }
+
+    struct FailBuild;
+
+    impl FailBuild {
+        fn on() -> Self {
+            FAIL_BUILD.with(|f| f.set(true));
+            Self
+        }
+    }
+
+    impl Drop for FailBuild {
+        fn drop(&mut self) {
+            FAIL_BUILD.with(|f| f.set(false));
+        }
+    }
+
+    const MARKER: &str =
+        "rule Marker : malware { strings: $a = \"currawong-yara-marker\" condition: $a }";
+
+    #[test]
+    fn a_panicking_build_is_an_error_naming_the_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.yar"), MARKER).unwrap();
+        let _fail = FailBuild::on();
+        let err = compile_dir(dir.path())
+            .err()
+            .expect("build failure is an error");
+        assert!(err.contains("WASM module is not valid"), "{err}");
+        assert!(err.contains("MemoryDenyWriteExecute"), "{err}");
+        assert!(YaraEngine::new(dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_panicking_reload_keeps_the_last_good_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("good.yar"), MARKER).unwrap();
+        let engine = YaraEngine::new(dir.path()).unwrap();
+        std::fs::write(
+            dir.path().join("second.yar"),
+            "rule Second { condition: true }",
+        )
+        .unwrap();
+        let err = {
+            let _fail = FailBuild::on();
+            engine.reload().unwrap_err()
+        };
+        assert!(err.contains("WASM module is not valid"), "{err}");
+        let current = engine.current();
+        assert_eq!(current.generation, 0);
+        assert_eq!(current.summary.rules, 1);
+        assert_eq!(engine.reload().unwrap(), 1);
+        assert_eq!(engine.current().summary.rules, 2);
+    }
+
+    #[test]
+    fn a_non_string_panic_is_still_an_error() {
+        let err = catch_build(|| std::panic::panic_any(7_u8))
+            .err()
+            .expect("error");
+        assert!(err.contains("unknown panic"), "{err}");
+    }
 }
