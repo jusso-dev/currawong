@@ -7,6 +7,7 @@ use figment::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -39,6 +40,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
+    pub quarantine: QuarantineConfig,
     pub url_rewrite: UrlRewriteConfig,
     pub dlp: DlpProfile,
     pub encrypt: EncryptConfig,
@@ -891,6 +893,85 @@ pub struct PolicyConfig {
     pub forward_domains: Vec<String>,
 }
 
+/// Quarantine queues only an administrator may release, and only with a reason.
+/// Compare queue names with [`canonical_queue`]; `malware` is the floor's
+/// name for the issue's `virus` queue.
+pub const ADMIN_RELEASE_QUEUES: &[&str] = &["malware", "virus", "pspf"];
+
+/// Queue names are free text from policy. Trimmed, lower case and with `_`
+/// as `-`, so `Virus`, ` virus` and `scan_failed` match `virus` and
+/// `scan-failed`.
+pub fn canonical_queue(queue: &str) -> String {
+    queue.trim().to_ascii_lowercase().replace('_', "-")
+}
+
+/// Only an administrator may release from this queue, and only with a reason.
+pub fn admin_release_queue(queue: &str) -> bool {
+    ADMIN_RELEASE_QUEUES.contains(&canonical_queue(queue).as_str())
+}
+
+/// Quarantine index, blobs, retention, user digests and release links.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QuarantineConfig {
+    /// Holds `quarantine.sqlite` and, for the `fs` blob store, the blobs.
+    /// Empty means `<spool.dir>/quarantine`.
+    pub dir: PathBuf,
+    /// Days an item is kept before the hourly purge removes it.
+    pub retention_days: u64,
+    /// Per-queue overrides of `retention_days`.
+    pub queue_retention_days: BTreeMap<String, u64>,
+    /// Queues end users may release or delete from their digest. The
+    /// `ADMIN_RELEASE_QUEUES` are refused here.
+    pub user_release_queues: Vec<String>,
+    /// HMAC key for digest links, 32 bytes or more. Created mode 0600 when missing.
+    pub link_key_path: PathBuf,
+    /// Public HTTPS base URL that digest links point at.
+    pub link_base_url: String,
+    pub link_ttl_hours: u64,
+    /// Send each user a digest of their held spam.
+    pub digests: bool,
+    /// Digest sender. Empty means `quarantine@<gateway.hostname>`.
+    pub digest_from: String,
+    pub digest_interval_hours: u64,
+    /// Serve the digest-link and release endpoints on this address. Put a
+    /// TLS proxy in front of it.
+    pub listen: Option<String>,
+    pub blob_store: BlobStoreConfig,
+}
+
+/// Where message bytes are kept. `s3` endpoints pass the residency guard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BlobStoreConfig {
+    /// `fs` or `s3`.
+    pub kind: String,
+    /// S3-compatible endpoint, for example `https://s3.ap-southeast-2.amazonaws.com`.
+    /// Credentials come from the standard `AWS_*` environment variables.
+    pub endpoint: String,
+    pub bucket: String,
+    pub region: String,
+}
+
+impl Default for QuarantineConfig {
+    fn default() -> Self {
+        Self {
+            dir: PathBuf::new(),
+            retention_days: 30,
+            queue_retention_days: BTreeMap::new(),
+            user_release_queues: vec!["spam".into()],
+            link_key_path: PathBuf::from("/etc/currawong/quarantine-link.key"),
+            link_base_url: String::new(),
+            link_ttl_hours: 72,
+            digests: false,
+            digest_from: String::new(),
+            digest_interval_hours: 24,
+            listen: None,
+            blob_store: BlobStoreConfig::default(),
+        }
+    }
+}
+
 /// Event export to SIEMs. See `docs/events.md`. Every sink is off unless set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -962,6 +1043,17 @@ impl Default for EventsConfig {
             syslog: None,
             webhook: None,
             wedgetail: None,
+        }
+    }
+}
+
+impl Default for BlobStoreConfig {
+    fn default() -> Self {
+        Self {
+            kind: "fs".into(),
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: "ap-southeast-2".into(),
         }
     }
 }
@@ -1275,6 +1367,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
+            quarantine: QuarantineConfig::default(),
             url_rewrite: UrlRewriteConfig::default(),
             dlp: DlpProfile::default(),
             encrypt: EncryptConfig::default(),
@@ -1550,6 +1643,7 @@ impl Config {
                 tenant.id
             )));
         }
+        self.validate_quarantine()?;
         // Exchange routes read these on every delivery; a missing file would
         // defer all mail for the domain, so fail at startup instead.
         for route in &self.domains.routes {
@@ -1574,6 +1668,59 @@ impl Config {
         }
         self.events.validate()?;
         Ok(())
+    }
+
+    fn validate_quarantine(&self) -> Result<(), ConfigError> {
+        let q = &self.quarantine;
+        let bad = |msg: String| Err(ConfigError::Invalid(format!("quarantine.{msg}")));
+        if q.retention_days == 0 || q.queue_retention_days.values().any(|&days| days == 0) {
+            return bad("retention days must be at least 1".into());
+        }
+        if q.link_ttl_hours == 0 || q.digest_interval_hours == 0 {
+            return bad("link_ttl_hours and digest_interval_hours must be at least 1".into());
+        }
+        if let Some(queue) = q
+            .user_release_queues
+            .iter()
+            .find(|queue| admin_release_queue(queue))
+        {
+            return bad(format!(
+                "user_release_queues may not include {queue:?}: only administrators release it"
+            ));
+        }
+        if q.digests && q.listen.is_none() {
+            return bad("listen must be set when digests are on, or the links lead nowhere".into());
+        }
+        if q.digests && !q.link_base_url.starts_with("https://") {
+            return bad("link_base_url must be an https:// URL when digests are on".into());
+        }
+        if !q.digest_from.is_empty() && !q.digest_from.contains('@') {
+            return bad("digest_from must be an address".into());
+        }
+        if let Some(listen) = &q.listen {
+            if listen.parse::<SocketAddr>().is_err() {
+                return bad(format!("listen '{listen}' is not a socket address"));
+            }
+        }
+        let blobs = &q.blob_store;
+        match blobs.kind.as_str() {
+            "fs" => {}
+            "s3" if !blobs.endpoint.is_empty()
+                && !blobs.bucket.is_empty()
+                && !blobs.region.is_empty() => {}
+            "s3" => return bad("blob_store s3 needs endpoint, bucket and region".into()),
+            _ => return bad("blob_store.kind must be \"fs\" or \"s3\"".into()),
+        }
+        Ok(())
+    }
+
+    /// The quarantine directory, `<spool.dir>/quarantine` unless set.
+    pub fn quarantine_dir(&self) -> PathBuf {
+        if self.quarantine.dir.as_os_str().is_empty() {
+            self.spool.dir.join("quarantine")
+        } else {
+            self.quarantine.dir.clone()
+        }
     }
 
     pub fn metrics_addr(&self) -> Result<SocketAddr, ConfigError> {
@@ -1860,6 +2007,26 @@ mod tests {
             }
         }
         assert_eq!(cfg.limits.max_recipients, 5);
+    }
+
+    #[test]
+    fn quarantine_settings_are_validated() {
+        let mut cfg = Config::load(&example_path()).unwrap();
+        cfg.quarantine.user_release_queues.push(" Virus".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("user_release_queues"), "{err}");
+        let mut cfg = Config::load(&example_path()).unwrap();
+        cfg.quarantine.digests = true;
+        cfg.quarantine.link_base_url = "https://quarantine.example.test".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("listen"), "{err}");
+        cfg.quarantine.listen = Some("127.0.0.1:8025".into());
+        cfg.validate().unwrap();
+        cfg.quarantine.link_base_url = "http://quarantine.example.test".into();
+        assert!(cfg.validate().is_err());
+        let mut cfg = Config::load(&example_path()).unwrap();
+        cfg.quarantine.blob_store.kind = "s3".into();
+        assert!(cfg.validate().is_err());
     }
 
     fn acme_config() -> AcmeConfig {

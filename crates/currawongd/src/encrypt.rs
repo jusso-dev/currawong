@@ -9,7 +9,7 @@ use currawong_admin::routes::portal::CodeMailer;
 use currawong_core::{config::Config, Direction, TlsRequirement};
 use currawong_dlp::encrypt::{code_mail, notice, smime::Recipient, Issued, Route};
 use currawong_policy::{Action, Decision};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{Hold, QuarantineStore};
 use currawong_spool::{Envelope, Spool, SpoolState};
 use std::{io::Cursor, sync::Arc};
 use time::OffsetDateTime;
@@ -38,11 +38,18 @@ pub fn requested(decision: &Decision) -> Option<Mode> {
     }
 }
 
+/// Where mail that cannot be encrypted goes: the store and the index entry
+/// the policy decision would have made (its reason is filled in here).
+pub struct Fallback<'a> {
+    pub store: &'a QuarantineStore,
+    pub hold: Hold,
+}
+
 /// `raw` is the message as it arrived, quarantined when it cannot be
 /// encrypted; `sent` is what the recipients get (links may be rewritten).
 pub async fn deliver_encrypted(
     spool: &Spool,
-    quarantine: &QuarantineStore,
+    quarantine: &Fallback<'_>,
     pipeline: &Pipeline,
     mut env: Envelope,
     raw: &[u8],
@@ -212,13 +219,19 @@ async fn finish(spool: &Spool, env: &mut Envelope, pipeline: &str) -> Result<(),
 /// Mail a policy asked to encrypt is held, never sent in clear.
 async fn hold(
     spool: &Spool,
-    quarantine: &QuarantineStore,
+    quarantine: &Fallback<'_>,
     env: &mut Envelope,
     raw: &[u8],
     reason: &str,
 ) -> Result<(), String> {
+    let hold = Hold {
+        reason: format!("{reason} (queue {})", quarantine.hold.queue),
+        ..quarantine.hold.clone()
+    };
     quarantine
-        .hold(env.id.as_str(), reason, raw)
+        .store
+        .hold(&hold, raw, OffsetDateTime::now_utc())
+        .await
         .map_err(|err| err.to_string())?;
     tracing::warn!(id = %env.id, %reason, "could not encrypt, quarantined");
     finish(spool, env, "quarantine").await

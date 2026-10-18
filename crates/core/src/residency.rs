@@ -309,7 +309,7 @@ impl ResidencyGuard {
                 }
                 other => other,
             })?;
-        self.enforce_startup(&cfg.residency.content_endpoints)
+        self.enforce_startup(&content_endpoints(cfg))
     }
 
     pub fn enforce_startup(&self, endpoints: &[String]) -> Result<(), ResidencyError> {
@@ -347,7 +347,7 @@ impl ResidencyGuard {
                 matched_rule: matched,
             });
         }
-        for endpoint in &cfg.residency.content_endpoints {
+        for endpoint in &content_endpoints(cfg) {
             let (decision, matched) = match Url::parse(endpoint) {
                 Ok(url) => (
                     match self.check(&url) {
@@ -619,6 +619,15 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(dir)
+}
+
+/// `residency.content_endpoints` plus the S3 quarantine blob endpoint, if any.
+fn content_endpoints(cfg: &Config) -> Vec<String> {
+    let mut endpoints = cfg.residency.content_endpoints.clone();
+    if cfg.quarantine.blob_store.kind == "s3" {
+        endpoints.push(cfg.quarantine.blob_store.endpoint.clone());
+    }
+    endpoints
 }
 
 #[cfg(test)]

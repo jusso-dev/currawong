@@ -442,6 +442,37 @@ retention_days = 30
 requests_per_minute = 10
 trusted_proxies = ["127.0.0.1/32", "::1/128"]
 
+# quarantine.dir: index (quarantine.sqlite) and fs blobs. Empty uses <spool.dir>/quarantine.
+# quarantine.retention_days: kept this long, then purged hourly from the index
+# and the blob store. queue_retention_days overrides it per queue.
+# quarantine.user_release_queues: queues end users may release or delete from
+# their digest. Malware, virus and pspf items are released by a tenant_admin
+# with a reason, never by end users.
+# quarantine.digests: each user gets a digest of newly held items in their
+# queues every digest_interval_hours, through the outbound spool. Links are
+# HMAC signed with link_key_path (created mode 0600), expire after
+# link_ttl_hours and work once.
+# quarantine.listen: serves the digest-link and release endpoints, and must be
+# set when digests are on. Put a TLS proxy at link_base_url in front of it.
+# quarantine.blob_store: "fs", or "s3" with an S3-compatible endpoint that
+# passes the residency guard. Credentials come from AWS_* environment variables.
+[quarantine]
+retention_days = 30
+queue_retention_days = { malware = 90 }
+user_release_queues = ["spam"]
+link_key_path = "/etc/currawong/quarantine-link.key"
+link_base_url = "https://quarantine.currawong.example.test"
+link_ttl_hours = 72
+digests = false
+digest_interval_hours = 24
+# listen = "127.0.0.1:8025"
+
+[quarantine.blob_store]
+kind = "fs"
+# kind = "s3"
+# endpoint = "https://s3.ap-southeast-2.amazonaws.com"
+# bucket = "currawong-quarantine"
+# region = "ap-southeast-2"
 
 # events: export to SIEMs (schema in docs/events.md). Every sink is off until configured.
 # Each sink has its own bounded queue; overflow goes to disk (default <spool.dir>/events),

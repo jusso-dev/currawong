@@ -783,7 +783,10 @@ async fn delivery_adds_received_header() {
     assert!(text.contains("hello"));
 }
 
-#[tokio::test(start_paused = true)]
+// Real time for the deliveries: a paused clock auto-advances while the
+// runtime waits on the sink's socket, so delivery timeouts could fire first.
+// The clock is paused only to jump past the retry delay.
+#[tokio::test]
 async fn delivery_4xx_retries_on_schedule() {
     let h = await_harness().await;
     let hits = Arc::new(AtomicUsize::new(0));
@@ -816,7 +819,9 @@ async fn delivery_4xx_retries_on_schedule() {
     deliverer.poll_due().await.unwrap();
     tokio::task::yield_now().await;
     assert_eq!(hits.load(Ordering::SeqCst), 1, "not due yet");
+    tokio::time::pause();
     tokio::time::advance(Duration::from_secs(5 * 60 + 1)).await;
+    tokio::time::resume();
     deliverer.poll_due().await.unwrap();
     tokio::task::yield_now().await;
     assert_eq!(hits.load(Ordering::SeqCst), 2);

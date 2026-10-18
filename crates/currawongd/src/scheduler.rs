@@ -1,7 +1,7 @@
 //! Run the pipeline before delivery. Unscanned mail is never handed to the deliverer.
 use currawong_core::{config::Config, Direction, MessageId, ScanReport, TlsRequirement, Verdict};
 use currawong_policy::{canonical_domain, Action, Decision};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{Hold, QuarantineStore, RELEASE_HAM_PIPELINE, RELEASE_PIPELINE};
 use currawong_smtp::delivery::{build_dsn, is_null_sender};
 use currawong_spool::{Envelope, RcptStatus, Spool, SpoolState};
 use futures::StreamExt;
@@ -39,6 +39,9 @@ struct Plan {
     /// delivered, for BEC first-time sender checks.
     #[serde(default)]
     history_sender: Option<String>,
+    /// Spam score, kept on quarantine index rows.
+    #[serde(default)]
+    score: Option<f64>,
 }
 
 /// One failing message is logged and skipped; it does not stall the rest.
@@ -58,16 +61,20 @@ pub async fn classify_pending(
         .await
         .map_err(|err| err.to_string())?;
     let now = OffsetDateTime::now_utc();
-    let due = incoming.into_iter().filter(pending_scan).chain(
-        deferred
-            .into_iter()
-            .filter(|env| env.pipeline == "scan_defer")
-            .filter(|env| env.next_attempt_at.is_none_or(|when| when <= now))
-            .map(|mut env| {
-                env.state = SpoolState::Deferred;
-                env
-            }),
-    );
+    let due = incoming
+        .into_iter()
+        .filter(|env| pending_scan(env) || is_release(env))
+        .chain(
+            deferred
+                .into_iter()
+                .filter(|env| env.pipeline == "scan_defer")
+                .filter(|env| env.next_attempt_at.is_none_or(|when| when <= now))
+                .map(|mut env| {
+                    env.state = SpoolState::Deferred;
+                    env
+                }),
+        );
+    let (released, due): (Vec<_>, Vec<_>) = due.partition(is_release);
     let parallel = pipeline.cfg.scanner.worker_pool_size.max(1);
     futures::stream::iter(due)
         .for_each_concurrent(parallel, |env| async move {
@@ -77,6 +84,44 @@ pub async fn classify_pending(
             }
         })
         .await;
+    for env in released {
+        let id = env.id.clone();
+        if let Err(err) = deliver_released(spool, pipeline, env).await {
+            tracing::error!(%id, %err, "released message not queued for delivery, will retry");
+        }
+    }
+    Ok(())
+}
+
+fn is_release(env: &Envelope) -> bool {
+    env.pipeline == RELEASE_PIPELINE || env.pipeline == RELEASE_HAM_PIPELINE
+}
+
+/// A message released from quarantine is delivered without running policy
+/// again, so this one release cannot be quarantined a second time. The
+/// release itself is in the quarantine audit trail; a spam release trains
+/// the Bayes classifier as ham. Inbound mail keeps the headers it was held
+/// with; outbound mail is signed now.
+async fn deliver_released(
+    spool: &Spool,
+    pipeline: &Pipeline,
+    mut env: Envelope,
+) -> Result<(), String> {
+    let raw = spool
+        .read_body(&env.id)
+        .await
+        .map_err(|err| err.to_string())?;
+    if env.direction == Direction::Outbound {
+        let report = ScanReport::new(env.id.clone());
+        env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
+    }
+    // Only a spam release says the classifier was wrong about spam.
+    if env.pipeline == RELEASE_HAM_PIPELINE {
+        pipeline.learn_released(&env, &raw).await;
+    }
+    env.pipeline = "deliver".into();
+    spool.update(&env).await.map_err(|err| err.to_string())?;
+    tracing::info!(id = %env.id, "released from quarantine, policy skipped");
     Ok(())
 }
 
@@ -172,6 +217,7 @@ async fn classify_one(
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
                 history_sender: pipeline.history_sender(&env, &raw, &report),
+                score: report.spam.as_ref().map(|spam| spam.total),
                 groups,
                 rewritten: rewritten_body.is_some(),
             };
@@ -310,8 +356,12 @@ async fn act(
             if let Some(mode) = encrypt::requested(decision) {
                 apply_actions(&mut env, decision, cfg, raw);
                 let sent = rewritten.unwrap_or(raw);
+                let fallback = encrypt::Fallback {
+                    store: quarantine,
+                    hold: hold_for(&env, decision, plan, decision.queue(), String::new()),
+                };
                 return encrypt::deliver_encrypted(
-                    spool, quarantine, pipeline, env, raw, sent, mode,
+                    spool, &fallback, pipeline, env, raw, sent, mode,
                 )
                 .await;
             }
@@ -344,12 +394,21 @@ async fn act(
             }
         }
         Verdict::Quarantine { reason } => {
-            let reason = match decision.queue() {
+            // A scan that never completed is a scan failure, whatever the
+            // deferring policy named.
+            let queue = if matches!(decision.verdict, Verdict::Defer { .. }) {
+                Some("scan-failed")
+            } else {
+                decision.queue()
+            };
+            let reason = match queue {
                 Some(queue) => format!("{reason} (queue {queue})"),
                 None => reason.clone(),
             };
+            let hold = hold_for(&env, decision, plan, queue, reason.clone());
             quarantine
-                .hold(env.id.as_str(), &reason, raw)
+                .hold(&hold, raw, OffsetDateTime::now_utc())
+                .await
                 .map_err(|err| err.to_string())?;
             env.pipeline = "quarantine".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
@@ -451,6 +510,28 @@ fn bounce(env: &Envelope, cfg: &Config) -> Envelope {
     dsn.tls = TlsRequirement::None;
     dsn.pipeline = "pending".into();
     dsn
+}
+
+/// The quarantine index entry for `env` under `decision`.
+fn hold_for(
+    env: &Envelope,
+    decision: &Decision,
+    plan: &Plan,
+    queue: Option<&str>,
+    reason: String,
+) -> Hold {
+    Hold {
+        message_id: env.id.clone(),
+        tenant_id: decision.tenant_id.clone(),
+        queue: queue.unwrap_or("policy").to_string(),
+        reason,
+        reasons: decision.explanation.clone(),
+        sender: env.mail_from.clone(),
+        recipients: env.rcpt_to.clone(),
+        score: plan.score,
+        direction: env.direction,
+        headers: env.prepend_headers.clone(),
+    }
 }
 
 /// A spool-safe id (26 upper-case hex characters) derived from another id.
