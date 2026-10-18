@@ -4,6 +4,7 @@ use currawong_auth::{
 };
 use currawong_classify::{
     message::{too_nested, MAX_RAW_BYTES},
+    spam::Feedback,
     Classifier, TenantContext,
 };
 use currawong_core::telemetry::SCAN_DURATION_SECONDS;
@@ -653,6 +654,26 @@ impl Pipeline {
             tracing::info!(id = %env.id, counts = ?dlp.counts, incomplete = dlp.incomplete, "dlp findings");
         }
         report.dlp = Some(dlp);
+    }
+
+    /// A quarantine release trains the tenant's Bayes store as ham. Keyed by
+    /// the released message id, so a retry does not train twice. Failure is
+    /// logged and never holds up delivery.
+    pub async fn learn_released(&self, env: &Envelope, raw: &[u8]) {
+        let Some(classifier) = self.classifier.clone() else {
+            return;
+        };
+        let tenant = tenant_context(&self.cfg, env);
+        let (id, raw) = (env.id.to_string(), raw.to_vec());
+        let trained = tokio::task::spawn_blocking(move || {
+            classifier.learn(&tenant, &id, &raw, Feedback::Released)
+        })
+        .await;
+        match trained {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => tracing::warn!(id = %env.id, %err, "release not learned"),
+            Err(err) => tracing::warn!(id = %env.id, %err, "release not learned"),
+        }
     }
 
     /// Classification is CPU and SQLite work, so it runs off the async workers.

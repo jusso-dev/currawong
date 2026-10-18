@@ -1,0 +1,11 @@
+{% if outbound %}These messages you sent ({{ recipient }}) were held in quarantine and have not been delivered. If one should be sent, ask your administrator to release it.{% else %}These messages to {{ recipient }} were held in quarantine. Release a message to have it delivered, or delete it. Each link works once.{% endif %}
+{% for entry in entries %}
+Received: {{ entry.received }}
+{% if outbound %}To{% else %}From{% endif %}: {{ entry.address }}
+Subject: {{ entry.subject }}
+Queue: {{ entry.queue }}
+{% if let Some(release) = entry.release.as_deref() %}Release: {{ release }}
+{% endif %}{% if let Some(delete) = entry.delete.as_deref() %}Delete: {{ delete }}
+{% endif %}{% endfor %}
+{% if more > 0 %}{{ more }} more held messages are not listed here. They will be in the next digest.
+{% endif %}{% if outbound %}Messages that are not released are removed automatically.{% else %}Messages you do not act on are removed automatically. Do not forward this email: anyone with these links can release the messages.{% endif %}

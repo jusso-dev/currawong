@@ -1,7 +1,7 @@
 use currawong_auth::{seed_txt, AuthChecker};
 use currawong_classify::{spam::Feedback, TenantContext};
 use currawong_core::{config::Config, Direction, Verdict};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{ListQuery, Principal, QuarantineStore, Role};
 use currawong_spool::{Envelope, Spool, SpoolState};
 use currawongd::{check_config, classify_pending, pending_scan, ready_to_deliver, Pipeline};
 use std::{io::Cursor, sync::Arc};
@@ -208,6 +208,14 @@ async fn repeated_scan_deferrals_end_in_quarantine() {
         .unwrap();
     let env = spool.load(&env.id).await.unwrap();
     assert_eq!(env.pipeline, "quarantine", "{env:?}");
+    let admin = Principal {
+        actor: "root".into(),
+        role: Role::PlatformAdmin,
+        tenant_id: None,
+    };
+    let items = held.list(&admin, &ListQuery::default()).unwrap().items;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].queue, "scan-failed");
 }
 
 /// Windows ignores trailing dots and spaces; the block list must too.

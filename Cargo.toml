@@ -101,9 +101,12 @@ rqrr = { version = "0.11", default-features = false }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 pdfium-render = "0.9"
 proptest = "1"
+# S3-compatible quarantine blobs. TLS through rustls; certificates are verified.
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+askama = "0.16"
+tower = { version = "0.5", features = ["util"] }
 lol_html = "3"
 encoding_rs = "0.8"
-askama = "0.16"
 
 # Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
 [profile.dev.package.argon2]

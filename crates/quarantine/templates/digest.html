@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en-AU">
+<head>
+<meta charset="utf-8">
+<title>Quarantine digest</title>
+</head>
+<body style="font-family: sans-serif; color: #1a1a1a;">
+{% if outbound %}
+<p>These messages you sent ({{ recipient }}) were held in quarantine and have not been delivered. If one should be sent, ask your administrator to release it.</p>
+{% else %}
+<p>These messages to {{ recipient }} were held in quarantine. Release a message to have it delivered, or delete it. Each link works once.</p>
+{% endif %}
+<table cellpadding="6" cellspacing="0" border="1" style="border-collapse: collapse;">
+<thead>
+<tr><th align="left">Received</th><th align="left">{% if outbound %}To{% else %}From{% endif %}</th><th align="left">Subject</th><th align="left">Queue</th>{% if !outbound %}<th></th>{% endif %}</tr>
+</thead>
+<tbody>
+{% for entry in entries %}
+<tr>
+<td>{{ entry.received }}</td>
+<td>{{ entry.address }}</td>
+<td>{{ entry.subject }}</td>
+<td>{{ entry.queue }}</td>
+{% if let (Some(release), Some(delete)) = (entry.release.as_deref(), entry.delete.as_deref()) %}
+<td><a href="{{ release }}">Release</a> | <a href="{{ delete }}">Delete</a></td>
+{% endif %}
+</tr>
+{% endfor %}
+</tbody>
+</table>
+{% if more > 0 %}
+<p>{{ more }} more held messages are not listed here. They will be in the next digest.</p>
+{% endif %}
+{% if outbound %}
+<p>Messages that are not released are removed automatically.</p>
+{% else %}
+<p>Messages you do not act on are removed automatically. Do not forward this email: anyone with these links can release the messages.</p>
+{% endif %}
+</body>
+</html>
