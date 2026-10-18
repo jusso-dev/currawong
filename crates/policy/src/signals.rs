@@ -17,7 +17,8 @@
 //!   `pspf.access.<marker>` (for example `pspf.access.legal-privilege`).
 //!   Classify adds `lookalike` when a sender or link domain imitates a
 //!   protected one, and passes on report flags such as `classify_skipped`
-//!   and `link_scan_truncated`.
+//!   and `link_scan_truncated`. Link rewriting adds `url_rewrite.skipped`
+//!   when some links were left without a click-time check.
 //! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
 //!   for the `marking` and `marking_at_least` conditions.
 //! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers

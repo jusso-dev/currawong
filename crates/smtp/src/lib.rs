@@ -1,4 +1,5 @@
 //! SMTP server, connection checks and outbound delivery.
+pub mod acme;
 pub mod auth_sasl;
 pub mod checks;
 pub mod command;

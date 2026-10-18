@@ -5,7 +5,7 @@ use currawong_auth::{AuthChecker, DmarcEventStore};
 use currawong_core::residency::ResidencyGuard;
 use currawong_dlp::encrypt::PortalStore;
 use currawong_smtp::{
-    checks::CheckStack, delivery::Deliverer, dns::HickoryDns, limits::ConnectionLimits,
+    acme::Acme, checks::CheckStack, delivery::Deliverer, dns::HickoryDns, limits::ConnectionLimits,
     relay::Relay, server::SmtpServer, session::SessionContext, tls::TlsManager,
 };
 use currawong_spool::Spool;
@@ -117,12 +117,33 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         Duration::from_secs(cfg.delivery.poll_secs.max(1)),
         shutdown.clone(),
     ));
-    let tls = match (&cfg.tls.cert, &cfg.tls.key) {
+    // ACME: answer HTTP-01 from now on, and get a certificate before any TLS
+    // listener starts if the cached one is missing or due for renewal.
+    let acme = match &cfg.tls.acme {
+        Some(acme_cfg) => {
+            let acme = Arc::new(Acme::new(acme_cfg.clone()).map_err(|err| err.to_string())?);
+            let http = TcpListener::bind(&acme_cfg.http_bind)
+                .await
+                .map_err(|err| format!("tls.acme.http_bind {}: {err}", acme_cfg.http_bind))?;
+            tokio::spawn(Arc::clone(&acme).serve_http01(http, shutdown.clone()));
+            acme.ensure().await.map_err(|err| err.to_string())?;
+            Some(acme)
+        }
+        None => None,
+    };
+    let (cert, key) = match &acme {
+        Some(acme) => (Some(acme.cert_path()), Some(acme.key_path())),
+        None => (cfg.tls.cert.clone(), cfg.tls.key.clone()),
+    };
+    let tls = match (&cert, &key) {
         (Some(cert), Some(key)) => Some(Arc::new(
             TlsManager::load(cert, key).map_err(|err| err.to_string())?,
         )),
         _ => None,
     };
+    if let (Some(acme), Some(tls)) = (&acme, &tls) {
+        tokio::spawn(Arc::clone(acme).renew(Arc::clone(tls), shutdown.clone()));
+    }
     let dns = HickoryDns::system().map_err(|err| err.to_string())?;
     let checks = Arc::new(
         CheckStack::from_checks(&cfg.checks, Arc::new(dns)).map_err(|err| err.to_string())?,
@@ -205,6 +226,15 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
                 }
             }
         });
+    }
+    if cfg.url_rewrite.enabled {
+        let (rewriter, clicks) = currawongd::url_protection(&cfg)?;
+        pipeline = pipeline.with_url_rewriter(rewriter);
+        let listener = TcpListener::bind(&cfg.url_rewrite.listen)
+            .await
+            .map_err(|err| format!("{}: {err}", cfg.url_rewrite.listen))?;
+        tracing::info!(bind = %cfg.url_rewrite.listen, "click service listening");
+        tokio::spawn(currawong_admin::routes::click::serve(listener, clicks));
     }
     pipeline.reload_policies().await?;
     tracing::info!(count = pipeline.policies.policies.len(), "policies loaded");
@@ -289,8 +319,6 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
         },
     );
     let tls_reload = tls.clone();
-    let cert = cfg.tls.cert.clone();
-    let key = cfg.tls.key.clone();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         wait_for_signals(shutdown_signal, tls_reload, cert, key).await;
@@ -385,6 +413,19 @@ where
     });
 }
 
+/// Wait for `signal`, or for ever when it could not be registered: a missing
+/// handler must not read as a signal (an instant shutdown, or a SIGHUP reload
+/// in a busy loop).
+#[cfg(unix)]
+async fn recv_or_pending(signal: Option<&mut tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            signal.recv().await;
+        }
+        None => std::future::pending().await,
+    }
+}
+
 async fn wait_for_signals(
     shutdown: CancellationToken,
     tls: Option<Arc<TlsManager>>,
@@ -402,15 +443,11 @@ async fn wait_for_signals(
                     shutdown.cancel();
                     break;
                 }
-                _ = async {
-                    if let Some(sig) = terminate.as_mut() { sig.recv().await; }
-                } => {
+                _ = recv_or_pending(terminate.as_mut()) => {
                     shutdown.cancel();
                     break;
                 }
-                _ = async {
-                    if let Some(sig) = hangup.as_mut() { sig.recv().await; }
-                } => {
+                _ = recv_or_pending(hangup.as_mut()) => {
                     if let (Some(tls), Some(cert), Some(key)) = (&tls, &cert, &key) {
                         if let Err(err) = currawongd::reload_certificates(tls, cert, key) {
                             tracing::error!(%err, "SIGHUP certificate reload failed");

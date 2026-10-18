@@ -756,6 +756,7 @@ async fn delivery_adds_received_header() {
     cfg.domains.routes = vec![DomainRoute {
         domain: "example.test".into(),
         next_hop: addr.to_string(),
+        platform: None,
     }];
     let env = queued(
         &h.spool,
@@ -792,6 +793,7 @@ async fn delivery_4xx_retries_on_schedule() {
     cfg.domains.routes = vec![DomainRoute {
         domain: "example.test".into(),
         next_hop: addr.to_string(),
+        platform: None,
     }];
     let env = queued(
         &h.spool,
@@ -832,6 +834,7 @@ async fn delivery_5xx_one_dsn_and_null_sender_none() {
     cfg.domains.routes = vec![DomainRoute {
         domain: "example.test".into(),
         next_hop: addr.to_string(),
+        platform: None,
     }];
     let env = queued(
         &h.spool,

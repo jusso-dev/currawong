@@ -39,6 +39,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub classify: ClassifyConfig,
     pub policy: PolicyConfig,
+    pub url_rewrite: UrlRewriteConfig,
     pub dlp: DlpProfile,
     pub encrypt: EncryptConfig,
     pub events: EventsConfig,
@@ -114,13 +115,78 @@ pub struct TlsConfig {
     pub acme: Option<AcmeConfig>,
 }
 
+/// Optional ACME (RFC 8555) certificates, used instead of `tls.cert` and
+/// `tls.key`. Off unless the section is present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AcmeConfig {
+    /// The CA's directory, for example Let's Encrypt's
+    /// `https://acme-v02.api.letsencrypt.org/directory`.
     pub directory_url: String,
+    /// Names on the certificate. HTTP-01 cannot validate wildcards.
     pub domains: Vec<String>,
+    /// `mailto:` address the CA may send expiry notices to.
     pub contact: String,
+    /// The account key, certificate and private key are kept here.
     pub cache_dir: PathBuf,
+    /// HTTP-01 challenge listener. The CA connects to port 80 on every name
+    /// in `domains`, so this must be reachable as port 80.
+    #[serde(default = "default_acme_http_bind")]
+    pub http_bind: String,
+}
+
+fn default_acme_http_bind() -> String {
+    "0.0.0.0:80".into()
+}
+
+impl AcmeConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let invalid = |text: String| Err(ConfigError::Invalid(format!("tls.acme: {text}")));
+        if !self.directory_url.starts_with("https://") {
+            return invalid("directory_url must be an https:// URL".into());
+        }
+        if self.domains.is_empty() {
+            return invalid("domains must name at least one host".into());
+        }
+        for domain in &self.domains {
+            if !is_host_name(domain) {
+                return invalid(format!(
+                    "'{domain}' is not a host name (HTTP-01 cannot issue wildcards)"
+                ));
+            }
+        }
+        if self
+            .contact
+            .strip_prefix("mailto:")
+            .is_none_or(str::is_empty)
+        {
+            return invalid("contact must be a mailto: address".into());
+        }
+        if !self.cache_dir.is_absolute() {
+            return invalid("cache_dir must be an absolute path".into());
+        }
+        match self.http_bind.parse::<SocketAddr>() {
+            Ok(addr) if addr.port() != 0 => Ok(()),
+            _ => invalid(format!(
+                "http_bind '{}' is not a socket address with a port",
+                self.http_bind
+            )),
+        }
+    }
+}
+
+fn is_host_name(name: &str) -> bool {
+    name.len() <= 253
+        && name.contains('.')
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,11 +307,281 @@ pub struct DomainsConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "DomainRouteToml", into = "DomainRouteToml")]
 pub struct DomainRoute {
+    /// Lower case with no trailing dot once loaded.
     pub domain: String,
-    /// `host` or `host:port`. Skips MX lookup.
+    /// `host` or `host:port`. Skips MX lookup. Empty for Exchange
+    /// on-premises, which delivers to its `mailbox_hosts` instead.
     pub next_hop: String,
+    /// The mailbox platform behind this domain. `None` is a plain smart host.
+    pub platform: Option<MailboxPlatform>,
+}
+
+/// `M365` and `GoogleWorkspace` only label a route for now: delivery uses
+/// its `next_hop` exactly as for a plain smart host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MailboxPlatform {
+    M365,
+    GoogleWorkspace,
+    ExchangeOnPrem {
+        version: ExchangeVersion,
+        /// Exchange Mailbox servers, `host` or `host:port`, tried in order.
+        mailbox_hosts: Vec<String>,
+        /// Name the Exchange certificate must carry. Delivery requires TLS.
+        tls_cert_name: String,
+        /// PEM file with the CA that issued the Exchange certificate, trusted
+        /// in addition to the WebPKI roots. For an internal enterprise CA.
+        ca_file: Option<PathBuf>,
+        /// Client certificate and key (PEM) presented to Exchange, for a
+        /// domain secure (mutual TLS) Receive connector. Both or neither.
+        /// Opt in: with neither, no client certificate is presented and the
+        /// connector is the anonymous, IP-restricted one. The gateway's
+        /// `tls.cert` is not used, as a server certificate often lacks the
+        /// client authentication usage Exchange needs.
+        client_cert: Option<PathBuf>,
+        client_key: Option<PathBuf>,
+    },
+}
+
+impl MailboxPlatform {
+    /// The certificate and key Currawong presents to an Exchange route, set
+    /// explicitly on the route. `None` means the connector is not domain secure.
+    pub fn client_identity(&self) -> Option<(&Path, &Path)> {
+        let Self::ExchangeOnPrem {
+            client_cert,
+            client_key,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        match (client_cert, client_key) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+            _ => None,
+        }
+    }
+}
+
+/// Exchange Server 2016, 2019 or Subscription Edition. SE uses the 2019 cmdlets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExchangeVersion {
+    #[serde(rename = "2016")]
+    Ex2016,
+    #[serde(rename = "2019")]
+    Ex2019,
+    #[serde(rename = "se")]
+    Se,
+}
+
+impl ExchangeVersion {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ex2016 => "Exchange Server 2016",
+            Self::Ex2019 => "Exchange Server 2019",
+            Self::Se => "Exchange Server Subscription Edition",
+        }
+    }
+}
+
+/// Lower case, no surrounding space, no trailing dot. Route lookups compare
+/// domains in this form on both sides.
+pub fn normalise_domain(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+impl DomainsConfig {
+    /// The configured route for `domain`, if any. The one lookup delivery
+    /// uses for both the next hop and its TLS rule.
+    pub fn route_for(&self, domain: &str) -> Option<&DomainRoute> {
+        let domain = normalise_domain(domain);
+        self.routes
+            .iter()
+            .find(|route| normalise_domain(&route.domain) == domain)
+    }
+}
+
+/// A DNS host name: dot-separated labels of letters, digits and inner hyphens.
+fn is_host_name(name: &str) -> bool {
+    (1..=253).contains(&name.len())
+        && !name
+            .rsplit('.')
+            .next()
+            .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()))
+        && name.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// `host`, `host:port`, an IP address or `ip:port` (`[v6]:port`).
+fn is_hop(hop: &str) -> bool {
+    if hop.parse::<SocketAddr>().is_ok() || hop.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    let (host, port) = match hop.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|p| *p != 0)),
+        None => (hop, Some(25)),
+    };
+    port.is_some() && is_host_name(host)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PlatformKind {
+    M365,
+    GoogleWorkspace,
+    ExchangeOnprem,
+}
+
+/// The flat TOML form of a route. `DomainRoute` is checked on the way in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomainRouteToml {
+    domain: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    next_hop: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mailbox_platform: Option<PlatformKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exchange_version: Option<ExchangeVersion>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    mailbox_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tls_cert_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_cert: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key: Option<PathBuf>,
+}
+
+impl TryFrom<DomainRouteToml> for DomainRoute {
+    type Error = String;
+
+    fn try_from(raw: DomainRouteToml) -> Result<Self, String> {
+        let domain = normalise_domain(&raw.domain);
+        if !is_host_name(&domain) {
+            return Err(format!(
+                "route {:?}: domain is not a domain name",
+                raw.domain
+            ));
+        }
+        let exchange_only = raw.exchange_version.is_some()
+            || !raw.mailbox_hosts.is_empty()
+            || raw.tls_cert_name.is_some()
+            || raw.ca_file.is_some()
+            || raw.client_cert.is_some()
+            || raw.client_key.is_some();
+        let platform = match raw.mailbox_platform {
+            Some(PlatformKind::ExchangeOnprem) => {
+                let version = raw.exchange_version.ok_or_else(|| {
+                    format!("route {domain}: exchange_onprem needs exchange_version \"2016\", \"2019\" or \"se\"")
+                })?;
+                if raw.mailbox_hosts.is_empty() {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem needs at least one mailbox_hosts entry"
+                    ));
+                }
+                if let Some(bad) = raw.mailbox_hosts.iter().find(|host| !is_hop(host)) {
+                    return Err(format!(
+                        "route {domain}: mailbox_hosts entry {bad:?} must be host or host:port"
+                    ));
+                }
+                let tls_cert_name = normalise_domain(&raw.tls_cert_name.unwrap_or_default());
+                if !is_host_name(&tls_cert_name)
+                    && tls_cert_name.parse::<std::net::IpAddr>().is_err()
+                {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem needs tls_cert_name, the host name on the Exchange certificate"
+                    ));
+                }
+                if raw.client_cert.is_some() != raw.client_key.is_some() {
+                    return Err(format!(
+                        "route {domain}: set both client_cert and client_key, or neither"
+                    ));
+                }
+                if !raw.next_hop.is_empty() {
+                    return Err(format!(
+                        "route {domain}: exchange_onprem uses mailbox_hosts, not next_hop"
+                    ));
+                }
+                return Ok(Self {
+                    domain,
+                    next_hop: String::new(),
+                    platform: Some(MailboxPlatform::ExchangeOnPrem {
+                        version,
+                        mailbox_hosts: raw.mailbox_hosts,
+                        tls_cert_name,
+                        ca_file: raw.ca_file,
+                        client_cert: raw.client_cert,
+                        client_key: raw.client_key,
+                    }),
+                });
+            }
+            Some(PlatformKind::M365) => Some(MailboxPlatform::M365),
+            Some(PlatformKind::GoogleWorkspace) => Some(MailboxPlatform::GoogleWorkspace),
+            None => None,
+        };
+        if exchange_only {
+            return Err(format!(
+                "route {domain}: exchange_version, mailbox_hosts, tls_cert_name, ca_file, client_cert and client_key need mailbox_platform = \"exchange_onprem\""
+            ));
+        }
+        if raw.next_hop.trim().is_empty() {
+            return Err(format!("route {domain}: next_hop is required"));
+        }
+        Ok(Self {
+            domain,
+            next_hop: raw.next_hop,
+            platform,
+        })
+    }
+}
+
+impl From<DomainRoute> for DomainRouteToml {
+    fn from(route: DomainRoute) -> Self {
+        let mut raw = DomainRouteToml {
+            domain: route.domain,
+            next_hop: route.next_hop,
+            mailbox_platform: None,
+            exchange_version: None,
+            mailbox_hosts: Vec::new(),
+            tls_cert_name: None,
+            ca_file: None,
+            client_cert: None,
+            client_key: None,
+        };
+        match route.platform {
+            None => {}
+            Some(MailboxPlatform::M365) => raw.mailbox_platform = Some(PlatformKind::M365),
+            Some(MailboxPlatform::GoogleWorkspace) => {
+                raw.mailbox_platform = Some(PlatformKind::GoogleWorkspace)
+            }
+            Some(MailboxPlatform::ExchangeOnPrem {
+                version,
+                mailbox_hosts,
+                tls_cert_name,
+                ca_file,
+                client_cert,
+                client_key,
+            }) => {
+                raw.mailbox_platform = Some(PlatformKind::ExchangeOnprem);
+                raw.exchange_version = Some(version);
+                raw.mailbox_hosts = mailbox_hosts;
+                raw.tls_cert_name = Some(tls_cert_name);
+                raw.ca_file = ca_file;
+                raw.client_cert = client_cert;
+                raw.client_key = client_key;
+            }
+        }
+        raw
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,6 +740,63 @@ impl Default for DmarcReportConfig {
             max_rows_per_report: 1_000,
             max_report_bytes: 5 * 1024 * 1024,
             retention_days: 7,
+        }
+    }
+}
+
+/// Links in delivered inbound mail point at the click service, which checks
+/// the real link again when it is clicked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UrlRewriteConfig {
+    pub enabled: bool,
+    /// Public `https://` base of the click service. Links become `<base_url>/u/<token>`.
+    pub base_url: String,
+    /// Click service bind address. It speaks plain HTTP: put a TLS proxy in front.
+    pub listen: String,
+    /// HMAC key, at least 32 bytes. Every node that serves clicks needs the same file.
+    pub key_file: PathBuf,
+    /// Links stop working this many days after the message arrived.
+    pub ttl_days: u64,
+    /// Links to these domains and their subdomains are not rewritten.
+    pub allow_domains: Vec<String>,
+    /// Domains or URL prefixes blocked at click time, one per line (`warn <entry>`
+    /// warns, `allow <entry>` marks a known site). Read again when it changes.
+    pub blocklist: Option<PathBuf>,
+    /// Links to sites not on an `allow` line of the block list get the warning page.
+    pub warn_unknown: bool,
+    /// Click events, one JSON object per line, mode 0600.
+    pub click_log: PathBuf,
+    /// The click log is rotated to `<click_log>.1` past this size.
+    pub click_log_max_bytes: u64,
+    /// Addresses or CIDRs of the TLS proxy in front of the click service. Its
+    /// `X-Forwarded-For` names the client; from anyone else it is ignored.
+    pub trusted_proxies: Vec<String>,
+    /// Verified clicks per minute from one client address (an IPv6 /64 counts as one).
+    pub clicks_per_minute_per_client: u32,
+    /// Verified clicks per minute on one link, per recipient of its message.
+    pub clicks_per_minute_per_link: u32,
+    /// Larger messages are delivered without rewriting.
+    pub max_message_bytes: usize,
+}
+
+impl Default for UrlRewriteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: String::new(),
+            listen: "127.0.0.1:8090".into(),
+            key_file: PathBuf::from("/etc/currawong/url.key"),
+            ttl_days: 7,
+            allow_domains: Vec::new(),
+            blocklist: None,
+            warn_unknown: false,
+            click_log: PathBuf::from("/var/lib/currawong/clicks.jsonl"),
+            click_log_max_bytes: 64 * 1024 * 1024,
+            trusted_proxies: Vec::new(),
+            clicks_per_minute_per_client: 600,
+            clicks_per_minute_per_link: 30,
+            max_message_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -896,6 +1289,7 @@ impl Default for Config {
             auth: AuthConfig::default(),
             classify: ClassifyConfig::default(),
             policy: PolicyConfig::default(),
+            url_rewrite: UrlRewriteConfig::default(),
             dlp: DlpProfile::default(),
             encrypt: EncryptConfig::default(),
             events: EventsConfig::default(),
@@ -1009,14 +1403,16 @@ impl Config {
                 "max_recipients must be at least 1".into(),
             ));
         }
-        if self.tls.acme.is_some() {
+        if let Some(acme) = &self.tls.acme {
+            if self.tls.cert.is_some() || self.tls.key.is_some() {
+                return Err(ConfigError::Invalid(
+                    "set tls.cert and tls.key, or tls.acme, not both".into(),
+                ));
+            }
+            acme.validate()?;
+        } else if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
             return Err(ConfigError::Invalid(
-                "tls.acme is not implemented yet: set tls.cert and tls.key".into(),
-            ));
-        }
-        if needs_tls && (self.tls.cert.is_none() || self.tls.key.is_none()) {
-            return Err(ConfigError::Invalid(
-                "STARTTLS or implicit TLS requires tls.cert and tls.key".into(),
+                "STARTTLS or implicit TLS requires tls.cert and tls.key, or tls.acme".into(),
             ));
         }
         let portal = &self.encrypt.portal;
@@ -1132,6 +1528,30 @@ impl Config {
                 )));
             }
         }
+        let urls = &self.url_rewrite;
+        if urls.enabled {
+            if !urls.base_url.starts_with("https://") {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite.base_url must start with https://".into(),
+                ));
+            }
+            urls.listen.parse::<SocketAddr>().map_err(|_| {
+                ConfigError::Invalid(format!(
+                    "url_rewrite.listen '{}' is not a socket address",
+                    urls.listen
+                ))
+            })?;
+            if urls.clicks_per_minute_per_client == 0 || urls.clicks_per_minute_per_link == 0 {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite click limits must be at least 1".into(),
+                ));
+            }
+            if urls.ttl_days == 0 {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite.ttl_days must be at least 1".into(),
+                ));
+            }
+        }
         // An empty tenant id would share the platform's policy namespace.
         if let Some(tenant) = self
             .relay
@@ -1143,6 +1563,28 @@ impl Config {
                 "relay tenant id {:?} must be non-empty with no surrounding spaces",
                 tenant.id
             )));
+        }
+        // Exchange routes read these on every delivery; a missing file would
+        // defer all mail for the domain, so fail at startup instead.
+        for route in &self.domains.routes {
+            let Some(MailboxPlatform::ExchangeOnPrem {
+                ca_file,
+                client_cert,
+                client_key,
+                ..
+            }) = &route.platform
+            else {
+                continue;
+            };
+            for path in [ca_file, client_cert, client_key].into_iter().flatten() {
+                if !path.is_file() {
+                    return Err(ConfigError::Invalid(format!(
+                        "route {}: {} is not a readable file",
+                        route.domain,
+                        path.display()
+                    )));
+                }
+            }
         }
         self.events.validate()?;
         Ok(())
@@ -1234,6 +1676,166 @@ mod tests {
         }
     }
 
+    fn routes(toml: &str) -> Result<Vec<DomainRoute>, ConfigError> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("routes.toml");
+        std::fs::write(&path, toml).unwrap();
+        load(&path).map(|cfg| cfg.domains.routes)
+    }
+
+    #[test]
+    fn exchange_onprem_route_parses() {
+        let routes = routes(
+            "[[domains.routes]]\ndomain = \"agency.example\"\nmailbox_platform = \"exchange_onprem\"\n\
+             exchange_version = \"se\"\nmailbox_hosts = [\"exch01.agency.example\", \"exch02.agency.example:2525\"]\n\
+             tls_cert_name = \"mail.agency.example\"\n\n\
+             [[domains.routes]]\ndomain = \"plain.example\"\nnext_hop = \"10.0.0.5\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            routes[0].platform,
+            Some(MailboxPlatform::ExchangeOnPrem {
+                version: ExchangeVersion::Se,
+                mailbox_hosts: vec![
+                    "exch01.agency.example".into(),
+                    "exch02.agency.example:2525".into()
+                ],
+                tls_cert_name: "mail.agency.example".into(),
+                ca_file: None,
+                client_cert: None,
+                client_key: None,
+            })
+        );
+        assert_eq!(routes[1].platform, None);
+        assert_eq!(routes[1].next_hop, "10.0.0.5");
+        // The flat form survives a round trip.
+        let again: DomainRoute = toml::from_str(&toml::to_string(&routes[0]).unwrap()).unwrap();
+        assert_eq!(again.platform, routes[0].platform);
+    }
+
+    #[test]
+    fn exchange_onprem_route_needs_its_settings() {
+        let base = "[[domains.routes]]\ndomain = \"agency.example\"\n";
+        for (extra, needle) in [
+            (
+                "mailbox_platform = \"exchange_onprem\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\n",
+                "exchange_version",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\ntls_cert_name = \"e\"\n",
+                "mailbox_hosts",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2016\"\nmailbox_hosts = [\"e\"]\n",
+                "tls_cert_name",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2013\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\n",
+                "2013",
+            ),
+            ("next_hop = \"e\"\nmailbox_hosts = [\"e\"]\n", "exchange_onprem"),
+            ("mailbox_platform = \"m365\"\n", "next_hop"),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch01\", \"\"]\ntls_cert_name = \"e\"\n",
+                "mailbox_hosts entry \"\"",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch01:99999\"]\ntls_cert_name = \"e\"\n",
+                "exch01:99999",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"exch 01\"]\ntls_cert_name = \"e\"\n",
+                "exch 01",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"mail agency\"\n",
+                "tls_cert_name",
+            ),
+            (
+                "mailbox_platform = \"exchange_onprem\"\nexchange_version = \"2019\"\nmailbox_hosts = [\"e\"]\ntls_cert_name = \"e\"\nclient_cert = \"/c.pem\"\n",
+                "client_key",
+            ),
+        ] {
+            let err = routes(&format!("{base}{extra}")).unwrap_err().to_string();
+            assert!(err.contains(needle), "{extra}: {err}");
+        }
+    }
+
+    #[test]
+    fn route_domains_are_normalised_and_looked_up_alike() {
+        let routes = routes(
+            "[[domains.routes]]\ndomain = \" Agency.Example. \"\nmailbox_platform = \"exchange_onprem\"\n\
+             exchange_version = \"2019\"\nmailbox_hosts = [\"10.1.1.5\", \"[2001:db8::5]:2525\"]\n\
+             tls_cert_name = \"Mail.Agency.Example.\"\n",
+        )
+        .unwrap();
+        assert_eq!(routes[0].domain, "agency.example");
+        let Some(MailboxPlatform::ExchangeOnPrem { tls_cert_name, .. }) = &routes[0].platform
+        else {
+            panic!("{:?}", routes[0]);
+        };
+        assert_eq!(tls_cert_name, "mail.agency.example");
+        let mut domains = DomainsConfig {
+            routes,
+            ..DomainsConfig::default()
+        };
+        // A route built in code is matched the same way.
+        domains.routes[0].domain = "AGENCY.example.".into();
+        for name in ["agency.example", "AGENCY.EXAMPLE.", " agency.example "] {
+            assert!(domains.route_for(name).is_some(), "{name}");
+        }
+        assert!(domains.route_for("other.example").is_none());
+    }
+
+    #[test]
+    fn exchange_files_are_checked_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let platform = |ca: &str, cert: Option<&str>| MailboxPlatform::ExchangeOnPrem {
+            version: ExchangeVersion::Ex2019,
+            mailbox_hosts: vec!["exch01.agency.example".into()],
+            tls_cert_name: "mail.agency.example".into(),
+            ca_file: Some(dir.path().join(ca)),
+            client_cert: cert.map(|c| dir.path().join(c)),
+            client_key: cert.map(|_| dir.path().join("client.key")),
+        };
+        std::fs::write(dir.path().join("ca.pem"), "x").unwrap();
+        std::fs::write(dir.path().join("client.pem"), "x").unwrap();
+        std::fs::write(dir.path().join("client.key"), "x").unwrap();
+        for (ca, cert, ok) in [
+            ("ca.pem", None, true),
+            ("ca.pem", Some("client.pem"), true),
+            ("missing.pem", None, false),
+            ("ca.pem", Some("missing.pem"), false),
+        ] {
+            let mut cfg = load(&example_path()).unwrap();
+            cfg.domains.routes.push(DomainRoute {
+                domain: "agency.example".into(),
+                next_hop: String::new(),
+                platform: Some(platform(ca, cert)),
+            });
+            assert_eq!(cfg.validate().is_ok(), ok, "{ca} {cert:?}");
+        }
+    }
+
+    #[test]
+    fn exchange_client_identity_is_opt_in_per_route() {
+        let route = |cert: Option<&str>| MailboxPlatform::ExchangeOnPrem {
+            version: ExchangeVersion::Ex2019,
+            mailbox_hosts: vec!["e".into()],
+            tls_cert_name: "e".into(),
+            ca_file: None,
+            client_cert: cert.map(PathBuf::from),
+            client_key: cert.map(|_| PathBuf::from("/route.key")),
+        };
+        // The gateway's tls.cert is never used as the client certificate.
+        assert_eq!(route(None).client_identity(), None);
+        assert_eq!(
+            route(Some("/route.pem")).client_identity(),
+            Some((Path::new("/route.pem"), Path::new("/route.key")))
+        );
+        assert_eq!(MailboxPlatform::M365.client_identity(), None);
+    }
+
     #[test]
     fn unknown_key_names_the_key() {
         let dir = tempfile::tempdir().unwrap();
@@ -1274,19 +1876,79 @@ mod tests {
         assert_eq!(cfg.limits.max_recipients, 5);
     }
 
-    #[test]
-    fn acme_is_refused_until_implemented() {
-        let mut cfg = Config::default();
-        cfg.tls.cert = None;
-        cfg.tls.key = None;
-        cfg.tls.acme = Some(AcmeConfig {
+    fn acme_config() -> AcmeConfig {
+        AcmeConfig {
             directory_url: "https://acme.example.test/directory".into(),
             domains: vec!["mx.example.test".into()],
             contact: "mailto:ops@example.test".into(),
             cache_dir: PathBuf::from("/var/lib/currawong/acme"),
-        });
+            http_bind: default_acme_http_bind(),
+        }
+    }
+
+    #[test]
+    fn acme_replaces_the_certificate_files() {
+        let mut cfg = Config::default();
+        assert!(cfg.tls.acme.is_none(), "ACME is off by default");
+        cfg.tls.acme = Some(acme_config());
         let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("tls.acme"), "{err}");
+        assert!(err.to_string().contains("not both"), "{err}");
+        cfg.tls.cert = None;
+        cfg.tls.key = None;
+        cfg.validate().unwrap();
+        cfg.tls.acme = None;
+        let err = cfg.validate().unwrap_err();
+        assert!(err.to_string().contains("tls.cert"), "{err}");
+    }
+
+    #[test]
+    fn acme_settings_are_checked() {
+        type Edit = fn(&mut AcmeConfig);
+        let cases: [(Edit, &str); 8] = [
+            (
+                |a| a.directory_url = "http://acme.example.test/d".into(),
+                "https://",
+            ),
+            (|a| a.domains.clear(), "at least one"),
+            (|a| a.domains = vec!["*.example.test".into()], "wildcards"),
+            (
+                |a| a.domains = vec!["bad host.example".into()],
+                "not a host",
+            ),
+            (|a| a.contact = "ops@example.test".into(), "mailto:"),
+            (|a| a.contact = "mailto:".into(), "mailto:"),
+            (|a| a.cache_dir = PathBuf::from("acme"), "absolute"),
+            (|a| a.http_bind = "0.0.0.0:0".into(), "http_bind"),
+        ];
+        for (edit, expected) in cases {
+            let mut cfg = Config::default();
+            cfg.tls.cert = None;
+            cfg.tls.key = None;
+            let mut acme = acme_config();
+            edit(&mut acme);
+            cfg.tls.acme = Some(acme);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("tls.acme") && err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn acme_section_loads_with_a_default_challenge_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("acme.toml");
+        std::fs::write(
+            &path,
+            "[tls.acme]\n\
+             directory_url = \"https://acme.example.test/directory\"\n\
+             domains = [\"mx.example.test\"]\n\
+             contact = \"mailto:ops@example.test\"\n\
+             cache_dir = \"/var/lib/currawong/acme\"\n",
+        )
+        .unwrap();
+        let cfg = load(&path).unwrap();
+        assert!(cfg.tls.cert.is_none());
+        assert_eq!(cfg.tls.acme.as_ref().unwrap().http_bind, "0.0.0.0:80");
+        cfg.validate().unwrap();
     }
 
     #[test]

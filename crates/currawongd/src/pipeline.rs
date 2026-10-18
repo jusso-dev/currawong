@@ -9,7 +9,7 @@ use currawong_classify::{
 use currawong_core::telemetry::SCAN_DURATION_SECONDS;
 use currawong_core::{
     config::{Config, TenantConfig},
-    AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+    AuthResults, Direction, EngineFinding, PartFlag, ScanReport, UrlSource, Verdict,
 };
 use currawong_dlp::encrypt::PortalStore;
 use currawong_parser::{text::DlpText, ParseResponse};
@@ -18,6 +18,7 @@ use currawong_policy::{
 };
 use currawong_scan::engines::yara::{self, CompiledRules, PollWatcher};
 use currawong_scan::pool::{display_name, sweep};
+use currawong_scan::urls::{Delivery, UrlRewriter};
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, ScanOutcome, WorkerPool, YaraEngine,
 };
@@ -25,6 +26,11 @@ use currawong_smtp::checks::{CheckStack, VerdictSignal};
 use currawong_spool::Envelope;
 use std::{path::Path, sync::Arc};
 use tracing::Instrument;
+
+/// Policy flag: some links in an inbound message were left as they were.
+pub const URL_REWRITE_SKIPPED: &str = "url_rewrite.skipped";
+/// Longer recipient lists are left out of click tokens.
+const MAX_TOKEN_RECIPIENTS: usize = 256;
 
 pub struct Pipeline {
     pub cfg: Arc<Config>,
@@ -44,6 +50,8 @@ pub struct Pipeline {
     pub bimi_jobs: Option<tokio::sync::mpsc::Sender<crate::dmarc::BimiJob>>,
     pub policies: PolicySet,
     policy_stamp: Option<currawong_policy::Stamp>,
+    /// Click-time link protection for delivered inbound mail.
+    pub url_rewriter: Option<Arc<UrlRewriter>>,
     /// Spam and lookalike scoring. `None` when `classify.enabled` is off or
     /// the classifier failed to load (`classify_error`, noted on each report).
     pub classifier: Option<Arc<Classifier>>,
@@ -101,6 +109,7 @@ impl Pipeline {
             bimi_jobs: None,
             policies: default_pack().clone(),
             policy_stamp: None,
+            url_rewriter: None,
             checks: None,
             classifier,
             classify_error,
@@ -183,10 +192,26 @@ impl Pipeline {
         raw: &[u8],
         report: &ScanReport,
     ) -> Result<Vec<String>, String> {
+        self.delivery_headers_for(env, raw, None, report).await
+    }
+
+    /// [`Self::delivery_headers`] for a copy whose body a stage changed:
+    /// results come from the message as it arrived (`raw`), the ARC seal
+    /// covers `delivered`, the bytes that leave.
+    pub async fn delivery_headers_for(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        delivered: Option<&[u8]>,
+        report: &ScanReport,
+    ) -> Result<Vec<String>, String> {
         if env.direction == Direction::Inbound {
             if report.modified {
                 if let Some(sealer) = self.arc_sealer().await {
-                    let sealed = self.auth.check_and_seal(raw, env, Some(&sealer)).await;
+                    let sealed = self
+                        .auth
+                        .seal_delivered(raw, delivered.unwrap_or(raw), env, &sealer)
+                        .await;
                     return Ok(vec![sealed.header]);
                 }
             }
@@ -236,6 +261,94 @@ impl Pipeline {
             }
             Err(err) => {
                 tracing::error!(%err, "ARC key lookup failed");
+                None
+            }
+        }
+    }
+
+    pub fn with_url_rewriter(mut self, rewriter: UrlRewriter) -> Self {
+        self.url_rewriter = Some(Arc::new(rewriter));
+        self
+    }
+
+    /// Links in inbound mail point at the click service. Returns the
+    /// rewritten message and marks the report modified, or `None` when
+    /// nothing changed. Links left as they were (a message over the limits,
+    /// a signed part, an unreadable charset) set the `url_rewrite.skipped`
+    /// flag, so policy decides whether such mail is delivered.
+    pub async fn rewrite_urls(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        report: &mut ScanReport,
+    ) -> Option<Vec<u8>> {
+        let rewriter = Arc::clone(self.url_rewriter.as_ref()?);
+        if env.direction != Direction::Inbound {
+            return None;
+        }
+        // A link read from a QR code is pixels in an image: it cannot be
+        // rewritten and gets no click-time check. Not `url_rewrite.skipped`
+        // (QR codes are common); policy has `qr_url` for these.
+        let qr = report
+            .url_sources
+            .iter()
+            .filter(|found| found.source == UrlSource::Qr)
+            .count();
+        if qr > 0 {
+            report.notes.push(format!(
+                "{qr} QR code links not rewritten: no click-time check"
+            ));
+        }
+        // Arrival time, not now, so a retry rebuilds the same bytes.
+        let issued = env.received_at.unix_timestamp().max(0) as u64;
+        // Sorted, so a retry from a split plan builds the same tokens.
+        let mut recipients = env.rcpt_to.clone();
+        recipients.sort();
+        recipients.dedup();
+        let mut recipient = recipients.join(",");
+        if recipient.len() > MAX_TOKEN_RECIPIENTS {
+            recipient.clear();
+        }
+        let (owned, id) = (raw.to_vec(), env.id.to_string());
+        let result = tokio::task::spawn_blocking(move || {
+            let delivery = Delivery {
+                message_id: &id,
+                recipient: &recipient,
+                issued_at: issued,
+            };
+            rewriter.rewrite_message(&owned, &delivery)
+        })
+        .await;
+        let skipped = |report: &mut ScanReport, note: String| {
+            report.notes.push(note);
+            if !report.flags.iter().any(|f| f == URL_REWRITE_SKIPPED) {
+                report.flags.push(URL_REWRITE_SKIPPED.into());
+            }
+        };
+        match result {
+            Ok(Ok(out)) => {
+                if out.skipped > 0 {
+                    for note in out.notes {
+                        skipped(report, note);
+                    }
+                } else {
+                    report.notes.extend(out.notes);
+                }
+                if out.links == 0 {
+                    return None;
+                }
+                tracing::info!(id = %env.id, links = out.links, "links rewritten");
+                report.modified = true;
+                Some(out.message)
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(id = %env.id, %err, "links not rewritten");
+                skipped(report, format!("links not rewritten: {err}"));
+                None
+            }
+            Err(err) => {
+                tracing::error!(id = %env.id, %err, "link rewriting failed");
+                skipped(report, "links not rewritten: rewriter failed".into());
                 None
             }
         }
@@ -321,13 +434,26 @@ impl Pipeline {
         raw: &[u8],
         body_path: Option<&Path>,
     ) -> (ScanReport, MessageDecision) {
+        let (report, decision, _) = self.assess_for_delivery(env, raw, body_path).await;
+        (report, decision)
+    }
+
+    /// [`Self::assess`], plus the body delivered copies carry when links were
+    /// rewritten. Rewriting runs before the decision so policy sees the
+    /// `url_rewrite.*` flags.
+    pub async fn assess_for_delivery(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+        body_path: Option<&Path>,
+    ) -> (ScanReport, MessageDecision, Option<Vec<u8>>) {
         let span = tracing::info_span!("message", message_id = %env.id);
         async {
             let started = std::time::Instant::now();
-            let (report, decision) = self.assess_inner(env, raw, body_path).await;
+            let (report, decision, rewritten) = self.assess_inner(env, raw, body_path).await;
             metrics::histogram!(SCAN_DURATION_SECONDS).record(started.elapsed().as_secs_f64());
             tracing::info!(verdict = ?decision.verdict(), "message evaluated");
-            (report, decision)
+            (report, decision, rewritten)
         }
         .instrument(span)
         .await
@@ -338,7 +464,7 @@ impl Pipeline {
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,
-    ) -> (ScanReport, MessageDecision) {
+    ) -> (ScanReport, MessageDecision, Option<Vec<u8>>) {
         let mut report = ScanReport::new(env.id.clone());
         let wants_event = self.dmarc_events.is_some() && env.direction == Direction::Inbound;
         let auth = self.auth.evaluate(raw, env, wants_event).await;
@@ -374,9 +500,10 @@ impl Pipeline {
             };
             self.scan_dlp(env, &text, &mut report);
             self.classify(env, raw, &mut report).await;
+            let rewritten = self.rewrite_urls(env, raw, &mut report).await;
             let decision = self.decide(env, &report);
             self.feedback(env, &report, &decision.verdict());
-            return (report, decision);
+            return (report, decision, rewritten);
         }
         let rules = self.yara.as_ref().map(|engine| engine.current());
         // Holds the extracted parts on disk until the engines have run.
@@ -463,9 +590,10 @@ impl Pipeline {
             });
         }
         self.classify(env, raw, &mut report).await;
+        let rewritten = self.rewrite_urls(env, raw, &mut report).await;
         let decision = self.decide(env, &report);
         self.feedback(env, &report, &decision.verdict());
-        (report, decision)
+        (report, decision, rewritten)
     }
 
     /// Tenant and direction per recipient: a message can reach several tenants,
@@ -831,13 +959,22 @@ pub fn auth_header(auth: &AuthResults) -> String {
 }
 
 /// Atomically replace a spool body (write beside it, fsync, rename).
-async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn rewrite_body(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use tokio::io::AsyncWriteExt;
     let tmp = path.with_extension("eml.strip");
     let mut file = tokio::fs::File::create(&tmp).await?;
     file.write_all(bytes).await?;
     file.sync_all().await?;
-    tokio::fs::rename(&tmp, path).await
+    tokio::fs::rename(&tmp, path).await?;
+    match path.parent() {
+        Some(dir) => sync_dir(dir).await,
+        None => Ok(()),
+    }
+}
+
+/// fsync a directory so a rename in it survives power loss.
+pub(crate) async fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    tokio::fs::File::open(dir).await?.sync_all().await
 }
 
 fn now() -> u64 {

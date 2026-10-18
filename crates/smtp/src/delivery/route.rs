@@ -1,7 +1,7 @@
 //! Next-hop selection: configured smart host, then MX, then the implicit MX
 //! (the domain's own A/AAAA, only when it has no MX records).
 use crate::dns::{normalise, DnsLookup, LookupError};
-use currawong_core::config::Config;
+use currawong_core::config::{Config, MailboxPlatform};
 use rand::seq::SliceRandom;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -28,6 +28,9 @@ pub struct Route {
     pub via_mx: bool,
     /// The MX answer (or, for an implicit MX, its absence) was DNSSEC-validated.
     pub mx_secure: bool,
+    /// The matched `domains.routes` entry's platform, so the TLS rule comes
+    /// from the same lookup as the hops.
+    pub platform: Option<MailboxPlatform>,
 }
 
 /// Details start with an RFC 3463 enhanced status code.
@@ -63,17 +66,35 @@ pub async fn resolve_route(
     dns: &dyn DnsLookup,
 ) -> Result<Route, RouteError> {
     let domain_l = normalise(domain);
-    if let Some(route) = cfg
-        .domains
-        .routes
-        .iter()
-        .find(|route| normalise(&route.domain) == domain_l)
-    {
-        let hop = resolve_hop(&route.next_hop, dns).await?;
+    if let Some(route) = cfg.domains.route_for(&domain_l) {
+        let hops = match &route.platform {
+            // One hop per Mailbox server, in order. A server whose name does
+            // not resolve is skipped, with a warning; delivery fails over to
+            // the next.
+            Some(MailboxPlatform::ExchangeOnPrem { mailbox_hosts, .. }) => {
+                let mut hops = Vec::new();
+                let mut last = None;
+                for host in mailbox_hosts {
+                    match resolve_hop(host, dns).await {
+                        Ok(hop) => hops.push(hop),
+                        Err(err) => {
+                            tracing::warn!(domain = %domain_l, %host, ?err, "Exchange Mailbox server skipped");
+                            last = Some(err);
+                        }
+                    }
+                }
+                match (hops.is_empty(), last) {
+                    (true, Some(err)) => return Err(err),
+                    _ => hops,
+                }
+            }
+            _ => vec![resolve_hop(&route.next_hop, dns).await?],
+        };
         return Ok(Route {
-            hops: vec![hop],
+            hops,
             via_mx: false,
             mx_secure: false,
+            platform: route.platform.clone(),
         });
     }
     let (mx, mx_secure) = match dns.resolve_mx(&domain_l).await {
@@ -155,6 +176,7 @@ pub async fn resolve_route(
         hops,
         via_mx: true,
         mx_secure,
+        platform: None,
     })
 }
 

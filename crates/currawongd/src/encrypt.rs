@@ -38,18 +38,21 @@ pub fn requested(decision: &Decision) -> Option<Mode> {
     }
 }
 
+/// `raw` is the message as it arrived, quarantined when it cannot be
+/// encrypted; `sent` is what the recipients get (links may be rewritten).
 pub async fn deliver_encrypted(
     spool: &Spool,
     quarantine: &QuarantineStore,
     pipeline: &Pipeline,
     mut env: Envelope,
     raw: &[u8],
+    sent: &[u8],
     mode: Mode,
 ) -> Result<(), String> {
     let cfg = &pipeline.cfg;
     let now = OffsetDateTime::now_utc();
     if mode != Mode::Portal {
-        match smime(cfg, &env.rcpt_to, raw, now.unix_timestamp() as u64) {
+        match smime(cfg, &env.rcpt_to, sent, now.unix_timestamp() as u64) {
             Ok(Ok(body)) => {
                 let id = derived_id(&env.id, "smime");
                 if spool.load(&id).await.is_err() {
@@ -116,7 +119,7 @@ pub async fn deliver_encrypted(
         }
         let (store, owned, to, route) = (
             Arc::clone(&portal),
-            raw.to_vec(),
+            sent.to_vec(),
             rcpt.clone(),
             route.clone(),
         );

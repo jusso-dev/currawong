@@ -34,6 +34,7 @@ tokio-util = { version = "0.7", features = ["codec", "io", "rt"] }
 bytes = "1"
 futures = "0.3"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 base64 = "0.22"
 url = "2"
@@ -50,6 +51,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 rustls-pemfile = "2"
 rcgen = "0.13"
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "rcgen"] }
+x509-parser = { version = "0.18", default-features = false }
 mail-parser = "0.11"
 mail-auth = "0.13"
 mail-send = { version = "0.5", default-features = false, features = ["ring", "tls12"] }
@@ -83,7 +86,6 @@ strsim = "0.11"
 psl = "2"
 idna = "1"
 regex = "1"
-hmac = "0.12"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 # Default modules minus console, cuckoo, crx, dex, vt and the test protos.
 yara-x = { version = "1.21", default-features = false, features = ["constant-folding", "exact-atoms", "fast-regexp", "pe-module", "dotnet-module", "elf-module", "lnk-module", "macho-module", "math-module", "hash-module", "string-module", "time-module", "zip-module"] }
@@ -94,6 +96,9 @@ rqrr = { version = "0.11", default-features = false }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 pdfium-render = "0.9"
 proptest = "1"
+lol_html = "3"
+encoding_rs = "0.8"
+askama = "0.16"
 
 # Argon2 is unusably slow unoptimised; SMTP AUTH tests hash and verify passwords.
 [profile.dev.package.argon2]
