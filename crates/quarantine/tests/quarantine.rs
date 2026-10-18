@@ -3,12 +3,13 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
-use currawong_core::{config::Config, Direction, MessageId};
+use currawong_core::{config::Config, Direction, MessageId, TlsRequirement};
 use currawong_quarantine::{
     digest::{send_digests, DigestSettings},
     http::{router, HttpState},
-    AuditEvent, AuditSink, BlobStore, FsBlobStore, Hold, Link, LinkAction, LinkSigner, ListQuery,
-    Principal, QuarantineError, QuarantineStore, Role, RELEASE_HAM_PIPELINE, RELEASE_PIPELINE,
+    AuditEvent, AuditSink, BlobStore, EncryptMode, FsBlobStore, Hold, Link, LinkAction, LinkSigner,
+    ListQuery, Principal, QuarantineError, QuarantineStore, Role, RELEASE_HAM_PIPELINE,
+    RELEASE_PIPELINE,
 };
 use currawong_spool::{Spool, SpoolState};
 use std::sync::{
@@ -68,6 +69,8 @@ fn hold(id: &str, queue: &str, tenant: Option<&str>) -> Hold {
         score: None,
         direction: Direction::Inbound,
         headers: vec!["Authentication-Results: currawong.example.test; spf=pass\r\n".into()],
+        tls: Default::default(),
+        encrypt: None,
     }
 }
 
@@ -977,4 +980,85 @@ async fn lists_show_held_items_unless_asked_for_all() {
         ..ListQuery::default()
     };
     assert_eq!(s.store.list(&admin, &all).unwrap().items.len(), 2);
+}
+
+#[tokio::test]
+async fn release_keeps_the_policy_tls_and_encryption_requirements() {
+    let s = setup().await;
+    let now = OffsetDateTime::now_utc();
+    let held = Hold {
+        tls: TlsRequirement::Required,
+        encrypt: Some(EncryptMode::Portal),
+        ..hold(SPAM_ID, "dlp", None)
+    };
+    let ids = s.store.hold(&held, RAW, now).await.unwrap();
+    let item = s.store.get(&ids[0]).unwrap().unwrap();
+    assert_eq!(item.tls, TlsRequirement::Required);
+    assert_eq!(item.encrypt, Some(EncryptMode::Portal));
+    let admin = principal("admin@example.test", Role::PlatformAdmin, None);
+    let released = s
+        .store
+        .act(&s.spool, &admin, &ids[0], LinkAction::Release, None, now)
+        .await
+        .unwrap()
+        .unwrap();
+    let env = s.spool.load(&released).await.unwrap();
+    assert_eq!(env.tls, TlsRequirement::Required);
+    assert_eq!(env.pipeline, RELEASE_PIPELINE);
+    // The scheduler finds the requirements from the released message.
+    let found = s.store.released_item(&env).unwrap().unwrap();
+    assert_eq!(found.id, ids[0]);
+    assert_eq!(found.encrypt, Some(EncryptMode::Portal));
+    let mut other = env.clone();
+    other.id = MessageId("01ARZ3NDEKTSV4RRFFQ69G5FAX".into());
+    assert!(s.store.released_item(&other).unwrap().is_none());
+}
+
+#[test]
+fn old_rows_migrate_with_safe_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quarantine.sqlite");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(include_str!("../migrations/0001_quarantine.sql"))
+            .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        for (id, reason) in [
+            ("plain", "spam-test (queue spam)"),
+            (
+                "smime",
+                "encrypt_smime: no S/MIME certificate for a@b.test (queue policy)",
+            ),
+            (
+                "portal",
+                "encrypt: the encryption portal is not enabled (queue policy)",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO quarantine (id, tenant_id, message_id, queue, recipient, sender,
+                 subject, score, reason, reasons_json, direction, headers_json, created_at,
+                 expires_at) VALUES (?1, NULL, ?2, 'policy', 'a@b.test', 's@c.test', '', NULL,
+                 ?3, '[]', 'outbound', '[]', 0, 9999999999)",
+                rusqlite::params![id, SPAM_ID, reason],
+            )
+            .unwrap();
+        }
+    }
+    let store = QuarantineStore::open(dir.path()).unwrap();
+    let get = |id: &str| store.get(id).unwrap().unwrap();
+    for id in ["plain", "smime", "portal"] {
+        assert_eq!(get(id).tls, TlsRequirement::None, "{id}");
+    }
+    assert_eq!(get("plain").encrypt, None);
+    assert_eq!(get("smime").encrypt, Some(EncryptMode::Smime));
+    // Either form will do; it is never sent in clear.
+    assert_eq!(get("portal").encrypt, Some(EncryptMode::Auto));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: usize = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 2);
+    // Opening again runs nothing twice.
+    drop(store);
+    QuarantineStore::open(dir.path()).unwrap();
 }

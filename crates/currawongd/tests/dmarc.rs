@@ -454,6 +454,8 @@ async fn bimi_logo_is_stored_off_the_classify_loop_with_a_domain_cache() {
             score: None,
             direction: Direction::Inbound,
             headers: Vec::new(),
+            tls: Default::default(),
+            encrypt: None,
         };
         quarantine
             .hold(&hold, &message(), OffsetDateTime::now_utc())
