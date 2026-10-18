@@ -3,6 +3,7 @@
 //! by what is left of the budget and charged with the bytes actually read.
 use crate::filetype::{self, FileKind};
 use crate::office::{self, password_candidates};
+use crate::parse::ContentChecks;
 use crate::yara::YaraScan;
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
@@ -64,6 +65,8 @@ pub struct Budget<'a, 'r> {
     pub hit: bool,
     pub store_failed: Option<String>,
     yara: Option<&'a mut YaraScan<'r>>,
+    /// HTML smuggling and QR checks, for a message parse.
+    pub(crate) checks: Option<ContentChecks>,
 }
 
 enum Stop {
@@ -88,6 +91,25 @@ impl<'a, 'r> Budget<'a, 'r> {
             hit: false,
             store_failed: None,
             yara: None,
+            checks: None,
+        }
+    }
+
+    pub(crate) fn with_checks(mut self, checks: ContentChecks) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+
+    /// HTML smuggling and QR checks on one part or member.
+    pub(crate) fn check(
+        &mut self,
+        bytes: &[u8],
+        filename: Option<&str>,
+        html_type: bool,
+        flags: &mut Vec<PartFlag>,
+    ) {
+        if let Some(checks) = self.checks.as_mut() {
+            checks.run(bytes, filename, html_type, &filetype::detect(bytes), flags);
         }
     }
 
@@ -235,7 +257,8 @@ fn child(
     budget: &mut Budget,
     parts: &mut Vec<PartInfo>,
 ) {
-    let flags = inspect(bytes, Some(name), passwords, budget, parts);
+    let mut flags = inspect(bytes, Some(name), passwords, budget, parts);
+    budget.check(bytes, Some(name), false, &mut flags);
     let part = budget.part(Some(name), None, bytes, flags);
     parts.push(part);
 }
