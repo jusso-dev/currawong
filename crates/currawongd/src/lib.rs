@@ -18,7 +18,7 @@ pub use periodic::{
 pub use pipeline::{worker_binary, worker_pool, Pipeline};
 pub use scheduler::{classify_pending, pending_scan, ready_to_deliver};
 
-use currawong_admin::routes::click::{ClickLog, ClickState};
+use currawong_admin::routes::click::{ClickLimits, ClickLog, ClickState};
 use currawong_core::{config::Config, residency::ResidencyGuard, Config as CoreConfig};
 use currawong_scan::engines::yara::{compile_dir, RuleSummary};
 use currawong_scan::urls::{LocalBlocklist, UrlReputation, UrlRewriter, UrlSigner};
@@ -52,6 +52,7 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     yara_summary(&cfg)?;
     if cfg.url_rewrite.enabled {
         url_rewriter(&cfg)?;
+        click_limits(&cfg)?;
     }
     Ok(cfg)
 }
@@ -79,7 +80,31 @@ pub fn url_protection(cfg: &CoreConfig) -> Result<(UrlRewriter, ClickState), Str
     let reputation: Arc<dyn UrlReputation> = Arc::new(list.with_warn_unknown(urls.warn_unknown));
     let log = ClickLog::open(&urls.click_log, urls.click_log_max_bytes)
         .map_err(|err| format!("click log {}: {err}", urls.click_log.display()))?;
-    Ok((rewriter, ClickState::new(signer, reputation, log)))
+    Ok((
+        rewriter,
+        ClickState::new(signer, reputation, log, click_limits(cfg)?),
+    ))
+}
+
+fn click_limits(cfg: &CoreConfig) -> Result<ClickLimits, String> {
+    let urls = &cfg.url_rewrite;
+    let trusted_proxies = urls
+        .trusted_proxies
+        .iter()
+        .map(|entry| {
+            entry
+                .parse::<ipnet::IpNet>()
+                .or_else(|_| entry.parse::<std::net::IpAddr>().map(ipnet::IpNet::from))
+                .map_err(|_| {
+                    format!("url_rewrite.trusted_proxies: {entry:?} is not an address or CIDR")
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ClickLimits {
+        per_client: urls.clicks_per_minute_per_client,
+        per_link: urls.clicks_per_minute_per_link,
+        trusted_proxies,
+    })
 }
 
 /// Compile the configured YARA rules. `--check-config` prints the summary:

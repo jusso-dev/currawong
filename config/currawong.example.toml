@@ -344,6 +344,10 @@ forward_domains = []
 # url_rewrite.click_log: one JSON object per click (time, message id, recipients, link,
 #   action), mode 0600, rotated to <click_log>.1 past click_log_max_bytes. Clicks also go
 #   to the event bus as `url_click`.
+# url_rewrite.trusted_proxies: the TLS proxy's addresses (or CIDRs). Only from these is
+#   X-Forwarded-For used to find the client for the per-client limit.
+# url_rewrite.clicks_per_minute_*: limits on verified clicks only (bad tokens never count).
+#   The per-link limit is per recipient of the message, so an all-staff mail is not cut off.
 [url_rewrite]
 enabled = false
 base_url = "https://links.example.test"
@@ -355,6 +359,9 @@ allow_domains = []
 warn_unknown = false
 click_log = "/var/lib/currawong/clicks.jsonl"
 click_log_max_bytes = 67108864
+trusted_proxies = []
+clicks_per_minute_per_client = 600
+clicks_per_minute_per_link = 30
 max_message_bytes = 10485760
 
 # dlp: TFN, Medicare, ABN, ACN, driver's licence and payment card detection.

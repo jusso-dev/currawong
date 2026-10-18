@@ -272,7 +272,11 @@ impl Pipeline {
         }
         // Arrival time, not now, so a retry rebuilds the same bytes.
         let issued = env.received_at.unix_timestamp().max(0) as u64;
-        let mut recipient = env.rcpt_to.join(",");
+        // Sorted, so a retry from a split plan builds the same tokens.
+        let mut recipients = env.rcpt_to.clone();
+        recipients.sort();
+        recipients.dedup();
+        let mut recipient = recipients.join(",");
         if recipient.len() > MAX_TOKEN_RECIPIENTS {
             recipient.clear();
         }
@@ -409,7 +413,7 @@ impl Pipeline {
     /// rewritten. Rewriting runs before the decision so policy sees the
     /// `url_rewrite.*` flags.
     pub async fn assess_for_delivery(
-        &mut self,
+        &self,
         env: &Envelope,
         raw: &[u8],
         body_path: Option<&Path>,

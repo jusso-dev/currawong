@@ -43,6 +43,10 @@ pub struct LocalBlocklist {
 
 #[derive(Default)]
 struct State {
+    /// A list has been read from the file at least once.
+    loaded: bool,
+    /// The file was missing and that was logged.
+    missing: bool,
     stamp: Option<(SystemTime, u64)>,
     read_at: Option<Instant>,
     digest: [u8; 32],
@@ -73,14 +77,27 @@ impl List {
             .then(|| "this link".to_string())
     }
 
-    fn push(&mut self, entry: &str) {
+    /// `false` when the entry is neither a URL nor a domain. A leading `*.`
+    /// is accepted and means the same as the bare domain.
+    fn push(&mut self, entry: &str) -> bool {
         let lower = entry.to_ascii_lowercase();
         if lower.starts_with("http://") || lower.starts_with("https://") {
-            let url = url::Url::parse(entry).map(|url| url.as_str().to_string());
-            self.prefixes.push(url.unwrap_or(lower));
-        } else if let Some(domain) = normalise_domain(entry) {
-            self.domains.push(domain);
+            match url::Url::parse(entry) {
+                Ok(url) => self.prefixes.push(url.as_str().to_string()),
+                Err(_) => return false,
+            }
+        } else {
+            let domain = entry.strip_prefix("*.").unwrap_or(entry);
+            match normalise_domain(domain) {
+                Some(domain) => self.domains.push(domain),
+                None => return false,
+            }
         }
+        true
+    }
+
+    fn is_empty(&self) -> bool {
+        self.domains.is_empty() && self.prefixes.is_empty()
     }
 }
 
@@ -99,7 +116,7 @@ impl LocalBlocklist {
             path: None,
             warn_unknown: false,
             state: Mutex::new(State {
-                entries: parse(text),
+                entries: parse(text).0,
                 ..State::default()
             }),
         }
@@ -130,37 +147,67 @@ impl LocalBlocklist {
         }
         let read = tokio::fs::read(path).await;
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        // Fail closed: a missing or truncated file after a good load keeps
+        // the last good list, so a delete-and-recreate or a half-written file
+        // never unblocks everything.
         match read {
-            Ok(bytes) => {
-                let digest: [u8; 32] = Sha256::digest(&bytes).into();
-                if digest != state.digest || state.read_at.is_none() {
-                    state.entries = parse(&String::from_utf8_lossy(&bytes));
-                    state.digest = digest;
-                }
+            Ok(bytes) if bytes.is_empty() && state.loaded && !state.entries.is_empty() => {
+                tracing::error!(path = %path.display(), "URL block list is empty, keeping the last good list");
                 state.stamp = stamp;
                 state.read_at = Some(Instant::now());
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => *state = State::default(),
-            // Keep the last good list rather than unblocking everything.
+            Ok(bytes) => {
+                let digest: [u8; 32] = Sha256::digest(&bytes).into();
+                if digest != state.digest || !state.loaded {
+                    let (entries, rejected) = parse(&String::from_utf8_lossy(&bytes));
+                    if !rejected.is_empty() {
+                        tracing::warn!(path = %path.display(), count = rejected.len(), first = %rejected[0], "URL block list entries ignored: not a domain or http(s) URL");
+                    }
+                    state.entries = entries;
+                    state.digest = digest;
+                }
+                state.loaded = true;
+                state.missing = false;
+                state.stamp = stamp;
+                state.read_at = Some(Instant::now());
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if !state.missing {
+                    tracing::error!(path = %path.display(), kept = state.loaded, "URL block list missing");
+                    state.missing = true;
+                }
+                state.read_at = Some(Instant::now());
+            }
             Err(err) => tracing::error!(path = %path.display(), %err, "URL block list unreadable"),
         }
     }
 }
 
-fn parse(text: &str) -> Entries {
+impl Entries {
+    fn is_empty(&self) -> bool {
+        self.block.is_empty() && self.warn.is_empty() && self.allow.is_empty()
+    }
+}
+
+/// The entries, and the lines that were not understood.
+fn parse(text: &str) -> (Entries, Vec<String>) {
     let mut entries = Entries::default();
+    let mut rejected = Vec::new();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
-        match line.split_once(char::is_whitespace) {
+        let ok = match line.split_once(char::is_whitespace) {
             Some(("warn", rest)) => entries.warn.push(rest.trim()),
             Some(("allow", rest)) => entries.allow.push(rest.trim()),
             _ => entries.block.push(line),
+        };
+        if !ok {
+            rejected.push(line.to_string());
         }
     }
-    entries
+    (entries, rejected)
 }
 
 /// Lower-case ASCII (punycode) form of a domain, as `url` gives hosts.
@@ -259,6 +306,49 @@ mod tests {
             list.check("https://new.example.net/").await,
             Reputation::Warn { .. }
         ));
+    }
+
+    #[test]
+    fn urls_blocklist_reports_entries_it_cannot_use() {
+        let (entries, rejected) =
+            parse("*.evil.test\nevil.test:8080\nevil.test/path\nhttps://[bad\nok.test\n");
+        assert_eq!(entries.block.domains, ["evil.test", "ok.test"]);
+        assert_eq!(
+            rejected,
+            ["evil.test:8080", "evil.test/path", "https://[bad"]
+        );
+    }
+
+    #[tokio::test]
+    async fn urls_blocklist_keeps_the_last_good_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("list.txt");
+        let list = LocalBlocklist::from_file(&path);
+        assert_eq!(list.check("https://bad.test/").await, Reputation::Clean);
+        std::fs::write(&path, "bad.test\n").unwrap();
+        assert!(matches!(
+            list.check("https://bad.test/").await,
+            Reputation::Blocked { .. }
+        ));
+        let stale = || list.state.lock().unwrap().read_at = Some(Instant::now() - REREAD);
+        // Truncated by a non-atomic write.
+        std::fs::write(&path, "").unwrap();
+        stale();
+        assert!(matches!(
+            list.check("https://bad.test/").await,
+            Reputation::Blocked { .. }
+        ));
+        // Deleted before being recreated.
+        std::fs::remove_file(&path).unwrap();
+        stale();
+        assert!(matches!(
+            list.check("https://bad.test/").await,
+            Reputation::Blocked { .. }
+        ));
+        // A deliberate clear is a file with no entries, for example a comment.
+        std::fs::write(&path, "# nothing blocked\n").unwrap();
+        stale();
+        assert_eq!(list.check("https://bad.test/").await, Reputation::Clean);
     }
 
     #[tokio::test]

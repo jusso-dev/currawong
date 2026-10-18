@@ -433,6 +433,13 @@ pub struct UrlRewriteConfig {
     pub click_log: PathBuf,
     /// The click log is rotated to `<click_log>.1` past this size.
     pub click_log_max_bytes: u64,
+    /// Addresses or CIDRs of the TLS proxy in front of the click service. Its
+    /// `X-Forwarded-For` names the client; from anyone else it is ignored.
+    pub trusted_proxies: Vec<String>,
+    /// Verified clicks per minute from one client address.
+    pub clicks_per_minute_per_client: u32,
+    /// Verified clicks per minute on one link, per recipient of its message.
+    pub clicks_per_minute_per_link: u32,
     /// Larger messages are delivered without rewriting.
     pub max_message_bytes: usize,
 }
@@ -450,6 +457,9 @@ impl Default for UrlRewriteConfig {
             warn_unknown: false,
             click_log: PathBuf::from("/var/lib/currawong/clicks.jsonl"),
             click_log_max_bytes: 64 * 1024 * 1024,
+            trusted_proxies: Vec::new(),
+            clicks_per_minute_per_client: 600,
+            clicks_per_minute_per_link: 30,
             max_message_bytes: 10 * 1024 * 1024,
         }
     }
@@ -1108,6 +1118,11 @@ impl Config {
                     urls.listen
                 ))
             })?;
+            if urls.clicks_per_minute_per_client == 0 || urls.clicks_per_minute_per_link == 0 {
+                return Err(ConfigError::Invalid(
+                    "url_rewrite click limits must be at least 1".into(),
+                ));
+            }
             if urls.ttl_days == 0 {
                 return Err(ConfigError::Invalid(
                     "url_rewrite.ttl_days must be at least 1".into(),

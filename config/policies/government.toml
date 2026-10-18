@@ -147,7 +147,27 @@ actions = [{ add_header = { name = "X-Currawong-Spam", value = "[SPAM]" } }]
 
 # Links left without a click-time check (see the default pack).
 [[policy]]
+id = "url-rewrite-skipped-dmarc-fail"
+priority = 79
+conditions = [
+    { direction = "inbound" },
+    { flag = "url_rewrite.skipped" },
+    { auth = { method = "dmarc", result = "fail" } },
+]
+actions = [{ quarantine = "url-rewrite" }]
+
+[[policy]]
 id = "url-rewrite-skipped"
 priority = 80
 conditions = [{ direction = "inbound" }, { flag = "url_rewrite.skipped" }]
 actions = [{ add_header = { name = "X-Currawong-Links", value = "not-rewritten" } }]
+
+[[policy]]
+id = "url-rewrite-skipped-unauthenticated"
+priority = 81
+conditions = [
+    { direction = "inbound" },
+    { flag = "url_rewrite.skipped" },
+    { not = { auth = { method = "dmarc", result = "pass" } } },
+]
+actions = [{ add_header = { name = "X-Currawong-Warning", value = "links from an unauthenticated sender were not checked" } }]

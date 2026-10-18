@@ -21,6 +21,11 @@ pub const MAX_LINKS: usize = 10_000;
 pub const MAX_URL_BYTES: usize = 8 * 1024;
 /// Memory the HTML rewriter may use for one part.
 const HTML_MEMORY: usize = 32 * 1024 * 1024;
+/// More `multipart/` or attached-message headers than this and the message is
+/// not parsed in process: `mail-parser` recurses into nesting, and a stack
+/// overflow would abort the daemon. The same limits as the classify stage.
+const MAX_MULTIPARTS: usize = 512;
+const MAX_EMBEDDED_MESSAGES: usize = 32;
 /// `multipart/signed` protocols whose second part is a detached signature.
 const SIGNATURE_PROTOCOLS: &[&str] = &[
     "application/pkcs7-signature",
@@ -36,6 +41,8 @@ pub enum RewriteError {
     Unparsable,
     #[error("more than {MAX_LINKS} links")]
     TooManyLinks,
+    #[error("message nested too deeply to parse safely")]
+    TooNested,
 }
 
 #[derive(Debug, Default)]
@@ -74,6 +81,10 @@ struct Ctx<'a> {
     expires: u64,
     links: usize,
     too_long: usize,
+    /// Clear-signed PGP spans with links in them.
+    signed_text: usize,
+    /// Relative links with no `<base href>` to resolve them.
+    relative: usize,
 }
 
 /// What happened to one part.
@@ -122,6 +133,9 @@ impl UrlRewriter {
         if raw.len() > self.max_bytes {
             return Err(RewriteError::TooLarge);
         }
+        if too_nested(raw) {
+            return Err(RewriteError::TooNested);
+        }
         let message = MessageParser::default()
             .parse(raw)
             .ok_or(RewriteError::Unparsable)?;
@@ -130,6 +144,8 @@ impl UrlRewriter {
             expires: delivery.issued_at.saturating_add(self.ttl_secs),
             links: 0,
             too_long: 0,
+            signed_text: 0,
+            relative: 0,
         };
         let mut out = Rewritten::default();
         let mut edits: Vec<(usize, usize, Vec<u8>)> = Vec::new();
@@ -150,7 +166,7 @@ impl UrlRewriter {
                 .to_ascii_lowercase();
             let html = match &part.body {
                 PartType::Multipart(children) => {
-                    let protected = is_signed(part, children, parts);
+                    let protected = is_signed(part, children, parts, raw);
                     stack.extend(children.iter().map(|&c| (c as usize, signed || protected)));
                     continue;
                 }
@@ -218,10 +234,15 @@ impl UrlRewriter {
                 return Err(RewriteError::TooManyLinks);
             }
         }
-        if ctx.too_long > 0 {
-            out.skipped += ctx.too_long;
-            out.notes
-                .push(format!("{} links too long to rewrite", ctx.too_long));
+        for (count, what) in [
+            (ctx.too_long, "links too long to rewrite"),
+            (ctx.signed_text, "PGP signed texts with links not rewritten"),
+            (ctx.relative, "relative links with no base not rewritten"),
+        ] {
+            if count > 0 {
+                out.skipped += count;
+                out.notes.push(format!("{count} {what}"));
+            }
         }
         if edits.is_empty() {
             out.message = raw.to_vec();
@@ -262,16 +283,20 @@ impl UrlRewriter {
         };
         let rewrite = |decoded: &[u8], ctx: &mut Ctx| {
             if html {
-                self.rewrite_html(decoded, encoding, ctx)
-            } else if pgp_signed(decoded) {
-                if has_link(decoded) {
-                    Err("links in a PGP signed part not rewritten".to_string())
-                } else {
-                    Ok(decoded.to_vec())
-                }
-            } else {
-                Ok(self.rewrite_text(decoded, ctx))
+                return self.rewrite_html(decoded, encoding, ctx);
             }
+            // Only the clear-signed span is left alone: text before the
+            // header or after the signature is not covered by it.
+            let Some((start, end)) = pgp_signed(decoded) else {
+                return Ok(self.rewrite_text(decoded, ctx));
+            };
+            if has_link(&decoded[start..end]) {
+                ctx.signed_text += 1;
+            }
+            let mut out = self.rewrite_text(&decoded[..start], ctx);
+            out.extend_from_slice(&decoded[start..end]);
+            out.extend_from_slice(&self.rewrite_text(&decoded[end..], ctx));
+            Ok(out)
         };
         let out = match cte {
             "base64" => {
@@ -306,17 +331,46 @@ impl UrlRewriter {
         })
     }
 
-    /// Rewrites `href` on `<a>` (and SVG `xlink:href`) and `<area>`, and
-    /// `<form action>`. Relative links are resolved against `<base href>`;
-    /// protocol-relative ones (`//host/`) as https.
+    /// Rewrites `href`, `xlink:href` (SVG) and `formaction` on any element
+    /// (so VML buttons such as `<v:roundrect href>` too) and `<form action>`.
+    /// `<link>` (style sheets) and `<base>` are left alone. Relative links are
+    /// resolved against the first `<base href>`, wherever it is, as a browser
+    /// does; protocol-relative ones (`//host/`) as https. A relative link
+    /// with no base is counted as skipped.
     fn rewrite_html(
         &self,
         html: &[u8],
         encoding: AsciiCompatibleEncoding,
         ctx: &mut Ctx,
     ) -> Result<Vec<u8>, String> {
-        let ctx = RefCell::new(ctx);
+        let failed =
+            |err: lol_html::errors::RewritingError| format!("HTML part not rewritten: {err}");
+        let settings = || {
+            lol_html::Settings::new()
+                .with_encoding(encoding)
+                .with_strict(false)
+                .with_memory_settings(
+                    lol_html::MemorySettings::new().with_max_allowed_memory_usage(HTML_MEMORY),
+                )
+        };
         let base: RefCell<Option<Url>> = RefCell::new(None);
+        let find_base = settings().append_element_content_handler(element!("base[href]", |el| {
+            let mut base = base.borrow_mut();
+            if base.is_none() {
+                let href = decode_entities(&el.get_attribute("href").unwrap_or_default());
+                *base = Url::parse(&href)
+                    .ok()
+                    .filter(|url| matches!(url.scheme(), "http" | "https"));
+            }
+            Ok(())
+        }));
+        {
+            let mut scan = HtmlRewriter::new(find_base, |_: &[u8]| {});
+            scan.write(html).map_err(failed)?;
+            scan.end().map_err(failed)?;
+        }
+        let base = base.borrow().clone();
+        let ctx = RefCell::new(ctx);
         let mut out = Vec::with_capacity(html.len() + html.len() / 4);
         let attr = |el: &mut Element,
                     name: &str|
@@ -324,39 +378,29 @@ impl UrlRewriter {
             let Some(value) = el.get_attribute(name) else {
                 return Ok(());
             };
-            let url = resolve(&decode_entities(&value), base.borrow().as_ref());
+            let href = decode_entities(&value);
+            let url = resolve(&href, base.as_ref());
+            if url.is_none() && base.is_none() && is_relative(&href) {
+                ctx.borrow_mut().relative += 1;
+            }
             if let Some(link) = url.and_then(|url| self.link(url, &mut ctx.borrow_mut())) {
                 el.set_attribute(name, &link)?;
             }
             Ok(())
         };
-        let settings = lol_html::Settings::new()
-            .append_element_content_handler(element!("base[href]", |el| {
-                let mut base = base.borrow_mut();
-                if base.is_none() {
-                    let href = decode_entities(&el.get_attribute("href").unwrap_or_default());
-                    *base = Url::parse(&href)
-                        .ok()
-                        .filter(|url| matches!(url.scheme(), "http" | "https"));
-                }
-                Ok(())
-            }))
-            .append_element_content_handler(element!("a", |el| {
-                attr(el, "href")?;
-                attr(el, "xlink:href")
-            }))
-            .append_element_content_handler(element!("area[href]", |el| attr(el, "href")))
-            .append_element_content_handler(element!("form[action]", |el| attr(el, "action")))
-            .with_encoding(encoding)
-            .with_strict(false)
-            .with_memory_settings(
-                lol_html::MemorySettings::new().with_max_allowed_memory_usage(HTML_MEMORY),
-            );
-        let mut rewriter = HtmlRewriter::new(settings, |chunk: &[u8]| {
+        let rewrite = settings().append_element_content_handler(element!("*", |el| {
+            match el.tag_name().as_str() {
+                "base" | "link" => return Ok(()),
+                "form" => attr(el, "action")?,
+                _ => {}
+            }
+            attr(el, "href")?;
+            attr(el, "xlink:href")?;
+            attr(el, "formaction")
+        }));
+        let mut rewriter = HtmlRewriter::new(rewrite, |chunk: &[u8]| {
             out.extend_from_slice(chunk);
         });
-        let failed =
-            |err: lol_html::errors::RewritingError| format!("HTML part not rewritten: {err}");
         rewriter.write(html).map_err(failed)?;
         rewriter.end().map_err(failed)?;
         Ok(out)
@@ -431,10 +475,24 @@ fn resolve(href: &str, base: Option<&Url>) -> Option<Url> {
     }
 }
 
+/// A relative reference that goes somewhere once resolved: not empty and not
+/// a fragment of the same document.
+fn is_relative(href: &str) -> bool {
+    let href = href.trim();
+    !href.is_empty()
+        && !href.starts_with('#')
+        && matches!(
+            Url::parse(href),
+            Err(url::ParseError::RelativeUrlWithoutBase)
+        )
+}
+
 /// A `multipart/signed` whose protocol names a detached signature and whose
-/// second part is that signature. A bare `multipart/signed` wrapper does not
+/// second part is that signature and parses as one: a CMS SignedData
+/// structure for S/MIME, an OpenPGP signature packet for PGP. The signature
+/// itself is not verified. A wrapper with junk in the signature part does not
 /// exempt its links.
-fn is_signed(part: &MessagePart, children: &[u32], parts: &[MessagePart]) -> bool {
+fn is_signed(part: &MessagePart, children: &[u32], parts: &[MessagePart], raw: &[u8]) -> bool {
     let Some(ct) = part.content_type() else {
         return false;
     };
@@ -450,29 +508,135 @@ fn is_signed(part: &MessagePart, children: &[u32], parts: &[MessagePart]) -> boo
     if !signed || !SIGNATURE_PROTOCOLS.contains(&protocol.as_str()) || children.len() != 2 {
         return false;
     }
-    parts
-        .get(children[1] as usize)
-        .and_then(|sig| sig.content_type())
-        .is_some_and(|sig| {
-            format!("{}/{}", sig.ctype(), sig.subtype().unwrap_or(""))
-                .eq_ignore_ascii_case(&protocol)
-        })
+    let Some(sig) = parts.get(children[1] as usize) else {
+        return false;
+    };
+    let matches = sig.content_type().is_some_and(|ct| {
+        format!("{}/{}", ct.ctype(), ct.subtype().unwrap_or("")).eq_ignore_ascii_case(&protocol)
+    });
+    let (body, end) = (sig.offset_body as usize, sig.offset_end as usize);
+    if !matches || body > end || end > raw.len() {
+        return false;
+    }
+    let cte = sig
+        .content_transfer_encoding()
+        .unwrap_or("7bit")
+        .trim()
+        .to_ascii_lowercase();
+    let Some(bytes) = decode(&raw[body..end], &cte) else {
+        return false;
+    };
+    if protocol.ends_with("pgp-signature") {
+        pgp_signature(&bytes)
+    } else {
+        cms_signed_data(&bytes)
+    }
 }
 
-/// Clear-signed PGP text: the header, a signature block and its end.
-fn pgp_signed(text: &[u8]) -> bool {
+/// DER or BER `ContentInfo` with content type signedData (1.2.840.113549.1.7.2).
+fn cms_signed_data(der: &[u8]) -> bool {
+    const SIGNED_DATA: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x07, 0x02,
+    ];
+    if der.first() != Some(&0x30) || der.len() < 2 + SIGNED_DATA.len() {
+        return false;
+    }
+    let (header, length) = match der[1] {
+        // Indefinite length (BER), common from Outlook.
+        0x80 => (2, None),
+        n if n < 0x80 => (2, Some(n as usize)),
+        n => {
+            let count = (n & 0x7f) as usize;
+            if count > 4 || der.len() < 2 + count {
+                return false;
+            }
+            let len = der[2..2 + count]
+                .iter()
+                .fold(0usize, |acc, b| acc << 8 | *b as usize);
+            (2 + count, Some(len))
+        }
+    };
+    let fits = length.is_none_or(|len| header + len <= der.len() && len > SIGNED_DATA.len());
+    fits && der[header..].starts_with(SIGNED_DATA)
+}
+
+/// An OpenPGP signature packet (tag 2), ASCII armoured or binary.
+fn pgp_signature(bytes: &[u8]) -> bool {
+    let packet = match armoured(bytes, b"-----BEGIN PGP SIGNATURE-----") {
+        Some(decoded) => decoded,
+        None => bytes.to_vec(),
+    };
+    let Some(&first) = packet.first() else {
+        return false;
+    };
+    let tag = if first & 0x80 == 0 {
+        return false;
+    } else if first & 0x40 != 0 {
+        first & 0x3f
+    } else {
+        (first >> 2) & 0x0f
+    };
+    tag == 2 && packet.len() > 8
+}
+
+/// The base64 body of an ASCII armour block starting with `begin`: header
+/// lines up to a blank line, then base64 up to the `=` checksum or the end
+/// line.
+fn armoured(text: &[u8], begin: &[u8]) -> Option<Vec<u8>> {
+    let at = text.windows(begin.len()).position(|w| w == begin)?;
+    let mut lines = text[at + begin.len()..]
+        .split(|b| *b == b'\n')
+        .map(|line| line.trim_ascii())
+        .skip(1);
+    for line in lines.by_ref() {
+        if line.is_empty() {
+            break;
+        }
+        if !line.contains(&b':') {
+            return None;
+        }
+    }
+    let mut body = Vec::new();
+    for line in lines {
+        if line.starts_with(b"=") || line.starts_with(b"-----") {
+            return transfer::decode_base64(&body);
+        }
+        body.extend_from_slice(line);
+    }
+    None
+}
+
+/// The span of clear-signed PGP text, from the header line to the end of a
+/// signature block that parses as a signature packet.
+fn pgp_signed(text: &[u8]) -> Option<(usize, usize)> {
     let find = |needle: &[u8], from: usize| {
         text.get(from..)?
             .windows(needle.len())
             .position(|w| w == needle)
             .map(|at| at + from)
     };
-    let Some(start) = find(b"-----BEGIN PGP SIGNED MESSAGE-----", 0) else {
-        return false;
+    let start = find(b"-----BEGIN PGP SIGNED MESSAGE-----", 0)?;
+    if start != 0 && text[start - 1] != b'\n' {
+        return None;
+    }
+    let signature = find(b"-----BEGIN PGP SIGNATURE-----", start)?;
+    let end_marker = b"-----END PGP SIGNATURE-----";
+    let end = find(end_marker, signature)? + end_marker.len();
+    pgp_signature(&text[signature..end]).then_some((start, end))
+}
+
+/// More embedded messages or multiparts than `mail-parser` can safely
+/// recurse into. A plain byte scan, so it cannot itself be driven deep.
+pub fn too_nested(raw: &[u8]) -> bool {
+    let count = |needle: &[u8], limit: usize| {
+        raw.windows(needle.len())
+            .filter(|w| w.eq_ignore_ascii_case(needle))
+            .nth(limit)
+            .is_some()
     };
-    let line_start = start == 0 || text[start - 1] == b'\n';
-    let signature = find(b"-----BEGIN PGP SIGNATURE-----", start);
-    line_start && signature.is_some_and(|at| find(b"-----END PGP SIGNATURE-----", at).is_some())
+    count(b"multipart/", MAX_MULTIPARTS)
+        || count(b"message/rfc822", MAX_EMBEDDED_MESSAGES)
+        || count(b"message/global", MAX_EMBEDDED_MESSAGES)
 }
 
 fn decode(body: &[u8], cte: &str) -> Option<Vec<u8>> {
@@ -667,6 +831,8 @@ mod tests {
             expires: 10,
             links: 0,
             too_long: 0,
+            signed_text: 0,
+            relative: 0,
         }
     }
 
@@ -760,12 +926,49 @@ mod tests {
     }
 
     #[test]
-    fn urls_inline_pgp_needs_a_signature_block() {
-        let signed = b"-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhi\n-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n";
-        assert!(pgp_signed(signed));
-        assert!(!pgp_signed(
-            b"-----BEGIN PGP SIGNED MESSAGE-----\nhttps://evil.test/\n"
-        ));
-        assert!(!pgp_signed(b"x -----BEGIN PGP SIGNED MESSAGE----- -----BEGIN PGP SIGNATURE----- -----END PGP SIGNATURE-----"));
+    fn urls_inline_pgp_needs_a_signature_packet() {
+        let signed = b"x\n-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nhi\n-----BEGIN PGP SIGNATURE-----\n\niQAQAQIDBAUGBwgJCgsMDQ4PEA==\n=abcd\n-----END PGP SIGNATURE-----\ny\n";
+        let (start, end) = pgp_signed(signed).unwrap();
+        assert_eq!(&signed[..start], b"x\n");
+        assert_eq!(&signed[end..], b"\ny\n");
+        let junk = b"-----BEGIN PGP SIGNED MESSAGE-----\n\nhi\n-----BEGIN PGP SIGNATURE-----\nabc\n-----END PGP SIGNATURE-----\n";
+        assert!(pgp_signed(junk).is_none());
+        assert!(pgp_signed(b"-----BEGIN PGP SIGNED MESSAGE-----\nhttps://evil.test/\n").is_none());
+    }
+
+    #[test]
+    fn urls_cms_structure_is_checked() {
+        let cms =
+            transfer::decode_base64(b"MIIAIAYJKoZIhvcNAQcCoBMBAgMEBQYHCAkKCwwNDg8QERIT").unwrap();
+        assert!(cms_signed_data(&cms));
+        let mut indefinite = cms.clone();
+        indefinite[1] = 0x80;
+        indefinite.drain(2..4);
+        assert!(cms_signed_data(&indefinite));
+        // Wrong content type (data, not signedData), and a length past the end.
+        let mut data = cms.clone();
+        data[14] = 0x01;
+        assert!(!cms_signed_data(&data));
+        assert!(!cms_signed_data(&cms[..20]));
+        assert!(!cms_signed_data(b"AAAA"));
+    }
+
+    #[test]
+    fn urls_vml_formaction_and_late_base_are_rewritten() {
+        let (out, links) = html(
+            br#"<a href="page">early</a><v:roundrect href="https://evil.test/vml"><w:anchorlock/></v:roundrect><button formaction="https://evil.test/f">b</button><link rel="stylesheet" href="https://cdn.example.net/s.css"><base href="https://evil.test/dir/">"#,
+        );
+        assert_eq!(links, 3, "{out}");
+        assert!(out.contains("https://cdn.example.net/s.css"), "{out}");
+        assert!(out.contains(r#"<base href="https://evil.test/dir/">"#));
+        let mut c = ctx();
+        rewriter()
+            .rewrite_html(
+                br##"<a href="other.html">r</a><a href="#top">t</a><a href="">e</a>"##,
+                AsciiCompatibleEncoding::new(encoding_rs::UTF_8).unwrap(),
+                &mut c,
+            )
+            .unwrap();
+        assert_eq!((c.links, c.relative), (0, 1));
     }
 }

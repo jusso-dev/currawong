@@ -12,6 +12,10 @@ use time::OffsetDateTime;
 
 use crate::pipeline::Pipeline;
 
+/// A copy made from a split plan and not yet acted on. Neither classified
+/// nor delivered; the original's retry finishes it.
+const SPLIT: &str = "split";
+
 /// Tenant redirect and bcc are skipped once mail has passed through this
 /// gateway this many times. Platform and mandatory ones always apply.
 const MAX_OWN_HOPS: usize = 3;
@@ -111,8 +115,17 @@ async fn classify_one(
         Ok(bytes) => {
             let plan: Plan = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
             if plan.rewritten {
+                // Every recipient of the plan, as on the first pass, though
+                // the envelope may already be narrowed to the first group.
+                let mut whole = env.clone();
+                whole.rcpt_to = plan
+                    .groups
+                    .iter()
+                    .flatten()
+                    .map(|d| d.recipient.clone())
+                    .collect();
                 let mut report = ScanReport::new(env.id.clone());
-                rewritten_body = pipeline.rewrite_urls(&env, &raw, &mut report).await;
+                rewritten_body = pipeline.rewrite_urls(&whole, &raw, &mut report).await;
             }
             plan
         }
@@ -193,14 +206,23 @@ async fn classify_one(
             let mut sorted = rcpts.clone();
             sorted.sort();
             let id = derived_id(&env.id, &sorted.join("\n"));
-            if spool.load(&id).await.is_ok() {
+            if let Ok(existing) = spool.load(&id).await {
+                // A crash between making the copy and acting on it left it
+                // marked `split`: finish it from the plan. It is never
+                // classified on its own (its body may carry rewritten links).
+                if existing.pipeline == SPLIT {
+                    act(
+                        spool, quarantine, cfg, existing, &raw, &group[0], &plan, None,
+                    )
+                    .await?;
+                }
                 continue;
             }
             let mut copy = env.clone();
             copy.id = id;
             copy.state = SpoolState::Incoming;
             copy.next_attempt_at = None;
-            copy.pipeline = "pending".into();
+            copy.pipeline = SPLIT.into();
             narrow(&mut copy, &rcpts);
             tracing::info!(id = %env.id, split = %copy.id, "recipients differ, message split");
             let body = match (&rewritten_body, &group[0].verdict) {

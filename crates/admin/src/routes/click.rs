@@ -6,62 +6,145 @@
 //! click. Plain HTTP: run it behind the TLS proxy that serves `base_url`.
 use axum::{
     extract::{ConnectInfo, Path, Query, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     Router,
 };
 use currawong_integrations::export::{self, Event, EventKind};
 use currawong_scan::urls::{Reputation, TokenError, UrlReputation, UrlSigner};
-use governor::{clock::DefaultClock, state::keyed::DefaultKeyedStateStore, Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    collections::HashMap,
+    hash::Hash,
     io::Write,
     net::{IpAddr, SocketAddr},
-    num::NonZeroU32,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
-/// Clicks per minute from one client address. Behind a proxy every click
-/// comes from the proxy, so this only stops a runaway client.
-const PER_CLIENT_PER_MINUTE: u32 = 600;
-/// Clicks per minute on one link, which stops a token being used as a
-/// high-volume redirector.
-const PER_TOKEN_PER_MINUTE: u32 = 30;
+/// A token with no recipient list was sent to more than fit in it.
+const UNLISTED_RECIPIENTS: u32 = 50;
+/// Each limiter forgets idle keys once it holds this many.
+const MAX_KEYS: usize = 50_000;
 
-type Limiter<K> = RateLimiter<K, DefaultKeyedStateStore<K>, DefaultClock>;
+/// Click rate limits. Only clicks on verified tokens count, so junk tokens
+/// cannot use up anyone's allowance.
+#[derive(Debug, Clone)]
+pub struct ClickLimits {
+    /// Clicks per minute from one client address.
+    pub per_client: u32,
+    /// Clicks per minute on one link per recipient of its message.
+    pub per_link: u32,
+    /// Peers whose `X-Forwarded-For` is believed: the TLS proxy in front.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+}
+
+impl Default for ClickLimits {
+    fn default() -> Self {
+        Self {
+            per_client: 600,
+            per_link: 30,
+            trusted_proxies: Vec::new(),
+        }
+    }
+}
+
+/// Fixed one-minute windows per key.
+struct Windows<K> {
+    hits: Mutex<HashMap<K, (Instant, u32)>>,
+}
+
+impl<K: Eq + Hash> Windows<K> {
+    fn new() -> Self {
+        Self {
+            hits: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn hit(&self, key: K, limit: u32) -> bool {
+        let mut hits = self.hits.lock().unwrap_or_else(|p| p.into_inner());
+        if hits.len() > MAX_KEYS {
+            hits.retain(|_, (start, _)| start.elapsed() < WINDOW);
+        }
+        let entry = hits.entry(key).or_insert((Instant::now(), 0));
+        if entry.0.elapsed() >= WINDOW {
+            *entry = (Instant::now(), 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 <= limit
+    }
+}
+
+const WINDOW: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct ClickState {
     pub signer: UrlSigner,
     pub reputation: Arc<dyn UrlReputation>,
     pub log: Arc<ClickLog>,
-    limits: Arc<(Limiter<IpAddr>, Limiter<[u8; 32]>)>,
+    limits: Arc<ClickLimits>,
+    windows: Arc<(Windows<IpAddr>, Windows<[u8; 32]>)>,
 }
 
 impl ClickState {
-    pub fn new(signer: UrlSigner, reputation: Arc<dyn UrlReputation>, log: ClickLog) -> Self {
-        let quota = |n: u32| Quota::per_minute(NonZeroU32::new(n).expect("non-zero"));
+    pub fn new(
+        signer: UrlSigner,
+        reputation: Arc<dyn UrlReputation>,
+        log: ClickLog,
+        limits: ClickLimits,
+    ) -> Self {
         Self {
             signer,
             reputation,
             log: Arc::new(log),
-            limits: Arc::new((
-                RateLimiter::keyed(quota(PER_CLIENT_PER_MINUTE)),
-                RateLimiter::keyed(quota(PER_TOKEN_PER_MINUTE)),
-            )),
+            limits: Arc::new(limits),
+            windows: Arc::new((Windows::new(), Windows::new())),
         }
     }
 
-    fn allowed(&self, client: IpAddr, token: &str) -> bool {
-        let (per_client, per_token) = &*self.limits;
+    /// One verified click from `client` on `token`, whose message went to
+    /// `recipients` (comma separated, empty when there were too many).
+    fn allowed(&self, client: IpAddr, token: &str, recipients: &str) -> bool {
+        let (per_client, per_link) = &*self.windows;
+        let share = match recipients {
+            "" => UNLISTED_RECIPIENTS,
+            list => list.split(',').count().min(u32::MAX as usize) as u32,
+        };
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        let ok = per_client.check_key(&client).is_ok() && per_token.check_key(&key).is_ok();
-        per_client.retain_recent();
-        per_token.retain_recent();
-        ok
+        let client_ok = per_client.hit(client, self.limits.per_client);
+        let link_ok = per_link.hit(key, self.limits.per_link.saturating_mul(share));
+        client_ok && link_ok
+    }
+
+    /// The clicking client: the peer, or when the peer is a trusted proxy,
+    /// the nearest untrusted address in `X-Forwarded-For`.
+    fn client(&self, peer: IpAddr, headers: &HeaderMap) -> IpAddr {
+        let trusted = |ip: &IpAddr| {
+            self.limits
+                .trusted_proxies
+                .iter()
+                .any(|net| net.contains(ip))
+        };
+        if !trusted(&peer) {
+            return peer;
+        }
+        let chain: Vec<IpAddr> = headers
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .flat_map(|value| value.split(','))
+            .filter_map(|hop| hop.trim().parse().ok())
+            .collect();
+        chain
+            .iter()
+            .rev()
+            .find(|ip| !trusted(ip))
+            .or(chain.first())
+            .copied()
+            .unwrap_or(peer)
     }
 }
 
@@ -172,17 +255,11 @@ struct ClickQuery {
 
 async fn click(
     State(state): State<ClickState>,
-    ConnectInfo(client): ConnectInfo<SocketAddr>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
     Path(token): Path<String>,
     Query(query): Query<ClickQuery>,
 ) -> Response {
-    if !state.allowed(client.ip(), &token) {
-        return page(
-            StatusCode::TOO_MANY_REQUESTS,
-            "Too many clicks",
-            "Wait a minute and try the link again.",
-        );
-    }
     let now = now();
     let claims = match state.signer.verify(&token, now) {
         Ok(claims) => claims,
@@ -202,6 +279,14 @@ async fn click(
             );
         }
     };
+    let client = state.client(peer.ip(), &headers);
+    if !state.allowed(client, &token, &claims.r) {
+        return page(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many clicks",
+            "Wait a minute and try the link again.",
+        );
+    }
     let proceed = query.proceed.is_some();
     let (action, reason) = match state.reputation.check(&claims.u).await {
         Reputation::Clean => (ClickAction::Redirected, String::new()),
@@ -284,7 +369,7 @@ fn page(status: StatusCode, title: &str, detail: &str) -> Response {
             ),
             (
                 header::CONTENT_SECURITY_POLICY,
-                HeaderValue::from_static("default-src 'none'"),
+                HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
             ),
             (
                 header::X_CONTENT_TYPE_OPTIONS,

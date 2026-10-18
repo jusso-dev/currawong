@@ -247,31 +247,119 @@ fn message(content_type: &str, body: &str) -> Vec<u8> {
     format!("From: a@example.org\r\nTo: b@example.test\r\nSubject: x\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{body}").into_bytes()
 }
 
+/// Minimal well-formed CMS ContentInfo (signedData) and OpenPGP signature
+/// packet, base64. Structure only: nothing here is a real signature.
+const CMS: &str = "MIIAIAYJKoZIhvcNAQcCoBMBAgMEBQYHCAkKCwwNDg8QERIT";
+const PGP_PACKET: &str = "iQAQAQIDBAUGBwgJCgsMDQ4PEA==";
+
+fn signed(protocol: &str, sig_type: &str, signature: &str) -> Vec<u8> {
+    let body = format!("--s\r\nContent-Type: text/plain\r\n\r\nhttps://evil.test/a\r\n--s\r\nContent-Type: {sig_type}\r\nContent-Transfer-Encoding: base64\r\n\r\n{signature}\r\n--s--\r\n");
+    message(
+        &format!("multipart/signed; protocol=\"{protocol}\"; boundary=s"),
+        &body,
+    )
+}
+
 #[test]
 fn urls_bogus_signed_wrappers_do_not_exempt_links() {
     let rewriter = rewriter();
-    let inner = "--s\r\nContent-Type: text/plain\r\n\r\nhttps://evil.test/a\r\n--s\r\nContent-Type: application/octet-stream\r\n\r\nAAAA\r\n--s--\r\n";
-    for content_type in [
-        "multipart/signed; boundary=s",
-        "multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=s",
-        "multipart/signed; protocol=\"text/plain\"; boundary=s",
+    let smime = "application/pkcs7-signature";
+    let pgp = "application/pgp-signature";
+    let armour = format!(
+        "-----BEGIN PGP SIGNATURE-----\r\n\r\n{PGP_PACKET}\r\n=abcd\r\n-----END PGP SIGNATURE-----"
+    );
+    let armour_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &armour);
+    for (raw, exempt) in [
+        (
+            message(
+                "multipart/signed; boundary=s",
+                "--s\r\nContent-Type: text/plain\r\n\r\nhttps://evil.test/a\r\n--s--\r\n",
+            ),
+            false,
+        ),
+        (signed("text/plain", "text/plain", CMS), false),
+        (signed(smime, "application/octet-stream", CMS), false),
+        // The right protocol and part type with junk for a signature.
+        (signed(smime, smime, "AAAA"), false),
+        (signed(pgp, pgp, "AAAA"), false),
+        (signed(smime, smime, CMS), true),
+        (signed(pgp, pgp, &armour_b64), true),
     ] {
-        let out = rewriter
-            .rewrite_message(&message(content_type, inner), &at("m", 0))
-            .unwrap();
-        assert_eq!(out.links, 1, "{content_type}");
-        assert_eq!(out.skipped, 0);
+        let out = rewriter.rewrite_message(&raw, &at("m", 0)).unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        assert_eq!(
+            (out.links, out.skipped),
+            if exempt { (0, 1) } else { (1, 0) },
+            "{text}"
+        );
     }
     let fake_pgp = "-----BEGIN PGP SIGNED MESSAGE-----\r\nhttps://evil.test/b\r\n";
     let out = rewriter
         .rewrite_message(&message("text/plain", fake_pgp), &at("m", 0))
         .unwrap();
     assert_eq!(out.links, 1);
-    let real_pgp = "-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nhttps://evil.test/c\r\n-----BEGIN PGP SIGNATURE-----\r\nabc\r\n-----END PGP SIGNATURE-----\r\n";
+    let junk_pgp = "-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nhttps://evil.test/c\r\n-----BEGIN PGP SIGNATURE-----\r\n\r\nAAAA\r\n-----END PGP SIGNATURE-----\r\n";
     let out = rewriter
-        .rewrite_message(&message("text/plain", real_pgp), &at("m", 0))
+        .rewrite_message(&message("text/plain", junk_pgp), &at("m", 0))
         .unwrap();
-    assert_eq!((out.links, out.skipped), (0, 1), "{:?}", out.notes);
+    assert_eq!((out.links, out.skipped), (1, 0), "{:?}", out.notes);
+    // Only the clear-signed span is exempt; links around it are rewritten.
+    let real_pgp = format!("Before https://evil.test/before\r\n-----BEGIN PGP SIGNED MESSAGE-----\r\nHash: SHA256\r\n\r\nhttps://evil.test/c\r\n-----BEGIN PGP SIGNATURE-----\r\n\r\n{PGP_PACKET}\r\n=abcd\r\n-----END PGP SIGNATURE-----\r\nAfter https://evil.test/after\r\n");
+    let out = rewriter
+        .rewrite_message(&message("text/plain", &real_pgp), &at("m", 0))
+        .unwrap();
+    assert_eq!((out.links, out.skipped), (2, 1), "{:?}", out.notes);
+    let text = String::from_utf8(out.message).unwrap();
+    assert!(text.contains("https://evil.test/c\r\n"));
+    assert!(!text.contains("evil.test/before") && !text.contains("evil.test/after"));
+}
+
+/// Nesting deep enough to overflow `mail-parser` is refused before parsing,
+/// and nesting under the limit parses on a thread with the stack tokio gives
+/// a blocking task (2 MiB).
+#[test]
+fn urls_deep_nesting_is_refused_without_crashing() {
+    let nested = |depth: usize, multipart: bool| {
+        let mut raw = String::from(
+            "From: a@example.org\r\nTo: b@example.test\r\nSubject: x\r\nMIME-Version: 1.0\r\n",
+        );
+        for n in 0..depth {
+            if multipart {
+                raw.push_str(&format!(
+                    "Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n"
+                ));
+            } else {
+                raw.push_str("Content-Type: message/rfc822\r\n\r\nSubject: inner\r\n");
+            }
+        }
+        raw.push_str("Content-Type: text/plain\r\n\r\nhttps://evil.test/deep\r\n");
+        raw.into_bytes()
+    };
+    let rewriter = std::sync::Arc::new(rewriter());
+    for (depth, multipart, refused) in [
+        (513, true, true),
+        (33, false, true),
+        (500, true, false),
+        (31, false, false),
+    ] {
+        let raw = nested(depth, multipart);
+        let rw = std::sync::Arc::clone(&rewriter);
+        let result = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || rw.rewrite_message(&raw, &at("m", 0)).map(|out| out.links))
+            .unwrap()
+            .join()
+            .expect("no crash");
+        if refused {
+            assert_eq!(
+                result,
+                Err(currawong_scan::urls::RewriteError::TooNested),
+                "{depth}"
+            );
+        } else {
+            assert!(result.is_ok(), "{depth}: {result:?}");
+        }
+    }
 }
 
 #[test]

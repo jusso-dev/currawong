@@ -263,24 +263,143 @@ async fn urls_crash_between_body_and_envelope_reclassifies_the_original() {
     assert!(!saved.join(format!("{}.eml", env.id)).exists());
 }
 
-/// Review finding 5: links left as they were raise `url_rewrite.skipped`,
-/// which the default pack turns into a header.
+/// A multipart/signed message whose signature part is a well-formed (not
+/// verified) CMS structure, so its link is left alone.
+fn signed_message() -> String {
+    "From: user@example.test\r\nTo: dest@example.test\r\nSubject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=s\r\n\r\n--s\r\nContent-Type: text/plain\r\n\r\nhttps://pay.example.net/signed\r\n--s\r\nContent-Type: application/pkcs7-signature\r\nContent-Transfer-Encoding: base64\r\n\r\nMIIAIAYJKoZIhvcNAQcCoBMBAgMEBQYHCAkKCwwNDg8QERIT\r\n--s--\r\n".into()
+}
+
+/// Links left as they were raise `url_rewrite.skipped`. The default pack
+/// tags the mail, warns when DMARC did not pass, and holds it when DMARC
+/// failed.
 #[tokio::test]
 async fn urls_skipped_links_are_flagged_for_policy() {
     let mut gw = gateway(|auth| {
         seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
     })
     .await;
-    let signed = "From: user@example.test\r\nTo: dest@example.test\r\nSubject: s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=s\r\n\r\n--s\r\nContent-Type: text/plain\r\n\r\nhttps://pay.example.net/signed\r\n--s\r\nContent-Type: application/pkcs7-signature\r\nContent-Transfer-Encoding: base64\r\n\r\nAAAA\r\n--s--\r\n";
     let env = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV", Direction::Inbound);
-    let (env, body) = gw.classify(&env, signed.as_bytes()).await;
+    let (env, body) = gw.classify(&env, signed_message().as_bytes()).await;
     assert_eq!(env.pipeline, "deliver");
     assert!(body.contains("https://pay.example.net/signed"));
+    let headers = env.prepend_headers.concat();
     assert!(
-        env.prepend_headers
-            .iter()
-            .any(|h| h.starts_with("X-Currawong-Links: not-rewritten")),
-        "{:?}",
-        env.prepend_headers
+        headers.contains("X-Currawong-Links: not-rewritten"),
+        "{headers}"
     );
+    // No DMARC record: not a pass, so the visible warning too.
+    assert!(
+        headers
+            .contains("X-Currawong-Warning: links from an unauthenticated sender were not checked"),
+        "{headers}"
+    );
+
+    // A junk signature exempts nothing.
+    let junk = signed_message().replace("MIIAIAYJKoZIhvcNAQcCoBMBAgMEBQYHCAkKCwwNDg8QERIT", "AAAA");
+    let env = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAW", Direction::Inbound);
+    let (env, body) = gw.classify(&env, junk.as_bytes()).await;
+    assert_eq!(env.pipeline, "deliver");
+    assert!(!body.contains("pay.example.net"), "{body}");
+    assert!(!env.prepend_headers.concat().contains("X-Currawong-Links"));
+
+    // DMARC fails (p=none, so the dmarc-reject policy does not apply).
+    let mut gw = gateway(|auth| {
+        seed_txt(auth.cache(), "example.test", "v=spf1 -all").unwrap();
+        seed_txt(auth.cache(), "_dmarc.example.test", "v=DMARC1; p=none").unwrap();
+    })
+    .await;
+    let env = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV", Direction::Inbound);
+    let (env, _) = gw.classify(&env, signed_message().as_bytes()).await;
+    assert_eq!(env.pipeline, "quarantine");
+}
+
+/// Round 2 finding 2: nesting deep enough to overflow `mail-parser` is not
+/// parsed in the daemon. The message is classified, flagged and kept whole.
+#[tokio::test]
+async fn urls_deeply_nested_mail_does_not_reach_the_parser() {
+    let mut gw = gateway(|auth| {
+        seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    })
+    .await;
+    let mut raw = String::from("From: user@example.test\r\nTo: dest@example.test\r\nSubject: deep\r\nMIME-Version: 1.0\r\n");
+    for n in 0..2_000 {
+        raw.push_str(&format!(
+            "Content-Type: multipart/mixed; boundary=b{n}\r\n\r\n--b{n}\r\n"
+        ));
+    }
+    raw.push_str("Content-Type: text/plain\r\n\r\nhttps://pay.example.net/deep\r\n");
+    let env = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV", Direction::Inbound);
+    let (report, _, rewritten) = gw
+        .pipeline
+        .assess_for_delivery(&env, raw.as_bytes(), None)
+        .await;
+    assert!(rewritten.is_none());
+    assert!(
+        report.flags.iter().any(|f| f == "url_rewrite.skipped"),
+        "{report:?}"
+    );
+    // Through the scheduler: decided (the nesting also fails other stages
+    // closed, so it is held), the bytes untouched, the daemon still running.
+    let (env, body) = gw.classify(&env, raw.as_bytes()).await;
+    assert_ne!(env.pipeline, "pending");
+    assert_eq!(body, raw);
+}
+
+/// Round 2 finding 4: a split copy left behind by a crash before it was
+/// acted on is finished from the plan, not classified on its own bytes.
+#[tokio::test]
+async fn urls_a_split_copy_left_by_a_crash_is_finished_from_the_plan() {
+    use sha2::{Digest, Sha256};
+    let mut gw = gateway(|auth| {
+        seed_txt(auth.cache(), "example.test", "v=spf1 +all").unwrap();
+    })
+    .await;
+    gw.pipeline.policies = currawong_policy::PolicySet::from_toml(
+        "[[policy]]\nid = \"hold-one\"\nconditions = [{ recipient = \"held@example.test\" }]\nactions = [{ quarantine = \"review\" }]\n",
+    )
+    .unwrap();
+    let id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    let mut env = envelope(id, Direction::Inbound);
+    env.rcpt_to = vec!["a@example.test".into(), "held@example.test".into()];
+    let copy_id =
+        hex::encode_upper(Sha256::digest(format!("{id}\nheld@example.test")))[..26].to_string();
+    // Writing the copy fails, as a crash would, after the plan is saved.
+    let blocker = gw
+        .root
+        .join("spool")
+        .join(SpoolState::Incoming.dir_name())
+        .join(format!("{copy_id}.eml.tmp"));
+    std::fs::create_dir_all(&blocker).unwrap();
+    gw.spool
+        .accept(env.clone(), Cursor::new(MESSAGE.to_vec()))
+        .await
+        .unwrap();
+    classify_pending(&gw.spool, &mut gw.pipeline, &gw.quarantine)
+        .await
+        .unwrap();
+    assert_eq!(gw.spool.load(&env.id).await.unwrap().pipeline, "pending");
+    // What a crash between making the copy and acting on it leaves.
+    std::fs::remove_dir(&blocker).unwrap();
+    let mut copy = env.clone();
+    copy.id = MessageId(copy_id.clone());
+    copy.rcpt_to = vec!["held@example.test".into()];
+    copy.pipeline = "split".into();
+    gw.spool
+        .accept(copy, Cursor::new(b"not the original".to_vec()))
+        .await
+        .unwrap();
+    classify_pending(&gw.spool, &mut gw.pipeline, &gw.quarantine)
+        .await
+        .unwrap();
+    let copy = gw.spool.load(&MessageId(copy_id.clone())).await.unwrap();
+    assert_eq!(copy.pipeline, "quarantine");
+    assert_eq!(
+        gw.quarantine.reason(&copy_id).unwrap(),
+        "hold-one (queue review)"
+    );
+    let original = gw.spool.load(&env.id).await.unwrap();
+    assert_eq!(original.pipeline, "deliver");
+    assert_eq!(original.rcpt_to, ["a@example.test"]);
+    let body = String::from_utf8(gw.spool.read_body(&env.id).await.unwrap()).unwrap();
+    assert!(body.contains(&format!("{BASE}/u/")), "{body}");
 }

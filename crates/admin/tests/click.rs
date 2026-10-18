@@ -1,6 +1,8 @@
 //! The click service over a real socket: round trip, tampering, and a link
 //! blocked after delivery.
-use currawong_admin::routes::click::{serve, ClickAction, ClickEvent, ClickLog, ClickState};
+use currawong_admin::routes::click::{
+    serve, ClickAction, ClickEvent, ClickLimits, ClickLog, ClickState,
+};
 use currawong_scan::urls::{Claims, Delivery, LocalBlocklist, UrlRewriter, UrlSigner};
 use std::{net::SocketAddr, path::Path, sync::Arc};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,9 +28,13 @@ async fn get(addr: SocketAddr, path: &str) -> Reply {
 }
 
 async fn request(addr: SocketAddr, method: &str, path: &str) -> Reply {
+    request_with(addr, method, path, "").await
+}
+
+async fn request_with(addr: SocketAddr, method: &str, path: &str, extra: &str) -> Reply {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: links.example.com.au\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: links.example.com.au\r\n{extra}Connection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes()).await.unwrap();
     let mut raw = Vec::new();
@@ -67,6 +73,15 @@ async fn start(dir: &Path) -> SocketAddr {
 }
 
 async fn start_with(dir: &Path, warn_unknown: bool, log_bytes: u64) -> SocketAddr {
+    start_limited(dir, warn_unknown, log_bytes, ClickLimits::default()).await
+}
+
+async fn start_limited(
+    dir: &Path,
+    warn_unknown: bool,
+    log_bytes: u64,
+    limits: ClickLimits,
+) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let list =
@@ -75,6 +90,7 @@ async fn start_with(dir: &Path, warn_unknown: bool, log_bytes: u64) -> SocketAdd
         signer(),
         Arc::new(list),
         ClickLog::open(&dir.join("clicks.jsonl"), log_bytes).unwrap(),
+        limits,
     );
     tokio::spawn(serve(listener, state));
     addr
@@ -344,4 +360,77 @@ async fn urls_click_log_is_private_and_rotates() {
         let mode = std::fs::metadata(&log).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+
+/// Round 2 finding 1: junk tokens use up nobody's allowance, the per-client
+/// limit follows `X-Forwarded-For` only from a trusted proxy, and the
+/// per-link limit grows with the message's recipients.
+#[tokio::test]
+async fn urls_rate_limits_count_verified_clicks_per_real_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ClickLimits {
+        per_client: 5,
+        per_link: 2,
+        trusted_proxies: vec!["127.0.0.1/32".parse().unwrap()],
+    };
+    let addr = start_limited(dir.path(), false, 1 << 20, limits).await;
+    let from = |ip: &str| format!("X-Forwarded-For: 198.51.100.7, {ip}\r\n");
+    // A flood of junk from one client does not touch the limits.
+    for _ in 0..20 {
+        let reply = request_with(addr, "GET", "/u/junk.junk", &from("203.0.113.1")).await;
+        assert_eq!(reply.status, 400);
+    }
+    let link = |n: usize, recipients: &str| {
+        let mut c = claims(&format!("https://shop.example.net/{n}"));
+        c.r = recipients.into();
+        format!("/u/{}", signer().sign(&c))
+    };
+    // Per client: five clicks from 203.0.113.1, then 429; another client
+    // behind the same proxy is unaffected.
+    for n in 0..5 {
+        let reply = request_with(addr, "GET", &link(n, "a@x.test"), &from("203.0.113.1")).await;
+        assert_eq!(reply.status, 302, "{n}");
+    }
+    let reply = request_with(addr, "GET", &link(5, "a@x.test"), &from("203.0.113.1")).await;
+    assert_eq!(reply.status, 429);
+    let reply = request_with(addr, "GET", &link(6, "a@x.test"), &from("203.0.113.2")).await;
+    assert_eq!(reply.status, 302);
+    // Per link: two clicks per recipient; a three-recipient link allows six.
+    let shared = link(7, "a@x.test,b@x.test,c@x.test");
+    let statuses: Vec<u16> = clicks_from_many(addr, &shared, 7).await;
+    assert_eq!(&statuses[..6], &[302; 6], "{statuses:?}");
+    assert_eq!(statuses[6], 429);
+}
+
+/// Seven clicks on `path`, each from its own client behind the proxy.
+async fn clicks_from_many(addr: SocketAddr, path: &str, n: usize) -> Vec<u16> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        let extra = format!("X-Forwarded-For: 192.0.2.{}\r\n", 10 + i);
+        out.push(request_with(addr, "GET", path, &extra).await.status);
+    }
+    out
+}
+
+#[tokio::test]
+async fn urls_forwarded_for_from_an_untrusted_peer_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ClickLimits {
+        per_client: 2,
+        per_link: 100,
+        trusted_proxies: Vec::new(),
+    };
+    let addr = start_limited(dir.path(), false, 1 << 20, limits).await;
+    let mut statuses = Vec::new();
+    for n in 0..3 {
+        let token = signer().sign(&claims(&format!("https://shop.example.net/{n}")));
+        // A spoofed header would give each request a fresh client.
+        let extra = format!("X-Forwarded-For: 192.0.2.{n}\r\n");
+        statuses.push(
+            request_with(addr, "GET", &format!("/u/{token}"), &extra)
+                .await
+                .status,
+        );
+    }
+    assert_eq!(statuses, [302, 302, 429]);
 }
