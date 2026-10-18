@@ -1,7 +1,7 @@
 use currawong_auth::{seed_txt, AuthChecker};
 use currawong_classify::{spam::Feedback, TenantContext};
 use currawong_core::{config::Config, Direction, Verdict};
-use currawong_quarantine::QuarantineStore;
+use currawong_quarantine::{ListQuery, Principal, QuarantineStore, Role};
 use currawong_spool::{Envelope, Spool, SpoolState};
 use currawongd::{check_config, classify_pending, pending_scan, ready_to_deliver, Pipeline};
 use std::{io::Cursor, sync::Arc};
@@ -208,6 +208,14 @@ async fn repeated_scan_deferrals_end_in_quarantine() {
         .unwrap();
     let env = spool.load(&env.id).await.unwrap();
     assert_eq!(env.pipeline, "quarantine", "{env:?}");
+    let admin = Principal {
+        actor: "root".into(),
+        role: Role::PlatformAdmin,
+        tenant_id: None,
+    };
+    let items = held.list(&admin, &ListQuery::default()).unwrap().items;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0].queue, "scan-failed");
 }
 
 /// Windows ignores trailing dots and spaces; the block list must too.
@@ -756,6 +764,102 @@ async fn lookalike_and_classify_flags_reach_policy_signals() {
         .await;
     let signals = currawong_policy::Signals::from_report(&report);
     assert!(signals.flags.contains("link_scan_truncated"), "{signals:?}");
+}
+
+fn attachment(name: &str, content_type: &str, bytes: &[u8]) -> String {
+    let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+    let lines: Vec<&str> = encoded
+        .as_bytes()
+        .chunks(76)
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect();
+    format!(
+        "--b\r\nContent-Type: {content_type}; name=\"{name}\"\r\nContent-Disposition: attachment; filename=\"{name}\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n",
+        lines.join("\r\n")
+    )
+}
+
+#[tokio::test]
+async fn qr_urls_feed_link_analysis_and_smuggling_reaches_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipeline = classify_pipeline(dir.path(), true);
+    let code = qrcode::QrCode::new(b"https://c0mmbank.com.au/login").unwrap();
+    let mut png = Cursor::new(Vec::new());
+    code.render::<image::Luma<u8>>()
+        .min_dimensions(240, 240)
+        .build()
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let blob = "QUJD".repeat(16 * 1024);
+    let html = format!(
+        "<script>var b = new Blob([atob(\"{blob}\")]); var a = document.createElement('a'); a.href = URL.createObjectURL(b); a.download = 'x.iso';</script>"
+    );
+    let png = png.into_inner();
+    let message = |attachments: &[String]| {
+        format!(
+            "From: a@example.test\r\nTo: dest@example.test\r\nSubject: verify\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nScan the code.\r\n{}--b--\r\n",
+            attachments.concat()
+        )
+    };
+
+    // A QR code alone is delivered, tagged by the default pack.
+    let raw = message(&[attachment("code.png", "image/png", &png)]);
+    let (report, decision) = pipeline
+        .assess(&envelope("a@example.test"), raw.as_bytes(), None)
+        .await;
+    assert!(
+        report.url_sources.contains(&currawong_core::FoundUrl {
+            url: "https://c0mmbank.com.au/login".into(),
+            source: currawong_core::UrlSource::Qr,
+        }),
+        "{:?}",
+        report.url_sources
+    );
+    let signals = currawong_policy::Signals::from_report(&report);
+    assert!(signals.flags.contains("qr_url"), "{signals:?}");
+    assert_eq!(signals.counts.get("qr_urls"), Some(&1));
+    assert!(
+        matches!(decision.verdict(), Verdict::Deliver),
+        "{decision:?}"
+    );
+    assert!(decision.decisions[0].actions.iter().any(|action| matches!(
+        action,
+        currawong_policy::Action::AddHeader { name, value }
+            if name == "X-Currawong-QR-Code" && value == "present"
+    )));
+
+    // With an HTML smuggling attachment the default pack quarantines it.
+    let raw = message(&[
+        attachment("code.png", "image/png", &png),
+        attachment("statement.html", "text/html", html.as_bytes()),
+    ]);
+    let (report, decision) = pipeline
+        .assess(&envelope("a@example.test"), raw.as_bytes(), None)
+        .await;
+    assert_eq!(
+        decision.decisions[0].queue(),
+        Some("phishing"),
+        "{decision:?}"
+    );
+    assert!(
+        report
+            .urls
+            .contains(&"https://c0mmbank.com.au/login".to_string()),
+        "{:?}",
+        report.urls
+    );
+    // The link exists only inside the image, so this finding came from the QR code.
+    assert!(
+        report
+            .lookalikes
+            .iter()
+            .any(|found| found.source == "url" && found.domain == "c0mmbank.com.au"),
+        "{:?}",
+        report.lookalikes
+    );
+    let signals = currawong_policy::Signals::from_report(&report);
+    assert!(signals.flags.contains("qr_code"), "{signals:?}");
+    assert!(signals.flags.contains("html_smuggling"), "{signals:?}");
 }
 
 #[tokio::test]

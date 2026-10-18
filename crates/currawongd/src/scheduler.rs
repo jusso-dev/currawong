@@ -289,14 +289,21 @@ async fn act(
             }
         }
         Verdict::Quarantine { reason } => {
-            let reason = match decision.queue() {
+            // A scan that never completed is a scan failure, whatever the
+            // deferring policy named.
+            let queue = if matches!(decision.verdict, Verdict::Defer { .. }) {
+                Some("scan-failed")
+            } else {
+                decision.queue()
+            };
+            let reason = match queue {
                 Some(queue) => format!("{reason} (queue {queue})"),
                 None => reason.clone(),
             };
             let hold = Hold {
                 message_id: env.id.clone(),
                 tenant_id: decision.tenant_id.clone(),
-                queue: decision.queue().unwrap_or("policy").to_string(),
+                queue: queue.unwrap_or("policy").to_string(),
                 reason: reason.clone(),
                 reasons: decision.explanation.clone(),
                 sender: env.mail_from.clone(),

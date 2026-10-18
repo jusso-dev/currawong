@@ -14,7 +14,8 @@ pub struct AuditEvent {
     pub role: String,
     pub tenant_id: Option<String>,
     pub item_id: String,
-    /// `release`, `delete`, `purge`, or `denied:<action>`.
+    /// `release_started` then `release`, `delete_started` then `delete`,
+    /// `purge`, or `denied:<action>`.
     pub action: String,
     pub reason: Option<String>,
     /// Release: the id of the re-injected spool message.

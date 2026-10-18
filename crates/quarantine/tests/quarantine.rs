@@ -15,11 +15,10 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-
-const MAX_ENTRIES: usize = currawong_quarantine::digest::MAX_ENTRIES;
 use time::{Duration, OffsetDateTime};
 use tower::ServiceExt;
 
+const MAX_ENTRIES: usize = currawong_quarantine::digest::MAX_ENTRIES;
 const SPAM_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 const VIRUS_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
 const RAW: &[u8] =

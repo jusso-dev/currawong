@@ -347,8 +347,8 @@ min_confidence = 50
 # queues every digest_interval_hours, through the outbound spool. Links are
 # HMAC signed with link_key_path (created mode 0600), expire after
 # link_ttl_hours and work once.
-# quarantine.listen: serves the digest-link and release endpoints. Put a TLS
-# proxy at link_base_url in front of it.
+# quarantine.listen: serves the digest-link and release endpoints, and must be
+# set when digests are on. Put a TLS proxy at link_base_url in front of it.
 # quarantine.blob_store: "fs", or "s3" with an S3-compatible endpoint that
 # passes the residency guard. Credentials come from AWS_* environment variables.
 [quarantine]
