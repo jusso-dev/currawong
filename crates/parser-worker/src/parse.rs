@@ -1,8 +1,9 @@
 //! MIME parse. A message that cannot be parsed returns an error, it does not panic.
 use crate::archive::{self, passwords_from_message, Budget};
 use crate::filetype::{self, FileKind};
-use crate::ipc::{ParseRequest, ParseResponse};
+use crate::ipc::{FoundUrl, ParseRequest, ParseResponse, UrlSource};
 use crate::yara::{RulesCache, YaraScan};
+use crate::{html_smuggling, qr};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
@@ -97,7 +98,9 @@ pub fn parse_full(
         yara.scan("message", raw);
     }
     let mut walk = Walk {
-        budget: Budget::new(limits, out_dir).with_yara(yara.as_mut()),
+        budget: Budget::new(limits, out_dir)
+            .with_yara(yara.as_mut())
+            .with_checks(ContentChecks::new(documents)),
         passwords: passwords_from_message(&text),
         parts: Vec::new(),
         urls: Vec::new(),
@@ -110,11 +113,16 @@ pub fn parse_full(
         walk.parts.push(part);
     }
     let Walk {
-        budget,
+        mut budget,
         parts,
         mut urls,
         ..
     } = walk;
+    let qr_urls = budget
+        .checks
+        .take()
+        .map(|checks| checks.urls)
+        .unwrap_or_default();
     if let Some(err) = budget.store_failed {
         return ParseResponse::failed(id, err);
     }
@@ -126,10 +134,25 @@ pub fn parse_full(
     urls.sort();
     urls.dedup();
     urls.truncate(MAX_URLS);
+    // QR URLs are bounded by the QR budget and kept even when text links
+    // filled `MAX_URLS`.
+    let mut url_sources: Vec<FoundUrl> = urls
+        .iter()
+        .map(|url| FoundUrl {
+            url: url.clone(),
+            source: UrlSource::Text,
+        })
+        .chain(qr_urls)
+        .collect();
+    url_sources.sort();
+    url_sources.dedup();
+    let mut urls: Vec<String> = url_sources.iter().map(|found| found.url.clone()).collect();
+    urls.dedup();
     ParseResponse {
         id: id.to_string(),
         parts,
         urls,
+        url_sources,
         error,
         warnings: Vec::new(),
         yara,
@@ -194,6 +217,10 @@ impl Walk<'_, '_> {
             {
                 flags.push(PartFlag::ExtMismatch);
             }
+            let html = matches!(part.body, PartType::Html(_))
+                || content_type.as_deref() == Some("text/html");
+            self.budget
+                .check(bytes, filename.as_deref(), html, &mut flags);
             let entry = self
                 .budget
                 .part(filename.as_deref(), content_type, bytes, flags);
@@ -210,6 +237,66 @@ impl Walk<'_, '_> {
             vec![PartFlag::LimitExceeded],
         );
         self.parts.push(part);
+    }
+}
+
+/// HTML smuggling and QR code checks for MIME parts and archive members.
+pub struct ContentChecks {
+    qr: qr::Budget,
+    /// PDFs are rendered only in the worker, like document text.
+    documents: bool,
+    urls: Vec<FoundUrl>,
+}
+
+impl ContentChecks {
+    fn new(documents: bool) -> Self {
+        Self {
+            qr: qr::Budget::default(),
+            documents,
+            urls: Vec::new(),
+        }
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        bytes: &[u8],
+        filename: Option<&str>,
+        html_type: bool,
+        kind: &FileKind,
+        flags: &mut Vec<PartFlag>,
+    ) {
+        if html_smuggling::is_html(html_type, filename, &kind.label, bytes)
+            && html_smuggling::flagged(bytes)
+        {
+            flags.push(PartFlag::HtmlSmuggling);
+        }
+        let codes = if kind.label.starts_with("image/") {
+            self.qr.image(bytes)
+        } else if self.documents && kind.label == "application/pdf" {
+            self.qr.pdf(bytes)
+        } else {
+            return;
+        };
+        match codes {
+            Ok(codes) => {
+                if !codes.is_empty() {
+                    flags.push(PartFlag::QrCode);
+                }
+                self.urls
+                    .extend(qr::urls(&codes).into_iter().map(|url| FoundUrl {
+                        url,
+                        source: UrlSource::Qr,
+                    }));
+            }
+            // A possible decode bomb fails closed like an archive limit.
+            Err(qr::Skipped::TooLarge) => {
+                if !flags.contains(&PartFlag::LimitExceeded) {
+                    flags.push(PartFlag::LimitExceeded);
+                }
+            }
+            // QR is a tagging signal: a used-up budget does not hold mail.
+            Err(qr::Skipped::Budget) => flags.push(PartFlag::QrSkipped),
+        }
     }
 }
 

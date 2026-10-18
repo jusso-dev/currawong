@@ -36,6 +36,15 @@ pdf-extract = { workspace = true }
 calamine = { workspace = true }
 yara-x = { workspace = true }
 base64 = { workspace = true }
+image = { workspace = true }
+rqrr = { workspace = true }
+regex = { workspace = true }
+pdfium-render = { workspace = true, optional = true }
+
+[features]
+# Render the first PDF pages for QR codes. Needs the Pdfium shared library
+# on the host at run time.
+pdfium = ["dep:pdfium-render"]
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -44,6 +53,7 @@ libc = { workspace = true }
 landlock = { workspace = true }
 
 [dev-dependencies]
+qrcode = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 zip = { workspace = true }

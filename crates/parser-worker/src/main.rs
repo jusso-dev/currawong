@@ -19,6 +19,9 @@ fn main() {
     sandbox::close_inherited_fds();
     let limits = WorkerLimits::from_env();
     let cfg = SandboxConfig::from_env();
+    // Shared libraries (Pdfium, with the `pdfium` feature) are bound before
+    // the sandbox stops the worker opening files.
+    currawong_parser::qr::init();
     let setup = sandbox::apply_limits(&limits)
         .map_err(|err| format!("resource limits: {err}"))
         .and_then(|()| sandbox::install(&cfg).map_err(|err| format!("sandbox: {err}")));
