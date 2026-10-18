@@ -15,7 +15,7 @@ pub use store::{open_blob_store, BlobStore, FsBlobStore, S3BlobStore};
 
 use currawong_core::{
     config::{admin_release_queue, canonical_queue, QuarantineConfig},
-    Direction, MessageId,
+    Direction, MessageId, TlsRequirement,
 };
 use currawong_integrations::export;
 use currawong_spool::{Envelope, Spool, SpoolError, SpoolState};
@@ -30,10 +30,14 @@ use std::{
 use time::OffsetDateTime;
 
 /// Applied in order. `PRAGMA user_version` records how many have run.
-const MIGRATIONS: &[&str] = &[include_str!("../migrations/0001_quarantine.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../migrations/0001_quarantine.sql"),
+    include_str!("../migrations/0002_release_requirements.sql"),
+];
 
 /// Spool `pipeline` of a released message: the scheduler delivers it without
-/// running policy again, so it cannot be quarantined a second time.
+/// running policy again, so it cannot be quarantined a second time. It keeps
+/// the TLS and encryption the held message's policy decision required.
 pub const RELEASE_PIPELINE: &str = "release";
 
 /// As [`RELEASE_PIPELINE`], for a release from the spam queue: the scheduler
@@ -140,6 +144,59 @@ pub struct Hold {
     pub direction: Direction,
     /// Our headers (Authentication-Results), prepended again on release.
     pub headers: Vec<String>,
+    /// Transport security the policy decision required, kept on release.
+    pub tls: TlsRequirement,
+    /// Encryption the policy decision required, applied on release.
+    pub encrypt: Option<EncryptMode>,
+}
+
+/// The `encrypt`, `encrypt_smime` and `encrypt_portal` policy actions, as
+/// the daemon's encrypt step applies them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptMode {
+    /// S/MIME when every recipient has a certificate, else the portal.
+    Auto,
+    Smime,
+    Portal,
+}
+
+impl EncryptMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Smime => "smime",
+            Self::Portal => "portal",
+        }
+    }
+
+    /// An unknown stored value still means encrypt: it is read as `auto`.
+    fn parse(text: &str) -> Self {
+        match text {
+            "smime" => Self::Smime,
+            "portal" => Self::Portal,
+            _ => Self::Auto,
+        }
+    }
+}
+
+fn tls_str(tls: TlsRequirement) -> &'static str {
+    match tls {
+        TlsRequirement::None => "none",
+        TlsRequirement::Opportunistic => "opportunistic",
+        TlsRequirement::Required => "required",
+        TlsRequirement::Dane => "dane",
+    }
+}
+
+/// An unknown stored value is read as the strictest requirement.
+fn parse_tls(text: &str) -> TlsRequirement {
+    match text {
+        "none" => TlsRequirement::None,
+        "opportunistic" => TlsRequirement::Opportunistic,
+        "required" => TlsRequirement::Required,
+        _ => TlsRequirement::Dane,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -157,6 +214,8 @@ pub struct Item {
     pub direction: Direction,
     #[serde(skip)]
     pub headers: Vec<String>,
+    pub tls: TlsRequirement,
+    pub encrypt: Option<EncryptMode>,
     pub created_at: i64,
     pub expires_at: i64,
     pub released_at: Option<i64>,
@@ -174,7 +233,7 @@ impl Item {
 
 const ITEM_COLUMNS: &str = "id, tenant_id, message_id, queue, recipient, sender, subject, score, \
      reason, reasons_json, direction, headers_json, created_at, expires_at, released_at, \
-     released_by, deleted_at, deleted_by";
+     released_by, deleted_at, deleted_by, tls, encrypt";
 
 fn item_from_row(row: &rusqlite::Row) -> rusqlite::Result<Item> {
     let json = |index: usize| -> rusqlite::Result<Vec<String>> {
@@ -213,6 +272,10 @@ fn item_from_row(row: &rusqlite::Row) -> rusqlite::Result<Item> {
         released_by: row.get(15)?,
         deleted_at: row.get(16)?,
         deleted_by: row.get(17)?,
+        tls: parse_tls(&row.get::<_, String>(18)?),
+        encrypt: row
+            .get::<_, Option<String>>(19)?
+            .map(|mode| EncryptMode::parse(&mode)),
     })
 }
 
@@ -344,8 +407,8 @@ impl QuarantineStore {
             tx.execute(
                 "INSERT OR IGNORE INTO quarantine (id, tenant_id, message_id, queue, recipient,
                  sender, subject, score, reason, reasons_json, direction, headers_json,
-                 created_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                 created_at, expires_at, tls, encrypt)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
                 params![
                     id,
                     hold.tenant_id,
@@ -360,7 +423,9 @@ impl QuarantineStore {
                     direction,
                     headers,
                     now,
-                    expires
+                    expires,
+                    tls_str(hold.tls),
+                    hold.encrypt.map(EncryptMode::as_str)
                 ],
             )
             .map_err(db)?;
@@ -381,6 +446,56 @@ impl QuarantineStore {
             .optional()
             .map_err(db)?
             .ok_or(QuarantineError::NotFound)
+    }
+
+    /// The item a released spool message came from, whatever its state now.
+    /// Release ids derive from the item id, and the release envelope keeps
+    /// the item's tenant and its one recipient.
+    pub fn released_item(&self, env: &Envelope) -> Result<Option<Item>, QuarantineError> {
+        let [recipient] = env.rcpt_to.as_slice() else {
+            return Ok(None);
+        };
+        let conn = self.conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {ITEM_COLUMNS} FROM quarantine WHERE tenant_id IS ?1 AND recipient = ?2"
+            ))
+            .map_err(db)?;
+        let mut rows = stmt
+            .query_map(params![env.tenant_id, recipient], item_from_row)
+            .map_err(db)?;
+        // A row that cannot be read stops the search with its error.
+        rows.find(|row| match row {
+            Ok(item) => derived_id(&item.id, "release") == env.id.as_str(),
+            Err(_) => true,
+        })
+        .transpose()
+        .map_err(db)
+    }
+
+    /// A released message that could not be encrypted was held again as
+    /// `held` rather than sent: recorded on the item it was released from.
+    pub fn release_failed(
+        &self,
+        item: &Item,
+        reason: &str,
+        held: &MessageId,
+        now: OffsetDateTime,
+    ) -> Result<(), QuarantineError> {
+        let system = Principal {
+            actor: "system".into(),
+            role: Role::PlatformAdmin,
+            tenant_id: None,
+        };
+        let now = now.unix_timestamp();
+        self.audit(
+            &system,
+            item,
+            "release_failed",
+            Some(reason),
+            Some(held.to_string()),
+            now,
+        )
     }
 
     /// BIMI logo and VMC status for the quarantine UI, as JSON.
@@ -988,7 +1103,8 @@ fn release_envelope(item: &Item, now: i64) -> Envelope {
         rcpt_status: Vec::new(),
         prepend_headers: item.headers.clone(),
         dsn_sent: false,
-        tls: Default::default(),
+        // Delivery defers rather than send without it.
+        tls: item.tls,
         pipeline: if item.queue == "spam" {
             RELEASE_HAM_PIPELINE
         } else {
