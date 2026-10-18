@@ -391,9 +391,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("good.yar"), MARKER).unwrap();
         let _fail = FailBuild::on();
-        let err = compile_dir(dir.path())
-            .err()
-            .expect("build failure is an error");
+        let Err(err) = compile_dir(dir.path()) else {
+            panic!("a build failure is an error");
+        };
         assert!(err.contains("WASM module is not valid"), "{err}");
         assert!(err.contains("MemoryDenyWriteExecute"), "{err}");
         assert!(YaraEngine::new(dir.path()).is_err());
@@ -423,9 +423,9 @@ mod tests {
 
     #[test]
     fn a_non_string_panic_is_still_an_error() {
-        let err = catch_build(|| std::panic::panic_any(7_u8))
-            .err()
-            .expect("error");
+        let Err(err) = catch_build(|| std::panic::panic_any(7_u8)) else {
+            panic!("a panic is an error");
+        };
         assert!(err.contains("unknown panic"), "{err}");
     }
 }
