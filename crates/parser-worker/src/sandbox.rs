@@ -64,6 +64,19 @@ pub fn close_inherited_fds() {
     }
 }
 
+/// glibc gives each thread that allocates its own malloc arena, up to eight
+/// per CPU, and each reserves 64 MiB of address space it never gives back.
+/// Under `RLIMIT_AS` that took the limit away from parsing whenever tokio's
+/// blocking pool happened to start another thread. The worker parses on one
+/// thread, so one arena costs nothing. Call before any thread is started.
+pub fn one_malloc_arena() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: sets an allocator parameter; no other thread exists yet.
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 1);
+    }
+}
+
 /// Address space, no core files, a file size cap and, under a dedicated uid,
 /// a process cap. CPU gets a hard cap over the worker's life
 /// (`cpu_secs * max_jobs`); [`start_job`] sets the per-job soft limit.
