@@ -434,3 +434,33 @@ async fn urls_forwarded_for_from_an_untrusted_peer_is_ignored() {
     }
     assert_eq!(statuses, [302, 302, 429]);
 }
+
+#[tokio::test]
+async fn urls_one_ipv6_64_is_one_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let limits = ClickLimits {
+        per_client: 2,
+        per_link: 100,
+        trusted_proxies: vec!["127.0.0.1/32".parse().unwrap()],
+    };
+    let addr = start_limited(dir.path(), false, 1 << 20, limits).await;
+    let mut statuses = Vec::new();
+    for n in 1..=3 {
+        let token = signer().sign(&claims(&format!("https://shop.example.net/{n}")));
+        // A new address in the same /64 each time.
+        let extra = format!("X-Forwarded-For: 2001:db8:1:2::{n}\r\n");
+        statuses.push(
+            request_with(addr, "GET", &format!("/u/{token}"), &extra)
+                .await
+                .status,
+        );
+    }
+    let token = signer().sign(&claims("https://shop.example.net/other"));
+    let extra = "X-Forwarded-For: 2001:db8:1:3::1\r\n";
+    statuses.push(
+        request_with(addr, "GET", &format!("/u/{token}"), extra)
+            .await
+            .status,
+    );
+    assert_eq!(statuses, [302, 302, 429, 302]);
+}

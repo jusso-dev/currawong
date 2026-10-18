@@ -34,7 +34,8 @@ const REREAD: Duration = Duration::from_secs(5);
 /// marks a known site when unknown sites get the warning page. `#` starts a
 /// comment. Domains are IDNA-normalised. The file is read again when it
 /// changes, so a link blocked after delivery is refused on its next click.
-/// A missing file lists nothing.
+/// A file that has never been read lists nothing; once a list has loaded, a
+/// missing or zero-byte file keeps it.
 pub struct LocalBlocklist {
     path: Option<PathBuf>,
     warn_unknown: bool,

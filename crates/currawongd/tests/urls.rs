@@ -403,3 +403,31 @@ async fn urls_a_split_copy_left_by_a_crash_is_finished_from_the_plan() {
     let body = String::from_utf8(gw.spool.read_body(&env.id).await.unwrap()).unwrap();
     assert!(body.contains(&format!("{BASE}/u/")), "{body}");
 }
+
+/// A link found in a QR code cannot be rewritten (it is in an image): it is
+/// noted, not flagged as skipped, and the text links are still rewritten.
+#[tokio::test]
+async fn urls_qr_code_links_are_noted_not_rewritten() {
+    let gw = gateway(|_| {}).await;
+    let env = envelope("01ARZ3NDEKTSV4RRFFQ69G5FAV", Direction::Inbound);
+    let mut report = currawong_core::ScanReport::new(env.id.clone());
+    report.url_sources.push(currawong_core::FoundUrl {
+        url: "https://qr.example.net/login".into(),
+        source: currawong_core::UrlSource::Qr,
+    });
+    let body = gw
+        .pipeline
+        .rewrite_urls(&env, MESSAGE, &mut report)
+        .await
+        .expect("text link rewritten");
+    assert!(!String::from_utf8(body).unwrap().contains("pay.example.net"));
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n == "1 QR code links not rewritten: no click-time check"),
+        "{:?}",
+        report.notes
+    );
+    assert!(!report.flags.iter().any(|f| f == "url_rewrite.skipped"));
+}

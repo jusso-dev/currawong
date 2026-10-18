@@ -436,7 +436,7 @@ pub struct UrlRewriteConfig {
     /// Addresses or CIDRs of the TLS proxy in front of the click service. Its
     /// `X-Forwarded-For` names the client; from anyone else it is ignored.
     pub trusted_proxies: Vec<String>,
-    /// Verified clicks per minute from one client address.
+    /// Verified clicks per minute from one client address (an IPv6 /64 counts as one).
     pub clicks_per_minute_per_client: u32,
     /// Verified clicks per minute on one link, per recipient of its message.
     pub clicks_per_minute_per_link: u32,

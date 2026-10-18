@@ -9,7 +9,7 @@ use currawong_classify::{
 use currawong_core::telemetry::SCAN_DURATION_SECONDS;
 use currawong_core::{
     config::{Config, TenantConfig},
-    AuthResults, Direction, EngineFinding, PartFlag, ScanReport, Verdict,
+    AuthResults, Direction, EngineFinding, PartFlag, ScanReport, UrlSource, Verdict,
 };
 use currawong_parser::{text::DlpText, ParseResponse};
 use currawong_policy::{
@@ -269,6 +269,19 @@ impl Pipeline {
         let rewriter = Arc::clone(self.url_rewriter.as_ref()?);
         if env.direction != Direction::Inbound {
             return None;
+        }
+        // A link read from a QR code is pixels in an image: it cannot be
+        // rewritten and gets no click-time check. Not `url_rewrite.skipped`
+        // (QR codes are common); policy has `qr_url` for these.
+        let qr = report
+            .url_sources
+            .iter()
+            .filter(|found| found.source == UrlSource::Qr)
+            .count();
+        if qr > 0 {
+            report.notes.push(format!(
+                "{qr} QR code links not rewritten: no click-time check"
+            ));
         }
         // Arrival time, not now, so a retry rebuilds the same bytes.
         let issued = env.received_at.unix_timestamp().max(0) as u64;

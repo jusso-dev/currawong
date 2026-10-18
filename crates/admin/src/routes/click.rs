@@ -19,7 +19,7 @@ use std::{
     collections::HashMap,
     hash::Hash,
     io::Write,
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr},
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -34,7 +34,7 @@ const MAX_KEYS: usize = 50_000;
 /// cannot use up anyone's allowance.
 #[derive(Debug, Clone)]
 pub struct ClickLimits {
-    /// Clicks per minute from one client address.
+    /// Clicks per minute from one client address (an IPv6 /64 counts as one).
     pub per_client: u32,
     /// Clicks per minute on one link per recipient of its message.
     pub per_link: u32,
@@ -68,6 +68,12 @@ impl<K: Eq + Hash> Windows<K> {
         let mut hits = self.hits.lock().unwrap_or_else(|p| p.into_inner());
         if hits.len() > MAX_KEYS {
             hits.retain(|_, (start, _)| start.elapsed() < WINDOW);
+            // Still full of live keys: start again rather than scan the
+            // whole map on every click from here on.
+            if hits.len() > MAX_KEYS {
+                tracing::warn!(keys = hits.len(), "click rate limiter full, reset");
+                hits.clear();
+            }
         }
         let entry = hits.entry(key).or_insert((Instant::now(), 0));
         if entry.0.elapsed() >= WINDOW {
@@ -114,6 +120,13 @@ impl ClickState {
             list => list.split(',').count().min(u32::MAX as usize) as u32,
         };
         let key: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        // One IPv6 client can hold a whole /64, so it is counted as one.
+        let client = match client {
+            IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+                IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX)))
+            }
+            other => other,
+        };
         let client_ok = per_client.hit(client, self.limits.per_client);
         let link_ok = per_link.hit(key, self.limits.per_link.saturating_mul(share));
         client_ok && link_ok
