@@ -115,7 +115,10 @@ jobs:
         run: |
           docker build -t deb12-systemd - <<'EOF'
           FROM debian:12
-          RUN apt-get update \
+          # Docker's Debian image ships a policy-rc.d that stops maintainer
+          # scripts starting services. A real Debian host has none.
+          RUN rm -f /usr/sbin/policy-rc.d \
+           && apt-get update \
            && apt-get install -y --no-install-recommends systemd systemd-sysv dbus curl iproute2 ca-certificates \
            && rm -rf /var/lib/apt/lists/*
           STOPSIGNAL SIGRTMIN+3

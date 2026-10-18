@@ -53,10 +53,12 @@ MemoryDenyWriteExecute=yes
 # AF_UNIX for a clamd socket, AF_NETLINK for interface enumeration.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 
-# System calls. The parser worker installs its own seccomp filter on top of
-# this one and lowers its rlimits, so seccomp and @resources stay allowed.
+# System calls. The parser worker installs Landlock and its own seccomp filter
+# on top of this one and lowers its rlimits, so the landlock_* calls, seccomp
+# and @resources stay allowed. @system-service has no landlock_* calls, and
+# systemd 252 (Debian 12) has no @sandbox group, so they are listed by name.
 SystemCallArchitectures=native
-SystemCallFilter=@system-service seccomp
+SystemCallFilter=@system-service seccomp landlock_create_ruleset landlock_add_rule landlock_restrict_self
 SystemCallFilter=~@privileged @mount @debug @cpu-emulation @obsolete @raw-io @reboot @swap
 SystemCallErrorNumber=EPERM
 

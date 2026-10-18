@@ -1,0 +1,4 @@
+# mkosi runs `systemctl preset-all` after mkosi.postinst.chroot, which would
+# enable currawongd again. The wizard enables it once the config and
+# certificate exist; until then it would only fail and restart.
+disable currawongd.service

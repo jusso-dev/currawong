@@ -67,7 +67,9 @@ impl Answers {
             scanner: Scanner {
                 clamd: Clamd {
                     address: if self.clamd { CLAMD_SOCKET } else { "" },
-                    required: true,
+                    // Off means the operator chose to run without ClamAV.
+                    // Required with no address fails config validation.
+                    required: self.clamd,
                 },
             },
         };
@@ -304,7 +306,12 @@ mod tests {
     fn clamd_off_writes_empty_address() {
         let mut answers = sample();
         answers.clamd = false;
-        let cfg: currawong_core::Config = toml::from_str(&answers.to_toml()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("currawong.toml");
+        std::fs::write(&path, answers.to_toml()).unwrap();
+        let cfg = currawong_core::Config::load(&path).unwrap();
+        cfg.validate().unwrap();
         assert_eq!(cfg.scanner.clamd.address, "");
+        assert!(!cfg.scanner.clamd.required);
     }
 }
