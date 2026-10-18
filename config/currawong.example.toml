@@ -358,7 +358,10 @@ listen = "127.0.0.1:8026"
 base_url = "https://secure.example.com.au"
 from = ""
 retention_days = 30
+# Per client address and per held message. The client address comes from
+# X-Forwarded-For only when the peer is one of trusted_proxies.
 requests_per_minute = 10
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
 
 
 # events: export to SIEMs (schema in docs/events.md). Every sink is off until configured.

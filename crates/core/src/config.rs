@@ -476,8 +476,12 @@ pub struct PortalConfig {
     pub from: String,
     /// Days a held message can be opened.
     pub retention_days: u64,
-    /// Code requests and code attempts per minute from one client address.
+    /// Code requests and code attempts per minute, per client address and
+    /// per held message.
     pub requests_per_minute: u32,
+    /// Reverse proxies (CIDRs) whose `X-Forwarded-For` is believed. From any
+    /// other peer the header is ignored and the peer address is the client.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for PortalConfig {
@@ -491,6 +495,7 @@ impl Default for PortalConfig {
             from: String::new(),
             retention_days: 30,
             requests_per_minute: 10,
+            trusted_proxies: vec!["127.0.0.1/32".into(), "::1/128".into()],
         }
     }
 }
@@ -1033,6 +1038,15 @@ impl Config {
                         .into(),
                 ));
             }
+            if let Some(bad) = portal
+                .trusted_proxies
+                .iter()
+                .find(|cidr| cidr.parse::<ipnet::IpNet>().is_err())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "encrypt.portal.trusted_proxies entry '{bad}' is not a CIDR"
+                )));
+            }
         }
         if self.limits.max_connections == 0 {
             return Err(ConfigError::Invalid(
@@ -1341,6 +1355,37 @@ mod tests {
             let err = cfg.validate().unwrap_err().to_string();
             assert!(err.contains(needle), "{needle}: {err}");
         }
+    }
+
+    #[test]
+    fn encrypt_portal_settings_are_validated() {
+        let mut cfg = Config::load(&example_path()).expect("example config");
+        cfg.encrypt.portal.enabled = true;
+        cfg.validate().expect("example portal settings are valid");
+        type Edit = fn(&mut PortalConfig);
+        let cases: [(Edit, &str); 5] = [
+            (
+                |p| p.base_url = "http://secure.example.com.au".into(),
+                "base_url",
+            ),
+            (|p| p.listen = "localhost".into(), "listen"),
+            (|p| p.retention_days = 0, "retention_days"),
+            (|p| p.requests_per_minute = 0, "requests_per_minute"),
+            (
+                |p| p.trusted_proxies = vec!["10.0.0.0/33".into()],
+                "trusted_proxies",
+            ),
+        ];
+        for (edit, needle) in cases {
+            let mut bad = cfg.clone();
+            edit(&mut bad.encrypt.portal);
+            let err = bad.validate().unwrap_err().to_string();
+            assert!(err.contains(needle), "{needle}: {err}");
+        }
+        // Off, the portal settings are not checked.
+        cfg.encrypt.portal.enabled = false;
+        cfg.encrypt.portal.base_url.clear();
+        cfg.validate().expect("disabled portal is not validated");
     }
 
     #[test]

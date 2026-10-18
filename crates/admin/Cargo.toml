@@ -10,6 +10,7 @@ currawong-dlp = { path = "../dlp" }
 async-trait = { workspace = true }
 axum = { workspace = true }
 governor = { workspace = true }
+ipnet = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

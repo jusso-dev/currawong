@@ -7,7 +7,7 @@ use crate::{pipeline::Pipeline, scheduler::derived_id};
 use async_trait::async_trait;
 use currawong_admin::routes::portal::CodeMailer;
 use currawong_core::{config::Config, Direction, TlsRequirement};
-use currawong_dlp::encrypt::{code_mail, notice, smime::Recipient};
+use currawong_dlp::encrypt::{code_mail, notice, smime::Recipient, Issued, Route};
 use currawong_policy::{Action, Decision};
 use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
@@ -104,14 +104,24 @@ pub async fn deliver_encrypted(
     };
     let from = sender(cfg);
     let base = cfg.encrypt.portal.base_url.trim_end_matches('/');
+    // The code mail later follows the notice: same tenant, same TLS policy.
+    let route = Route {
+        tenant_id: env.tenant_id.clone(),
+        tls: env.tls,
+    };
     for rcpt in env.rcpt_to.clone() {
         let id = derived_id(&env.id, &format!("portal\n{rcpt}"));
         if spool.load(&id).await.is_ok() {
             continue;
         }
-        let (store, owned, to) = (Arc::clone(&portal), raw.to_vec(), rcpt.clone());
+        let (store, owned, to, route) = (
+            Arc::clone(&portal),
+            raw.to_vec(),
+            rcpt.clone(),
+            route.clone(),
+        );
         let token = tokio::task::spawn_blocking(move || {
-            store.store(&to, &owned, now.unix_timestamp() as u64)
+            store.store(&to, &owned, &route, now.unix_timestamp() as u64)
         })
         .await
         .map_err(|err| err.to_string())?
@@ -223,7 +233,9 @@ fn rfc5322(at: OffsetDateTime) -> String {
         .unwrap_or_else(|_| "Thu, 01 Jan 1970 00:00:00 +0000".into())
 }
 
-/// Mails portal codes by spooling them for delivery.
+/// Mails portal codes by spooling them for delivery. The code opens the
+/// message, so it never goes in clear: at least `require_tls`, and DANE when
+/// the held message's policy asked for it.
 pub struct SpoolMailer {
     pub spool: Arc<Spool>,
     pub cfg: Arc<Config>,
@@ -231,20 +243,21 @@ pub struct SpoolMailer {
 
 #[async_trait]
 impl CodeMailer for SpoolMailer {
-    async fn send_code(&self, recipient: &str, code: &str) -> Result<(), String> {
+    async fn send_code(&self, issued: &Issued) -> Result<(), String> {
         let from = sender(&self.cfg);
+        let recipient = issued.recipient.as_str();
         let id = Envelope::new_id();
         let now = OffsetDateTime::now_utc();
         let body = code_mail(
             &from,
             recipient,
-            code,
+            &issued.code,
             &rfc5322(now),
             &format!("{id}@{}", self.cfg.gateway.hostname),
         );
         let env = Envelope {
             id,
-            tenant_id: None,
+            tenant_id: issued.route.tenant_id.clone(),
             authenticated_as: None,
             mail_from: from,
             rcpt_to: vec![recipient.to_string()],
@@ -260,7 +273,7 @@ impl CodeMailer for SpoolMailer {
             rcpt_status: Vec::new(),
             prepend_headers: Vec::new(),
             dsn_sent: false,
-            tls: TlsRequirement::None,
+            tls: issued.route.tls.max(TlsRequirement::Required),
             pipeline: "deliver".into(),
         };
         self.spool

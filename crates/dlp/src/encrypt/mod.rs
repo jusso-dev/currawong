@@ -4,7 +4,7 @@ pub mod portal;
 #[cfg(feature = "smime")]
 pub mod smime;
 
-pub use portal::{code_mail, notice, PortalError, PortalStore};
+pub use portal::{code_mail, notice, Issued, PortalError, PortalStore, Route};
 
 /// Header fields and body of a message, split at the first empty line.
 /// Each field keeps its folded continuation lines and its line ending.

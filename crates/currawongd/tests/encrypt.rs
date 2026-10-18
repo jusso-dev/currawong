@@ -1,14 +1,15 @@
 //! Policy TLS and encryption actions through the classify pass.
+use currawong_admin::routes::portal::CodeMailer;
 use currawong_auth::AuthChecker;
 use currawong_core::{
     config::{Config, TenantConfig},
     Direction, MessageId, TlsRequirement,
 };
-use currawong_dlp::encrypt::PortalStore;
+use currawong_dlp::encrypt::{PortalStore, Route};
 use currawong_policy::{default_pack, Action, Condition, Policy, PolicySet, Scope};
 use currawong_quarantine::QuarantineStore;
 use currawong_spool::{Envelope, Spool, SpoolState};
-use currawongd::{classify_pending, Pipeline};
+use currawongd::{classify_pending, Pipeline, SpoolMailer};
 use std::{io::Cursor, sync::Arc};
 use time::OffsetDateTime;
 
@@ -185,13 +186,52 @@ async fn encrypt_portal_holds_the_message_and_sends_a_link() {
     let portal = &h.cfg.encrypt.portal;
     let store = PortalStore::open(&portal.dir, &portal.key_path, 30).unwrap();
     let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
-    let (rcpt, code) = store.issue_code(&token, now).unwrap();
-    assert_eq!(rcpt, "ops@partner.test");
-    assert_eq!(store.open_message(&token, &code, now).unwrap(), RAW);
+    let issued = store.issue_code(&token, now).unwrap();
+    assert_eq!(issued.recipient, "ops@partner.test");
+    assert_eq!(
+        issued.route,
+        Route {
+            tenant_id: Some("t1".into()),
+            tls: TlsRequirement::Required,
+        }
+    );
+    assert_eq!(store.open_message(&token, &issued.code, now).unwrap(), RAW);
 
     // Classifying again sends nothing more.
     h.classify().await;
     assert_eq!(h.outgoing().await.len(), 1);
+}
+
+#[tokio::test]
+async fn portal_code_mail_follows_the_route_and_never_goes_in_clear() {
+    let h = Harness::new(Vec::new(), |_, _| {}).await;
+    let mailer = SpoolMailer {
+        spool: Arc::new(Spool::open(&h.cfg.spool.dir).await.unwrap()),
+        cfg: Arc::new(h.cfg.clone()),
+    };
+    for (asked, sent) in [
+        (TlsRequirement::None, TlsRequirement::Required),
+        (TlsRequirement::Dane, TlsRequirement::Dane),
+    ] {
+        let issued = currawong_dlp::encrypt::Issued {
+            recipient: "ops@partner.test".into(),
+            code: "123456".into(),
+            route: Route {
+                tenant_id: Some("t1".into()),
+                tls: asked,
+            },
+        };
+        mailer.send_code(&issued).await.unwrap();
+        let outgoing = h.outgoing().await;
+        let (env, body) = outgoing
+            .iter()
+            .find(|(env, _)| env.tls == sent)
+            .expect("code mail spooled");
+        assert_eq!(env.rcpt_to, ["ops@partner.test"]);
+        assert_eq!(env.tenant_id.as_deref(), Some("t1"));
+        assert_eq!(env.direction, Direction::Outbound);
+        assert!(String::from_utf8_lossy(body).contains("123456"));
+    }
 }
 
 #[tokio::test]

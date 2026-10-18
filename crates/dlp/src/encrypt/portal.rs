@@ -3,12 +3,14 @@
 //! code, which is mailed to them and is valid for ten minutes; five wrong
 //! codes lock the message for good.
 //!
-//! Files per message in `dir`: `<token>.bin` (nonce and ciphertext) and
-//! `<token>.json` (recipient, expiry, code hash and failure count).
+//! Files per message in `dir`: `<token>.json` (recipient, route, expiry,
+//! code hash and failure count), written first, and `<token>.bin` (nonce
+//! and ciphertext).
 use aes_gcm::{
     aead::{Aead, Payload},
     Aes256Gcm, KeyInit, Nonce,
 };
+use currawong_core::TlsRequirement;
 use rand::{Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -45,9 +47,29 @@ pub enum PortalError {
     Store(String),
 }
 
+/// How mail for a held message is sent: the code mail goes the same way as
+/// the original, with at least `require_tls`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Route {
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub tls: TlsRequirement,
+}
+
+/// A code to mail to `recipient`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Issued {
+    pub recipient: String,
+    pub code: String,
+    pub route: Route,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Record {
     recipient: String,
+    #[serde(default)]
+    route: Route,
     /// Unix seconds.
     created_at: u64,
     expires_at: u64,
@@ -89,7 +111,13 @@ impl PortalStore {
     }
 
     /// Hold `raw` for `recipient`. Returns the link token.
-    pub fn store(&self, recipient: &str, raw: &[u8], now: u64) -> Result<String, PortalError> {
+    pub fn store(
+        &self,
+        recipient: &str,
+        raw: &[u8],
+        route: &Route,
+        now: u64,
+    ) -> Result<String, PortalError> {
         let mut bytes = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut bytes);
         let token = hex::encode(bytes);
@@ -107,9 +135,9 @@ impl PortalStore {
             .map_err(store_err)?;
         let mut blob = nonce.to_vec();
         blob.extend(sealed);
-        write_atomic(&self.path(&token, "bin"), &blob)?;
         let record = Record {
             recipient: recipient.to_string(),
+            route: route.clone(),
             created_at: now,
             expires_at: now.saturating_add(self.retention_secs),
             code_hash: None,
@@ -117,7 +145,13 @@ impl PortalStore {
             code_issued_at: 0,
             failures: 0,
         };
+        // The record first: `purge_expired` walks records, so a sealed body
+        // never outlives a failed write unseen.
         self.save(&token, &record)?;
+        if let Err(err) = write_atomic(&self.path(&token, "bin"), &blob) {
+            let _ = fs::remove_file(self.path(&token, "json"));
+            return Err(err);
+        }
         Ok(token)
     }
 
@@ -132,7 +166,7 @@ impl PortalStore {
 
     /// A new six digit code for the message. The caller mails it to the
     /// returned recipient; it replaces any earlier code.
-    pub fn issue_code(&self, token: &str, now: u64) -> Result<(String, String), PortalError> {
+    pub fn issue_code(&self, token: &str, now: u64) -> Result<Issued, PortalError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut record = self.load(token)?;
         self.usable(&record, now)?;
@@ -147,7 +181,22 @@ impl PortalStore {
         record.code_issued_at = now;
         record.code_expires_at = now.saturating_add(CODE_TTL_SECS);
         self.save(token, &record)?;
-        Ok((record.recipient, code))
+        Ok(Issued {
+            recipient: record.recipient,
+            code,
+            route: record.route,
+        })
+    }
+
+    /// Clear a lock and any live code, for an administrator who has
+    /// confirmed the recipient. The recipient then asks for a new code.
+    pub fn unlock(&self, token: &str) -> Result<(), PortalError> {
+        let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
+        let mut record = self.load(token)?;
+        record.failures = 0;
+        record.code_hash = None;
+        record.code_issued_at = 0;
+        self.save(token, &record)
     }
 
     /// The message, when `code` is the live code. A used code is spent.
@@ -191,12 +240,18 @@ impl PortalStore {
             .map_err(|_| PortalError::Store(format!("{token} does not decrypt with this key")))
     }
 
-    /// Delete messages past their retention. Returns how many went.
+    /// Delete messages past their retention, and sealed bodies left without
+    /// a record by a crash. Returns how many messages went.
     pub fn purge_expired(&self, now: u64) -> Result<usize, PortalError> {
         let _guard = self.lock.lock().unwrap_or_else(|p| p.into_inner());
         let mut removed = 0;
         for entry in fs::read_dir(&self.dir).map_err(store_err)?.flatten() {
             let path = entry.path();
+            if path.extension().is_some_and(|x| x == "bin") && !path.with_extension("json").exists()
+            {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
             let Some(token) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -353,10 +408,8 @@ fn load_key(path: &Path, held: bool) -> Result<Zeroizing<[u8; 32]>, PortalError>
     }
     let mut key = Zeroizing::new([0u8; 32]);
     rand::rngs::OsRng.fill_bytes(key.as_mut());
-    let mut file = private_file(path)?;
-    file.write_all(key.as_ref())
-        .and_then(|_| file.sync_all())
-        .map_err(store_err)?;
+    // Written beside it and renamed, so a crash never leaves a short key.
+    write_atomic(path, key.as_ref())?;
     Ok(key)
 }
 
@@ -383,7 +436,12 @@ mod tests {
     fn encrypt_portal_opens_only_with_the_right_code() {
         let (dir, store) = store();
         let token = store
-            .store("partner@partner.example.com.au", MESSAGE, NOW)
+            .store(
+                "partner@partner.example.com.au",
+                MESSAGE,
+                &Route::default(),
+                NOW,
+            )
             .unwrap();
         // Sealed at rest.
         let blob = fs::read(dir.path().join("held").join(format!("{token}.bin"))).unwrap();
@@ -392,7 +450,11 @@ mod tests {
             store.open_message(&token, "000000", NOW),
             Err(PortalError::NoCode)
         );
-        let (rcpt, code) = store.issue_code(&token, NOW).unwrap();
+        let Issued {
+            recipient: rcpt,
+            code,
+            ..
+        } = store.issue_code(&token, NOW).unwrap();
         assert_eq!(rcpt, "partner@partner.example.com.au");
         assert_eq!(code.len(), 6);
         assert!(code.bytes().all(|b| b.is_ascii_digit()));
@@ -418,9 +480,14 @@ mod tests {
     fn encrypt_portal_locks_after_five_wrong_codes() {
         let (_dir, store) = store();
         let token = store
-            .store("partner@partner.example.com.au", MESSAGE, NOW)
+            .store(
+                "partner@partner.example.com.au",
+                MESSAGE,
+                &Route::default(),
+                NOW,
+            )
             .unwrap();
-        let (_, code) = store.issue_code(&token, NOW).unwrap();
+        let Issued { code, .. } = store.issue_code(&token, NOW).unwrap();
         for remaining in (1..MAX_FAILURES).rev() {
             assert_eq!(
                 store.open_message(&token, &wrong(&code), NOW),
@@ -445,8 +512,10 @@ mod tests {
     #[test]
     fn encrypt_portal_code_expires_after_ten_minutes_and_is_rate_limited() {
         let (_dir, store) = store();
-        let token = store.store("a@example.com.au", MESSAGE, NOW).unwrap();
-        let (_, code) = store.issue_code(&token, NOW).unwrap();
+        let token = store
+            .store("a@example.com.au", MESSAGE, &Route::default(), NOW)
+            .unwrap();
+        let Issued { code, .. } = store.issue_code(&token, NOW).unwrap();
         assert_eq!(
             store.issue_code(&token, NOW + 10),
             Err(PortalError::RateLimited { retry_after: 50 })
@@ -455,7 +524,7 @@ mod tests {
             store.open_message(&token, &code, NOW + CODE_TTL_SECS + 1),
             Err(PortalError::NoCode)
         );
-        let (_, fresh) = store.issue_code(&token, NOW + CODE_TTL_SECS + 1).unwrap();
+        let Issued { code: fresh, .. } = store.issue_code(&token, NOW + CODE_TTL_SECS + 1).unwrap();
         assert_eq!(
             store
                 .open_message(&token, &fresh, NOW + CODE_TTL_SECS + 2)
@@ -467,7 +536,9 @@ mod tests {
     #[test]
     fn encrypt_portal_messages_expire_and_purge() {
         let (dir, store) = store();
-        let token = store.store("a@example.com.au", MESSAGE, NOW).unwrap();
+        let token = store
+            .store("a@example.com.au", MESSAGE, &Route::default(), NOW)
+            .unwrap();
         let late = NOW + 31 * 86_400;
         assert_eq!(store.issue_code(&token, late), Err(PortalError::Expired));
         assert_eq!(store.purge_expired(NOW).unwrap(), 0);
@@ -481,14 +552,68 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (held, key) = (dir.path().join("held"), dir.path().join("key"));
         let store = PortalStore::open(&held, &key, 30).unwrap();
-        let token = store.store("a@example.com.au", MESSAGE, NOW).unwrap();
+        let token = store
+            .store("a@example.com.au", MESSAGE, &Route::default(), NOW)
+            .unwrap();
         drop(store);
         // Reopened with the same key, the message still opens.
         let store = PortalStore::open(&held, &key, 30).unwrap();
-        let (_, code) = store.issue_code(&token, NOW).unwrap();
+        let Issued { code, .. } = store.issue_code(&token, NOW).unwrap();
         assert_eq!(store.open_message(&token, &code, NOW).unwrap(), MESSAGE);
         // A lost key is not silently replaced while messages are held.
         fs::remove_file(&key).unwrap();
         assert!(PortalStore::open(&held, &key, 30).is_err());
+    }
+
+    #[test]
+    fn encrypt_portal_keeps_the_route_and_unlocks() {
+        let (_dir, store) = store();
+        let route = Route {
+            tenant_id: Some("t1".into()),
+            tls: TlsRequirement::Dane,
+        };
+        let token = store
+            .store("a@example.com.au", MESSAGE, &route, NOW)
+            .unwrap();
+        let issued = store.issue_code(&token, NOW).unwrap();
+        assert_eq!(issued.route, route);
+        for _ in 0..MAX_FAILURES {
+            let _ = store.open_message(&token, &wrong(&issued.code), NOW);
+        }
+        assert_eq!(
+            store.issue_code(&token, NOW + 120),
+            Err(PortalError::Locked)
+        );
+        store.unlock(&token).unwrap();
+        // The old code is gone; a new one opens the message.
+        assert_eq!(
+            store.open_message(&token, &issued.code, NOW + 120),
+            Err(PortalError::NoCode)
+        );
+        let fresh = store.issue_code(&token, NOW + 121).unwrap();
+        assert_eq!(
+            store.open_message(&token, &fresh.code, NOW + 122).unwrap(),
+            MESSAGE
+        );
+        assert_eq!(store.unlock(&"f".repeat(64)), Err(PortalError::NotFound));
+    }
+
+    #[test]
+    fn encrypt_portal_purges_sealed_bodies_without_a_record() {
+        let (dir, store) = store();
+        let held = dir.path().join("held");
+        let token = store
+            .store("a@example.com.au", MESSAGE, &Route::default(), NOW)
+            .unwrap();
+        let orphan = held.join(format!("{}.bin", "a".repeat(64)));
+        fs::write(&orphan, b"sealed").unwrap();
+        assert_eq!(store.purge_expired(NOW).unwrap(), 0);
+        assert!(!orphan.exists());
+        assert!(held.join(format!("{token}.bin")).exists());
+        // No temporary files are left behind by the key or record writes.
+        assert!(fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .all(|e| e.path().extension().is_none_or(|x| x != "tmp")));
     }
 }

@@ -1141,6 +1141,7 @@ dependencies = [
  "currawong-core",
  "currawong-dlp",
  "governor",
+ "ipnet",
  "serde",
  "tempfile",
  "tokio",

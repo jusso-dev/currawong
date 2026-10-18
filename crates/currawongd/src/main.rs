@@ -174,7 +174,18 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             spool: Arc::clone(&spool),
             cfg: Arc::clone(&cfg),
         });
-        let state = PortalState::new(Arc::clone(&store), mailer, portal.requests_per_minute);
+        let proxies = portal
+            .trusted_proxies
+            .iter()
+            .map(|cidr| cidr.parse())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| format!("encrypt.portal.trusted_proxies: {err}"))?;
+        let state = PortalState::new(
+            Arc::clone(&store),
+            mailer,
+            portal.requests_per_minute,
+            proxies,
+        );
         let listener = TcpListener::bind(&portal.listen)
             .await
             .map_err(|err| format!("encrypt.portal.listen {}: {err}", portal.listen))?;
