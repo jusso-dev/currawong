@@ -112,3 +112,37 @@ id = "spam-tag"
 priority = 70
 conditions = [{ score = { name = "spam", at_least = 5.0, below = 8.0 } }]
 actions = [{ add_header = { name = "X-Currawong-Spam", value = "[SPAM]" } }]
+
+# Link rewriting (`[url_rewrite]`) left some links as they were: a signed
+# part with a well-formed signature, a charset or encoding it cannot read, an
+# over-long link, or a whole message over the size, link or nesting limits.
+# Those links get no click-time check. Signatures are not verified, so a
+# signed wrapper is no proof of the sender: when DMARC fails the mail is
+# held; when DMARC did not pass (no record, or none evaluated) it carries a
+# warning header mail clients and transport rules can show. Mail with no
+# DMARC record is too common to hold on this alone.
+[[policy]]
+id = "url-rewrite-skipped-dmarc-fail"
+priority = 79
+conditions = [
+    { direction = "inbound" },
+    { flag = "url_rewrite.skipped" },
+    { auth = { method = "dmarc", result = "fail" } },
+]
+actions = [{ quarantine = "url-rewrite" }]
+
+[[policy]]
+id = "url-rewrite-skipped"
+priority = 80
+conditions = [{ direction = "inbound" }, { flag = "url_rewrite.skipped" }]
+actions = [{ add_header = { name = "X-Currawong-Links", value = "not-rewritten" } }]
+
+[[policy]]
+id = "url-rewrite-skipped-unauthenticated"
+priority = 81
+conditions = [
+    { direction = "inbound" },
+    { flag = "url_rewrite.skipped" },
+    { not = { auth = { method = "dmarc", result = "pass" } } },
+]
+actions = [{ add_header = { name = "X-Currawong-Warning", value = "links from an unauthenticated sender were not checked" } }]

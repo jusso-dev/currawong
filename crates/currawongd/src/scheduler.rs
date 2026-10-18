@@ -12,6 +12,10 @@ use time::OffsetDateTime;
 
 use crate::pipeline::Pipeline;
 
+/// A copy made from a split plan and not yet acted on. Neither classified
+/// nor delivered; the original's retry finishes it.
+const SPLIT: &str = "split";
+
 /// Tenant redirect and bcc are skipped once mail has passed through this
 /// gateway this many times. Platform and mandatory ones always apply.
 const MAX_OWN_HOPS: usize = 3;
@@ -27,6 +31,10 @@ struct Plan {
     headers: Vec<String>,
     bounce: bool,
     groups: Vec<Vec<Decision>>,
+    /// Delivered copies carry rewritten links. A retry rebuilds the same
+    /// bytes, which the headers above were computed over.
+    #[serde(default)]
+    rewritten: bool,
     /// The authenticated From address to remember once the message is
     /// delivered, for BEC first-time sender checks.
     #[serde(default)]
@@ -83,13 +91,48 @@ async fn classify_one(
         .await
         .map_err(|err| err.to_string())?;
     let body_path = spool_body(spool, &env);
+    // A copy of the arrival bytes outlives a crash between storing
+    // rewritten links and marking the message for delivery: put it back and
+    // classify what arrived, not our own output.
+    let original = original_path(spool, &env.id);
+    let raw = match (tokio::fs::read(&original).await, body_path.as_deref()) {
+        (Ok(saved), Some(path)) => {
+            crate::pipeline::rewrite_body(path, &saved)
+                .await
+                .map_err(|err| format!("could not restore the original body: {err}"))?;
+            let _ = tokio::fs::remove_file(&original).await;
+            saved
+        }
+        _ => raw,
+    };
     let raw = pipeline.strip_spooled(&raw, body_path.as_deref()).await?;
     let plan_path = plan_path(spool, &env.id);
     let mut bimi_auth = None;
+    // The body delivered copies get when links were rewritten. Quarantine
+    // and bounces keep the original.
+    let mut rewritten_body = None;
     let plan = match tokio::fs::read(&plan_path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| err.to_string())?,
+        Ok(bytes) => {
+            let plan: Plan = serde_json::from_slice(&bytes).map_err(|err| err.to_string())?;
+            if plan.rewritten {
+                // Every recipient of the plan, as on the first pass, though
+                // the envelope may already be narrowed to the first group.
+                let mut whole = env.clone();
+                whole.rcpt_to = plan
+                    .groups
+                    .iter()
+                    .flatten()
+                    .map(|d| d.recipient.clone())
+                    .collect();
+                let mut report = ScanReport::new(env.id.clone());
+                rewritten_body = pipeline.rewrite_urls(&whole, &raw, &mut report).await;
+            }
+            plan
+        }
         Err(_) => {
-            let (report, decision) = pipeline.assess(&env, &raw, body_path.as_deref()).await;
+            let (report, decision, rewritten) = pipeline
+                .assess_for_delivery(&env, &raw, body_path.as_deref())
+                .await;
             bimi_auth = report.auth.clone();
             let mut groups: Vec<Vec<Decision>> = decision
                 .split()
@@ -100,10 +143,16 @@ async fn classify_one(
                 .iter()
                 .flatten()
                 .any(|d| matches!(d.verdict, Verdict::Deliver));
+            if delivers {
+                rewritten_body = rewritten;
+            }
             let headers = if !delivers {
                 pipeline.auth_headers(&env, &report)
             } else {
-                match pipeline.delivery_headers(&env, &raw, &report).await {
+                match pipeline
+                    .delivery_headers_for(&env, &raw, rewritten_body.as_deref(), &report)
+                    .await
+                {
                     Ok(headers) => headers,
                     // Never send a tenant's mail unsigned when it has a key.
                     Err(reason) => {
@@ -124,6 +173,7 @@ async fn classify_one(
                 bounce: bounce_allowed(&env, &report, &raw),
                 history_sender: pipeline.history_sender(&env, &raw, &report),
                 groups,
+                rewritten: rewritten_body.is_some(),
             };
             if plan.groups.len() > 1 {
                 write_atomic(
@@ -156,21 +206,34 @@ async fn classify_one(
             let mut sorted = rcpts.clone();
             sorted.sort();
             let id = derived_id(&env.id, &sorted.join("\n"));
-            if spool.load(&id).await.is_ok() {
+            if let Ok(existing) = spool.load(&id).await {
+                // A crash between making the copy and acting on it left it
+                // marked `split`: finish it from the plan. It is never
+                // classified on its own (its body may carry rewritten links).
+                if existing.pipeline == SPLIT {
+                    act(
+                        spool, quarantine, cfg, existing, &raw, &group[0], &plan, None,
+                    )
+                    .await?;
+                }
                 continue;
             }
             let mut copy = env.clone();
             copy.id = id;
             copy.state = SpoolState::Incoming;
             copy.next_attempt_at = None;
-            copy.pipeline = "pending".into();
+            copy.pipeline = SPLIT.into();
             narrow(&mut copy, &rcpts);
             tracing::info!(id = %env.id, split = %copy.id, "recipients differ, message split");
+            let body = match (&rewritten_body, &group[0].verdict) {
+                (Some(rewritten), Verdict::Deliver) => rewritten.clone(),
+                _ => raw.clone(),
+            };
             spool
-                .accept(copy.clone(), Cursor::new(raw.clone()))
+                .accept(copy.clone(), Cursor::new(body))
                 .await
                 .map_err(|err| err.to_string())?;
-            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan).await?;
+            act(spool, quarantine, cfg, copy, &raw, &group[0], &plan, None).await?;
         }
         let rcpts: Vec<String> = plan.groups[0].iter().map(|d| d.recipient.clone()).collect();
         narrow(&mut env, &rcpts);
@@ -179,7 +242,18 @@ async fn classify_one(
     }
     let id = env.id.clone();
     let quarantined = matches!(plan.groups[0][0].verdict, Verdict::Quarantine { .. });
-    act(spool, quarantine, cfg, env, &raw, &plan.groups[0][0], &plan).await?;
+    let rewritten = rewritten_body.as_deref();
+    act(
+        spool,
+        quarantine,
+        cfg,
+        env,
+        &raw,
+        &plan.groups[0][0],
+        &plan,
+        rewritten,
+    )
+    .await?;
     if let (true, Some(auth)) = (quarantined, bimi_auth) {
         pipeline.queue_bimi(id, auth);
     }
@@ -190,6 +264,8 @@ async fn classify_one(
     Ok(())
 }
 
+/// `rewritten` replaces the spool body when the message is delivered.
+#[allow(clippy::too_many_arguments)]
 async fn act(
     spool: &Spool,
     quarantine: &QuarantineStore,
@@ -198,6 +274,7 @@ async fn act(
     raw: &[u8],
     decision: &Decision,
     plan: &Plan,
+    rewritten: Option<&[u8]>,
 ) -> Result<(), String> {
     tracing::info!(id = %env.id, explanation = %decision.explanation.join("; "), "policy decision");
     // Replace, never extend: a re-evaluated deferred message must not
@@ -225,9 +302,20 @@ async fn act(
     };
     match verdict {
         Verdict::Deliver => {
+            let original = original_path(spool, &env.id);
+            if let Some(body) = rewritten {
+                let path = spool_body(spool, &env).ok_or("spool body missing")?;
+                write_atomic(&original, raw).await?;
+                crate::pipeline::rewrite_body(&path, body)
+                    .await
+                    .map_err(|err| format!("could not store rewritten links: {err}"))?;
+            }
             apply_actions(&mut env, decision, cfg, raw);
             env.pipeline = "deliver".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
+            if rewritten.is_some() {
+                let _ = tokio::fs::remove_file(&original).await;
+            }
         }
         Verdict::Defer { reason } => {
             env.pipeline = "scan_defer".into();
@@ -357,6 +445,11 @@ fn derived_id(id: &MessageId, salt: &str) -> MessageId {
     MessageId(hex::encode_upper(digest)[..26].to_string())
 }
 
+/// The arrival bytes of a message whose rewritten body is being stored.
+fn original_path(spool: &Spool, id: &MessageId) -> PathBuf {
+    spool.root().join("rewrite").join(format!("{id}.eml"))
+}
+
 fn plan_path(spool: &Spool, id: &MessageId) -> PathBuf {
     spool.root().join("split").join(format!("{id}.json"))
 }
@@ -375,6 +468,9 @@ async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), String
         .map_err(|err| err.to_string())?;
     file.sync_all().await.map_err(|err| err.to_string())?;
     tokio::fs::rename(&tmp, path)
+        .await
+        .map_err(|err| err.to_string())?;
+    crate::pipeline::sync_dir(dir)
         .await
         .map_err(|err| err.to_string())
 }

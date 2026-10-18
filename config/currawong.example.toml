@@ -342,6 +342,46 @@ history_database = "/var/lib/currawong/sender-history.sqlite"
 # database = "/var/lib/currawong/policy.db"
 forward_domains = []
 
+# url_rewrite: http(s) links in the text and HTML parts of delivered inbound
+# mail become <base_url>/u/<token>. The token is an HMAC-SHA256 signature over
+# the link, the message id, the recipients, the arrival time and an expiry.
+# Attachments and attached messages are left alone. Links in S/MIME or PGP
+# signed parts, in parts whose charset or encoding cannot be read, over-long
+# links, and every link of a message that cannot be rewritten (over
+# max_message_bytes, unparsable, more than 10,000 links) are left as they are
+# and set the `url_rewrite.skipped` policy flag; the default pack tags such
+# mail with `X-Currawong-Links: not-rewritten`.
+# url_rewrite.listen: the click service, plain HTTP. Put a TLS proxy for base_url in front of it.
+# url_rewrite.key_file: at least 32 bytes, for example `openssl rand -hex 32 > url.key`.
+#   Every node that serves clicks needs the same key. Changing it breaks delivered links.
+# url_rewrite.blocklist: one domain (blocks subdomains too) or http(s) URL prefix per
+#   line; `warn <entry>` shows a warning page instead, `allow <entry>` marks a known
+#   site. Read again when it changes, so a link blocked after delivery is refused at
+#   its next click.
+# url_rewrite.warn_unknown: links to sites without an `allow` line get the warning page.
+# url_rewrite.click_log: one JSON object per click (time, message id, recipients, link,
+#   action), mode 0600, rotated to <click_log>.1 past click_log_max_bytes. Clicks also go
+#   to the event bus as `url_click`.
+# url_rewrite.trusted_proxies: the TLS proxy's addresses (or CIDRs). Only from these is
+#   X-Forwarded-For used to find the client for the per-client limit.
+# url_rewrite.clicks_per_minute_*: limits on verified clicks only (bad tokens never count).
+#   The per-link limit is per recipient of the message, so an all-staff mail is not cut off.
+[url_rewrite]
+enabled = false
+base_url = "https://links.example.test"
+listen = "127.0.0.1:8090"
+key_file = "/etc/currawong/url.key"
+ttl_days = 7
+allow_domains = []
+# blocklist = "/etc/currawong/url-blocklist.txt"
+warn_unknown = false
+click_log = "/var/lib/currawong/clicks.jsonl"
+click_log_max_bytes = 67108864
+trusted_proxies = []
+clicks_per_minute_per_client = 600
+clicks_per_minute_per_link = 30
+max_message_bytes = 10485760
+
 # dlp: TFN, Medicare, ABN, ACN, driver's licence and payment card detection.
 # Outbound mail is scanned; set scan_inbound to scan inbound mail too.
 # dlp.min_confidence: 0 to 100. A bare TFN or Medicare number scores 40; the

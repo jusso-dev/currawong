@@ -16,6 +16,8 @@ currawong-classify = { path = "../classify" }
 currawong-parser-worker = { path = "../parser-worker" }
 currawong-policy = { path = "../policy" }
 currawong-quarantine = { path = "../quarantine" }
+currawong-admin = { path = "../admin" }
+ipnet = { workspace = true }
 currawong-dlp = { path = "../dlp" }
 currawong-integrations = { path = "../integrations" }
 tokio = { workspace = true }
