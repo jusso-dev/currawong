@@ -5,7 +5,9 @@
 //! Names produced today:
 //! - flags: `malware`, `active_content`, `fail_closed`, `defer`, plus part
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
-//!   `executable`, `limit_exceeded`; `yara` when any YARA rule matched and
+//!   `executable`, `limit_exceeded`, `html_smuggling`, `qr_code`,
+//!   `qr.skipped` (images not checked once the QR budget ran out); `qr_url`
+//!   when a QR code held a link; `yara` when any YARA rule matched and
 //!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
 //!   `dlp.incomplete` when some text could not be scanned for identifiers;
 //!   `pspf.invalid` (a protective marking that breaks the standard),
@@ -26,7 +28,7 @@
 //!   `lookalike` (the strongest finding, 0 to 1); `bec` (0 to 1, inbound only)
 //!   with flags `bec.<reason>` such as `bec.display_name_spoof` and
 //!   `bec.payment_change`.
-use currawong_core::{AuthResults, PartFlag, ScanReport};
+use currawong_core::{AuthResults, PartFlag, ScanReport, UrlSource};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -75,6 +77,15 @@ impl Signals {
         }
         signals.count("parts", report.parts.len() as u64);
         signals.count("urls", report.urls.len() as u64);
+        let qr_urls = report
+            .url_sources
+            .iter()
+            .filter(|found| found.source == UrlSource::Qr)
+            .count();
+        if qr_urls > 0 {
+            signals.flag("qr_url");
+            signals.count("qr_urls", qr_urls as u64);
+        }
         if let Some(dlp) = &report.dlp {
             for (kind, count) in &dlp.counts {
                 signals.count(&format!("dlp.{}", kind.as_str()), u64::from(*count));
@@ -151,6 +162,9 @@ fn part_flag(flag: PartFlag) -> &'static str {
         PartFlag::HasOleObject => "has_ole_object",
         PartFlag::Executable => "executable",
         PartFlag::LimitExceeded => "limit_exceeded",
+        PartFlag::HtmlSmuggling => "html_smuggling",
+        PartFlag::QrCode => "qr_code",
+        PartFlag::QrSkipped => "qr.skipped",
         PartFlag::Unscannable => "unscannable",
     }
 }

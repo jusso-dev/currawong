@@ -42,6 +42,12 @@ pub enum PartFlag {
     HasOleObject,
     Executable,
     LimitExceeded,
+    /// HTML that builds a file in the browser from an inline payload.
+    HtmlSmuggling,
+    /// An image or PDF page with a readable QR code.
+    QrCode,
+    /// Not checked for QR codes: the message's QR budget was used up.
+    QrSkipped,
     /// An archive or document that could not be opened (unsupported format,
     /// corrupt, RAR). Treated as a fail-closed scan.
     Unscannable,
@@ -56,6 +62,9 @@ impl PartFlag {
             Self::HasOleObject => "HasOleObject",
             Self::Executable => "Executable",
             Self::LimitExceeded => "LimitExceeded",
+            Self::HtmlSmuggling => "HtmlSmuggling",
+            Self::QrCode => "QrCode",
+            Self::QrSkipped => "QrSkipped",
             Self::Unscannable => "Unscannable",
         }
     }
@@ -177,12 +186,31 @@ pub struct YaraMatch {
     pub part: String,
 }
 
+/// Where the parser found a URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrlSource {
+    /// The raw message or a decoded MIME part.
+    Text,
+    /// A QR code in an image or a PDF page.
+    Qr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FoundUrl {
+    pub url: String,
+    pub source: UrlSource,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     pub message_id: MessageId,
     pub auth: Option<AuthResults>,
     pub parts: Vec<PartInfo>,
     pub urls: Vec<String>,
+    /// The parser's URLs with where each was found, for example a QR code.
+    #[serde(default)]
+    pub url_sources: Vec<FoundUrl>,
     pub engines: Vec<EngineFinding>,
     /// Every YARA rule match, for policy to act on by rule name or tag.
     #[serde(default)]
@@ -340,6 +368,7 @@ impl ScanReport {
             auth: None,
             parts: Vec::new(),
             urls: Vec::new(),
+            url_sources: Vec::new(),
             engines: Vec::new(),
             yara: Vec::new(),
             malware: false,

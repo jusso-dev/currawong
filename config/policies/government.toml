@@ -72,6 +72,18 @@ conditions = [{ flag = "active_content" }]
 actions = [{ quarantine = "active-content" }]
 
 [[policy]]
+id = "html-smuggling"
+priority = 31
+conditions = [{ flag = "html_smuggling" }]
+actions = [{ quarantine = "phishing" }]
+
+[[policy]]
+id = "qr-code-tag"
+priority = 75
+conditions = [{ flag = "qr_code" }]
+actions = [{ add_header = { name = "X-Currawong-QR-Code", value = "present" } }]
+
+[[policy]]
 id = "dmarc-reject"
 priority = 50
 conditions = [

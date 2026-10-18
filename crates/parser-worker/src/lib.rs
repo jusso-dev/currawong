@@ -3,12 +3,14 @@
 pub mod archive;
 pub mod filetype;
 pub mod fuzz;
+pub mod html_smuggling;
 pub mod ipc;
 pub mod office;
 pub mod parse;
+pub mod qr;
 pub mod sandbox;
 pub mod text;
 pub mod yara;
 
-pub use ipc::{LoadRules, ParseRequest, ParseResponse};
+pub use ipc::{FoundUrl, LoadRules, ParseRequest, ParseResponse, UrlSource};
 pub use parse::parse_request;
