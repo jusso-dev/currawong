@@ -5,8 +5,9 @@ use async_trait::async_trait;
 use currawong_core::config::{Config, DomainRoute, ExchangeVersion, MailboxPlatform};
 use currawong_smtp::{
     delivery::{
+        check_exchange_tls,
         mta_sts::{MtaSts, PolicyFetcher},
-        check_exchange_tls, Deliverer, DeliveryOutcome, OutboundTls,
+        Deliverer, DeliveryOutcome, OutboundTls,
     },
     dns::{MapDns, Tlsa},
     tls::build_server_config,
@@ -808,7 +809,6 @@ async fn exchange_setup(hosts: &[String], ca_pem: Option<&str>) -> Setup {
     setup
 }
 
-/// A port nothing listens on, so connecting is refused.
 /// A port that refuses connections. Port 1 (tcpmux) is privileged, so no
 /// test can bind it, and is outside every ephemeral range, so no other test
 /// can be handed it. Checked first, so a host that does run tcpmux fails
@@ -1055,7 +1055,10 @@ async fn exchange_tls_files_are_parsed_at_startup() {
     // The key belongs to another certificate.
     set_client(&mut setup, Some((cert.clone(), other_key)));
     let err = check_exchange_tls(&setup.cfg).unwrap_err();
-    assert!(err.contains("route example.test") && err.contains("client"), "{err}");
+    assert!(
+        err.contains("route example.test") && err.contains("client"),
+        "{err}"
+    );
 
     // Not PEM at all, an empty CA file, and a certificate file with no certificate.
     let junk = dir.join("junk.pem");

@@ -9,8 +9,8 @@ pub mod outbound_tls;
 pub mod route;
 
 use crate::{dns::DnsLookup, tlsrpt::TlsRpt};
-pub use exchange::check_exchange_tls;
 pub use dsn::{build_dsn, status_code};
+pub use exchange::check_exchange_tls;
 pub use outbound_tls::OutboundTls;
 pub use route::{resolve_route, RouteError};
 

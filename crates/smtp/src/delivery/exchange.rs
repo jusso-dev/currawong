@@ -71,8 +71,8 @@ impl ExchangeTlsCache {
         }
         let (tls, owned) = (tls.clone(), files.clone());
         let config = tokio::task::spawn_blocking(move || build(&tls, &owned))
-        .await
-        .map_err(|err| format!("4.7.5 TLS settings: {err}"))??;
+            .await
+            .map_err(|err| format!("4.7.5 TLS settings: {err}"))??;
         self.lock()
             .insert(files.clone(), (stamps, Arc::clone(&config)));
         Ok(config)
@@ -107,7 +107,11 @@ fn build(tls: &OutboundTls, files: &ExchangeTlsFiles) -> Result<Arc<ClientConfig
 pub fn check_exchange_tls(cfg: &Config) -> Result<(), String> {
     let tls = OutboundTls::webpki();
     for route in &cfg.domains.routes {
-        let Some(files) = route.platform.as_ref().and_then(ExchangeTlsFiles::from_platform) else {
+        let Some(files) = route
+            .platform
+            .as_ref()
+            .and_then(ExchangeTlsFiles::from_platform)
+        else {
             continue;
         };
         build(&tls, &files).map_err(|err| format!("route {}: {err}", route.domain))?;

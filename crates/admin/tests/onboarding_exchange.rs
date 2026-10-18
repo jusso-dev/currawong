@@ -167,7 +167,9 @@ fn onboarding_exchange_variants_match_golden() {
     // The backup still records the secure lists, so rollback does not depend
     // on which mode the wizard is in when it is run.
     assert!(scripts.transport.contains("ReceiveSecure = $receiveSecure"));
-    assert!(scripts.rollback.contains("if ($previous.ReceiveSecure -eq $false"));
+    assert!(scripts
+        .rollback
+        .contains("if ($previous.ReceiveSecure -eq $false"));
     // A missing lock-down backup is reported, not skipped silently.
     assert!(scripts
         .rollback

@@ -182,8 +182,9 @@ next_hop = "127.0.0.1:2526"
 # certificate must be valid for tls_cert_name; ca_file adds an internal CA to
 # the WebPKI roots for this route. client_cert and client_key (both or
 # neither, opt in; tls.cert is not used) are presented to a domain secure
-# Receive connector and must allow client authentication. Put the Exchange servers' source addresses in that
-# tenant's relay.tenants trusted_cidrs for outbound.
+# Receive connector and must allow client authentication. Put the Exchange
+# servers' source addresses in that tenant's relay.tenants trusted_cidrs for
+# outbound.
 # mailbox_platform = "m365" or "google_workspace" is a label only for now;
 # those routes use next_hop.
 # See docs/integrations/exchange-onprem.md.
