@@ -148,7 +148,7 @@ impl AcmeConfig {
             return invalid("domains must name at least one host".into());
         }
         for domain in &self.domains {
-            if !is_host_name(domain) {
+            if !domain.contains('.') || !is_host_name(domain) {
                 return invalid(format!(
                     "'{domain}' is not a host name (HTTP-01 cannot issue wildcards)"
                 ));
@@ -172,20 +172,6 @@ impl AcmeConfig {
             )),
         }
     }
-}
-
-fn is_host_name(name: &str) -> bool {
-    name.len() <= 253
-        && name.contains('.')
-        && name.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
