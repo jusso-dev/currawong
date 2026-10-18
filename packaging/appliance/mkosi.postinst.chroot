@@ -4,6 +4,7 @@ set -e
 
 # The wizard writes the real config, generates the certificate for the real
 # hostname and then enables currawongd. Do not start it before that.
+# mkosi's later preset-all would re-enable it; 10-currawong.preset prevents that.
 systemctl disable currawongd.service
 rm -f /etc/currawong/cert.pem /etc/currawong/key.pem
 
