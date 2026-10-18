@@ -1,0 +1,10 @@
+; DNS for Currawong in front of {{ c.version }}.
+; Currawong does not change DNS for you. Publish these once the connectors
+; are in place and the wizard's checks pass.
+{% for domain in c.domains -%}
+; {{ domain }}: replace the existing MX records with
+{{ domain }}. IN MX 10 {{ c.fqdn }}.
+; {{ domain }}: if it has an SPF record, add "{{ c.spf }}" before its "all"
+; term. If it has none, publish
+{{ domain }}. IN TXT "v=spf1 {{ c.spf }} -all"
+{% endfor -%}

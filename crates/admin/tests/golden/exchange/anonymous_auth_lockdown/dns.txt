@@ -1,0 +1,13 @@
+; DNS for Currawong in front of Exchange Server Subscription Edition.
+; Currawong does not change DNS for you. Publish these once the connectors
+; are in place and the wizard's checks pass.
+; health.example: replace the existing MX records with
+health.example. IN MX 10 mx.gateway.health.example.
+; health.example: if it has an SPF record, add "ip4:198.51.100.20 ip6:2001:db8::25" before its "all"
+; term. If it has none, publish
+health.example. IN TXT "v=spf1 ip4:198.51.100.20 ip6:2001:db8::25 -all"
+; clinic.health.example: replace the existing MX records with
+clinic.health.example. IN MX 10 mx.gateway.health.example.
+; clinic.health.example: if it has an SPF record, add "ip4:198.51.100.20 ip6:2001:db8::25" before its "all"
+; term. If it has none, publish
+clinic.health.example. IN TXT "v=spf1 ip4:198.51.100.20 ip6:2001:db8::25 -all"

@@ -4,3 +4,5 @@
 pub mod routes;
 
 pub use currawong_core::Error;
+
+pub mod onboarding;
