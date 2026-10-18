@@ -389,9 +389,16 @@ async fn decompression_bomb_hits_the_memory_limit() {
             "{parsed:?}"
         ),
     }
+    // The same worker goes on parsing. Each job used to start a thread with
+    // a 64 MiB stack, which failed for good (EAGAIN) once glibc malloc arenas
+    // for tokio's blocking threads had taken that address space.
     let small = message_file(&dir, "small.eml", PLAIN);
-    let next = pool.scan_file("small", &small, &limits()).await;
-    assert!(matches!(next, ScanOutcome::Parsed(_)), "{next:?}");
+    for n in 0..20 {
+        let next = pool
+            .scan_file(&format!("small-{n}"), &small, &limits())
+            .await;
+        assert!(matches!(next, ScanOutcome::Parsed(_)), "{n}: {next:?}");
+    }
 }
 
 fn script(dir: &tempfile::TempDir, body: &str) -> PathBuf {

@@ -13,10 +13,12 @@ use currawong_parser::yara::RulesCache;
 use currawong_parser::{parse_request, LoadRules, ParseRequest, ParseResponse};
 use futures::{SinkExt, StreamExt};
 use std::io;
+use std::sync::mpsc;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 fn main() {
     sandbox::close_inherited_fds();
+    sandbox::one_malloc_arena();
     let limits = WorkerLimits::from_env();
     let cfg = SandboxConfig::from_env();
     // Shared libraries (Pdfium, with the `pdfium` feature) are bound before
@@ -39,6 +41,13 @@ fn main() {
         println!("{}", serde_json::Value::Object(report));
         return;
     }
+    // The parse thread starts before any other, so its stack is in place
+    // before anything else takes address space.
+    let setup = setup.and_then(|warnings| {
+        Parser::spawn()
+            .map(|parser| (warnings, parser))
+            .map_err(|err| format!("parse thread: {err}"))
+    });
     // No I/O driver: stdin and stdout run on the blocking pool, and the I/O
     // driver brings tokio's signal driver, whose socketpair seccomp denies.
     let runtime = match tokio::runtime::Builder::new_current_thread().build() {
@@ -48,30 +57,30 @@ fn main() {
     runtime.block_on(serve(limits, setup));
 }
 
-async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
+async fn serve(limits: WorkerLimits, setup: Result<(Vec<String>, Parser), String>) {
     let mut writer = FramedWrite::new(tokio::io::stdout(), codec());
-    match setup {
+    let parser = match setup {
         Err(reason) => {
             let _ = writer
                 .send(encode(&ParseResponse::failed(STARTUP_ID, reason)))
                 .await;
             std::process::exit(1);
         }
-        Ok(warnings) => {
+        Ok((warnings, parser)) => {
             let mut ready = ParseResponse::failed(READY_ID, "");
             ready.error = None;
             ready.warnings = warnings;
             if writer.send(encode(&ready)).await.is_err() {
                 return;
             }
+            parser
         }
-    }
+    };
     // Requests are small, but YARA rule frames can be large.
     let request_codec = LengthDelimitedCodec::builder()
         .max_frame_length(LoadRules::MAX_FRAME_BYTES)
         .new_codec();
     let mut reader = FramedRead::new(tokio::io::stdin(), request_codec);
-    let mut rules = RulesCache::default();
     while let Some(frame) = reader.next().await {
         let frame = match frame {
             Ok(frame) => frame,
@@ -82,18 +91,21 @@ async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
                 break;
             }
         };
-        if let Ok(load) = serde_json::from_slice::<LoadRules>(&frame) {
-            if send(&mut writer, &rules.load(&load)).await.is_err() {
-                break;
+        let response = match job(&frame, &limits) {
+            Ok(job) => {
+                let id = job.id();
+                match parser.run(job) {
+                    Some(response) => response,
+                    None => {
+                        // The parse thread is gone. Fail this job and exit,
+                        // so the supervisor starts a new worker.
+                        let failed = ParseResponse::failed(id, "parse thread exited");
+                        let _ = send(&mut writer, &failed).await;
+                        std::process::exit(1);
+                    }
+                }
             }
-            continue;
-        }
-        let response = match serde_json::from_slice::<ParseRequest>(&frame) {
-            Ok(request) => match sandbox::start_job(&limits) {
-                Ok(()) => parse_on_big_stack(request, &mut rules),
-                Err(err) => ParseResponse::failed(&request.id, format!("cpu limit: {err}")),
-            },
-            Err(err) => ParseResponse::failed("request", err.to_string()),
+            Err((id, reason)) => ParseResponse::failed(id, reason),
         };
         if send(&mut writer, &response).await.is_err() {
             break;
@@ -105,17 +117,74 @@ async fn serve(limits: WorkerLimits, setup: Result<Vec<String>, String>) {
 /// virtual memory, so it counts against the address-space limit.
 const PARSE_STACK: usize = 64 * 1024 * 1024;
 
-fn parse_on_big_stack(request: ParseRequest, rules: &mut RulesCache) -> ParseResponse {
-    let id = request.id.clone();
-    std::thread::scope(|scope| {
+enum Job {
+    Load(LoadRules),
+    Parse(ParseRequest),
+}
+
+impl Job {
+    fn id(&self) -> String {
+        match self {
+            Job::Load(_) => LoadRules::REPLY_ID.to_string(),
+            Job::Parse(request) => request.id.clone(),
+        }
+    }
+}
+
+/// A request frame as a job for the parse thread, or the id and reason to
+/// fail it with.
+fn job(frame: &[u8], limits: &WorkerLimits) -> Result<Job, (String, String)> {
+    if let Ok(load) = serde_json::from_slice::<LoadRules>(frame) {
+        return Ok(Job::Load(load));
+    }
+    let request = serde_json::from_slice::<ParseRequest>(frame)
+        .map_err(|err| ("request".to_string(), err.to_string()))?;
+    if let Err(err) = sandbox::start_job(limits) {
+        return Err((request.id, format!("cpu limit: {err}")));
+    }
+    Ok(Job::Parse(request))
+}
+
+/// The one thread that loads rules and parses, for the worker's whole life.
+/// A thread per job needed `PARSE_STACK` of free address space every time;
+/// once something else held it (glibc keeps the address space of a malloc
+/// arena for good) every later job failed while the worker lived on.
+struct Parser {
+    jobs: mpsc::Sender<Job>,
+    done: mpsc::Receiver<ParseResponse>,
+}
+
+impl Parser {
+    fn spawn() -> io::Result<Self> {
+        let (jobs, inbox) = mpsc::channel::<Job>();
+        let (outbox, done) = mpsc::channel();
         std::thread::Builder::new()
             .name("parse".into())
             .stack_size(PARSE_STACK)
-            .spawn_scoped(scope, || parse_request(&request, rules))
-            .map_err(|err| format!("parse thread: {err}"))
-            .and_then(|handle| handle.join().map_err(|_| "parser panicked".to_string()))
-    })
-    .unwrap_or_else(|reason| ParseResponse::failed(id, reason))
+            .spawn(move || Self::serve(inbox, outbox))?;
+        Ok(Self { jobs, done })
+    }
+
+    fn serve(inbox: mpsc::Receiver<Job>, outbox: mpsc::Sender<ParseResponse>) {
+        let mut rules = RulesCache::default();
+        for job in inbox {
+            let run = std::panic::AssertUnwindSafe(|| match &job {
+                Job::Load(load) => rules.load(load),
+                Job::Parse(request) => parse_request(request, &mut rules),
+            });
+            let response = std::panic::catch_unwind(run)
+                .unwrap_or_else(|_| ParseResponse::failed(job.id(), "parser panicked"));
+            if outbox.send(response).is_err() {
+                return;
+            }
+        }
+    }
+
+    /// None if the parse thread has exited.
+    fn run(&self, job: Job) -> Option<ParseResponse> {
+        self.jobs.send(job).ok()?;
+        self.done.recv().ok()
+    }
 }
 
 /// A response too big for one frame becomes a failure for the same job.
