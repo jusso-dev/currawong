@@ -27,10 +27,10 @@ cargo install cargo-fuzz --locked
 ./scripts/seed-fuzz.sh
 cd fuzz
 cargo +nightly fuzz build
-cargo +nightly fuzz run smtp_command -- -max_total_time=60 -rss_limit_mb=512
+cargo +nightly fuzz run smtp_command -- -max_total_time=60 -rss_limit_mb=2048 -malloc_limit_mb=512
 ```
 
-`scripts/seed-fuzz.sh` copies `testdata/` fixtures and small protocol seeds into `fuzz/corpus/<target>/`. Nightly CI is described in `.github/workflows/fuzz.yml` (10 minutes per target, 512 MiB RSS). Crashes go to `fuzz/artifacts/` (ignored by git). Do not add exploit inputs; a crash is a panic or a resource blow-up, and the fix is a tighter limit or a rejected parse. Add the minimised input as a unit test next to the fix.
+`scripts/seed-fuzz.sh` copies `testdata/` fixtures and small protocol seeds into `fuzz/corpus/<target>/`. Nightly CI is described in `.github/workflows/fuzz.yml` (10 minutes per target, 512 MiB per allocation, 2 GiB RSS: ASan's quarantine alone holds up to 256 MiB, so a 512 MiB RSS cap trips on long runs with no real blow-up). Crashes go to `fuzz/artifacts/` (ignored by git). Do not add exploit inputs; a crash is a panic or a resource blow-up, and the fix is a tighter limit or a rejected parse. Add the minimised input as a unit test next to the fix.
 
 ## Gaps
 
