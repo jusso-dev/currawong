@@ -1,4 +1,4 @@
-# Nightly fuzz. Move to .github/workflows/fuzz.yml with the rest of CI.
+# Nightly fuzz.
 name: fuzz
 on:
   schedule:
