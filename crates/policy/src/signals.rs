@@ -23,9 +23,13 @@
 //!   protected one, and passes on report flags such as `classify_skipped`
 //!   and `link_scan_truncated`. Link rewriting adds `url_rewrite.skipped`
 //!   when some links were left without a click-time check.
+//!   Threat-intel feeds add `intel.hash`, `intel.url`, `intel.domain` and
+//!   `intel.ip` by indicator kind, and `intel.<source>` per feed (for example
+//!   `intel.urlhaus` or `intel.spamhaus-dbl`); `intel.dbl_low_reputation`
+//!   when Spamhaus DBL lists a link domain only as low reputation.
 //! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
 //!   for the `marking` and `marking_at_least` conditions.
-//! - counts: `parts`, `urls`, `yara` (matches), and distinct identifiers
+//! - counts: `parts`, `urls`, `yara` (matches), `intel_hits`, and distinct identifiers
 //!   found by DLP as `dlp.tfn`, `dlp.medicare`, `dlp.abn`, `dlp.acn`,
 //!   `dlp.driver_licence`, `dlp.card` (present only when found).
 //! - scores: `spam` (the classify total: Bayes points plus rule scores) and
@@ -165,6 +169,17 @@ impl Signals {
         }
         for tag in report.yara.iter().flat_map(|hit| &hit.tags) {
             signals.flag(&format!("yara.{tag}"));
+        }
+        for hit in &report.intel {
+            let kind = match hit.kind.as_str() {
+                "sha256" => "hash",
+                other => other,
+            };
+            signals.flag(&format!("intel.{kind}"));
+            signals.flag(&format!("intel.{}", hit.source));
+        }
+        if !report.intel.is_empty() {
+            signals.count("intel_hits", report.intel.len() as u64);
         }
         signals
     }

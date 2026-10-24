@@ -8,6 +8,7 @@ pub mod secret;
 pub mod telemetry;
 
 pub use config::{Config, ConfigError};
+pub use report::IntelHit;
 pub use report::{
     AuthMethodResult, AuthResults, BecReason, BecReport, Classification, DlpKind, DlpReport,
     DlpSample, EngineFinding, FoundUrl, LookalikeFinding, LookalikeTechnique, MarkingReport,

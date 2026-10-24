@@ -478,7 +478,7 @@ async fn checks_dnsbl_rate_greylist_and_allow_cidr() {
         }],
     };
     let name = currawong_smtp::checks::DnsblCheck::query_name(ip, &zone).unwrap();
-    assert!(name.starts_with("secret-key."), "{name}");
+    assert_eq!(name, "9.113.0.203.secret-key.zen.example.test");
     assert!(!format!("{zone:?}").contains("secret-key"));
     map.ips.insert(name, vec!["127.0.0.2".parse().unwrap()]);
     let dns = Arc::new(map);

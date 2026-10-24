@@ -65,6 +65,10 @@ pub struct Pipeline {
     /// Secure portal for `encrypt` and `encrypt_portal`. `None` when
     /// `encrypt.portal.enabled` is off: such mail is quarantined instead.
     pub portal: Option<Arc<PortalStore>>,
+    /// Threat-intel store and DQS. `None` when `intel.enabled` is off or the
+    /// store failed to open (`intel_error`, noted on each report).
+    pub intel: Option<Arc<currawong_intel::Intel>>,
+    pub intel_error: Option<String>,
 }
 
 impl Pipeline {
@@ -119,6 +123,14 @@ impl Pipeline {
                 )
             })
         });
+
+        let (intel, intel_error) = match crate::intel::open_intel(&cfg) {
+            Ok(intel) => (intel, None),
+            Err(err) => {
+                tracing::error!(%err, "threat-intel lookups disabled");
+                (None, Some(err))
+            }
+        };
         Self {
             rspamd,
             sandbox,
@@ -138,6 +150,8 @@ impl Pipeline {
             classifier,
             classify_error,
             portal: None,
+            intel,
+            intel_error,
         }
     }
 
@@ -632,6 +646,7 @@ impl Pipeline {
                 },
             });
         }
+        self.check_intel(&mut report).await;
         self.classify(env, raw, &mut report).await;
         let rewritten = self.rewrite_urls(env, raw, &mut report).await;
         let decision = self.decide(env, &report);
@@ -837,6 +852,22 @@ impl Pipeline {
             }
             Err(err) => report.notes.push(format!("classifier failed: {err}")),
         }
+    }
+
+    /// Part hashes (archive members included) and links (text and QR)
+    /// against the threat-intel store, and Spamhaus DQS when enabled.
+    async fn check_intel(&self, report: &mut ScanReport) {
+        let Some(intel) = &self.intel else {
+            if let Some(err) = &self.intel_error {
+                report.notes.push(format!("intel unavailable: {err}"));
+            }
+            return;
+        };
+        let hashes: Vec<String> = report.parts.iter().map(|p| p.sha256.clone()).collect();
+        let checked = intel.check(&hashes, &report.urls).await;
+        report.intel = checked.hits;
+        report.flags.extend(checked.flags);
+        report.notes.extend(checked.notes);
     }
 
     /// Part flags from the parser worker become the M1 verdict inputs.

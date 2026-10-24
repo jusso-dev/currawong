@@ -1153,3 +1153,63 @@ fn pspf_default_marking_policy_marks_unmarked_outbound_mail_when_enabled() {
         value: "VER=2018.6, NS=gov.au, SEC=OFFICIAL".into(),
     }));
 }
+
+#[test]
+fn intel_hits_become_flags_and_the_default_pack_quarantines_them() {
+    let hit = |kind: &str, source: &str| currawong_core::IntelHit {
+        kind: kind.into(),
+        value: "x".into(),
+        source: source.into(),
+        threat: "phishing".into(),
+    };
+    let mut scanned = report();
+    scanned.intel = vec![
+        hit("sha256", "malwarebazaar"),
+        hit("domain", "spamhaus-dbl"),
+    ];
+    let signals = Signals::from_report(&scanned);
+    for flag in [
+        "intel.hash",
+        "intel.domain",
+        "intel.malwarebazaar",
+        "intel.spamhaus-dbl",
+    ] {
+        assert!(signals.flags.contains(flag), "{flag}: {signals:?}");
+    }
+    assert_eq!(signals.counts.get("intel_hits"), Some(&2));
+    let queue = |signals: &Signals| {
+        let decision = evaluate(signals, &ctx("user@example.com.au"), default_pack());
+        let queue = decision.actions.iter().find_map(|action| match action {
+            Action::Quarantine(queue) => Some(queue.clone()),
+            _ => None,
+        });
+        (decision.verdict, queue)
+    };
+    assert_eq!(
+        queue(&signals),
+        (
+            Verdict::Quarantine {
+                reason: "intel-hash".into()
+            },
+            Some("malware".into())
+        )
+    );
+    for (flag, id) in [
+        ("intel.url", "intel-url"),
+        ("intel.domain", "intel-domain"),
+        ("intel.ip", "intel-ip"),
+    ] {
+        assert_eq!(
+            queue(&flagged(flag)),
+            (
+                Verdict::Quarantine { reason: id.into() },
+                Some("phishing".into())
+            ),
+            "{flag}"
+        );
+    }
+    assert_eq!(
+        default_verdict(&Signals::from_report(&report())),
+        Verdict::Deliver
+    );
+}
