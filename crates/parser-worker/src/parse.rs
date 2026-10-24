@@ -3,7 +3,7 @@ use crate::archive::{self, passwords_from_message, Budget};
 use crate::filetype::{self, FileKind};
 use crate::ipc::{FoundUrl, ParseRequest, ParseResponse, UrlSource};
 use crate::yara::{RulesCache, YaraScan};
-use crate::{html_smuggling, qr};
+use crate::{html_smuggling, qr, svg};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use mail_parser::decoders::{base64::base64_decode, quoted_printable::quoted_printable_decode};
@@ -118,10 +118,10 @@ pub fn parse_full(
         mut urls,
         ..
     } = walk;
-    let qr_urls = budget
+    let (qr_urls, links) = budget
         .checks
         .take()
-        .map(|checks| checks.urls)
+        .map(|checks| (checks.urls, checks.links))
         .unwrap_or_default();
     if let Some(err) = budget.store_failed {
         return ParseResponse::failed(id, err);
@@ -134,10 +134,12 @@ pub fn parse_full(
     urls.sort();
     urls.dedup();
     urls.truncate(MAX_URLS);
-    // QR URLs are bounded by the QR budget and kept even when text links
-    // filled `MAX_URLS`.
+    // QR URLs are bounded by the QR budget, and document links (remote
+    // templates, protocol handlers, PDF `/URI`) by `MAX_DOCUMENT_LINKS`;
+    // both are kept even when text links filled `MAX_URLS`.
     let mut url_sources: Vec<FoundUrl> = urls
         .iter()
+        .chain(&links)
         .map(|url| FoundUrl {
             url: url.clone(),
             source: UrlSource::Text,
@@ -240,12 +242,17 @@ impl Walk<'_, '_> {
     }
 }
 
+/// Links found inside documents, per message.
+const MAX_DOCUMENT_LINKS: usize = 128;
+
 /// HTML smuggling and QR code checks for MIME parts and archive members.
 pub struct ContentChecks {
     qr: qr::Budget,
     /// PDFs are rendered only in the worker, like document text.
     documents: bool,
     urls: Vec<FoundUrl>,
+    /// Remote templates, protocol handlers and PDF `/URI` targets.
+    links: Vec<String>,
 }
 
 impl ContentChecks {
@@ -254,6 +261,13 @@ impl ContentChecks {
             qr: qr::Budget::default(),
             documents,
             urls: Vec::new(),
+            links: Vec::new(),
+        }
+    }
+
+    pub(crate) fn link(&mut self, url: String) {
+        if self.links.len() < MAX_DOCUMENT_LINKS && !self.links.contains(&url) {
+            self.links.push(url);
         }
     }
 
@@ -266,9 +280,9 @@ impl ContentChecks {
         flags: &mut Vec<PartFlag>,
     ) {
         let text = html_smuggling::decoded(bytes);
-        if html_smuggling::is_html(html_type, filename, &kind.label, &text)
-            && html_smuggling::flagged(&text)
-        {
+        let markup = html_smuggling::is_html(html_type, filename, &kind.label, &text)
+            || svg::is_svg(filename, &kind.label, &text);
+        if markup && html_smuggling::flagged(&text) {
             flags.push(PartFlag::HtmlSmuggling);
         }
         let codes = if kind.label.starts_with("image/") {

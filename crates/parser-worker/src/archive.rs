@@ -1,10 +1,12 @@
 //! Bounded archive extraction. Limits stop zip bombs before they expand.
 //! Sizes declared in archive headers are never trusted: every read is capped
 //! by what is left of the budget and charged with the bytes actually read.
+use crate::external::Findings;
 use crate::filetype::{self, FileKind};
 use crate::office::{self, password_candidates};
 use crate::parse::ContentChecks;
 use crate::yara::YaraScan;
+use crate::{html_smuggling, onenote, pdf, shortcut, svg};
 use currawong_core::config::ExtractLimits;
 use currawong_core::{PartFlag, PartInfo};
 use std::collections::HashMap;
@@ -110,6 +112,19 @@ impl<'a, 'r> Budget<'a, 'r> {
     ) {
         if let Some(checks) = self.checks.as_mut() {
             checks.run(bytes, filename, html_type, &filetype::detect(bytes), flags);
+        }
+    }
+
+    /// Flags and links a document check found. Links go to link analysis
+    /// with the message's other URLs (message parse only).
+    pub(crate) fn record(&mut self, found: Findings, flags: &mut Vec<PartFlag>) {
+        for flag in found.flags {
+            add(flags, flag);
+        }
+        if let Some(checks) = self.checks.as_mut() {
+            for link in found.links {
+                checks.link(link);
+            }
         }
     }
 
@@ -228,6 +243,7 @@ pub fn inspect(
     let kind = filetype::detect(bytes);
     let mut flags = filetype::flags_for(bytes, filename, &kind);
     if !is_archive(&kind) {
+        documents(bytes, filename, &kind, passwords, budget, parts, &mut flags);
         return flags;
     }
     if budget.hit || !budget.enter() {
@@ -240,6 +256,12 @@ pub fn inspect(
         "application/x-tar" => untar(bytes, passwords, budget, parts, &mut flags),
         "application/x-iso9660-image" => unpack_iso(bytes, passwords, budget, parts),
         "application/x-7z-compressed" => un7z(bytes, passwords, budget, parts, &mut flags),
+        // Not unpacked: flagged for policy, and fails closed like any
+        // container that cannot be opened.
+        _ if filetype::is_disk_image(&kind) => {
+            add(&mut flags, PartFlag::DiskImage);
+            add(&mut flags, PartFlag::Unscannable);
+        }
         // RAR is not unpacked (licence), so it cannot be inspected.
         _ => add(&mut flags, PartFlag::Unscannable),
     }
@@ -248,6 +270,101 @@ pub fn inspect(
         add(&mut flags, PartFlag::LimitExceeded);
     }
     flags
+}
+
+/// Active content in documents and shell files that are not archives:
+/// SVG, shortcuts, RTF, PDF and OneNote. PDF and OneNote embedded files
+/// become child parts under the same limits as archive members.
+fn documents(
+    bytes: &[u8],
+    filename: Option<&str>,
+    kind: &FileKind,
+    passwords: &[String],
+    budget: &mut Budget,
+    parts: &mut Vec<PartInfo>,
+    flags: &mut Vec<PartFlag>,
+) {
+    let text = html_smuggling::decoded(bytes);
+    if svg::is_svg(filename, &kind.label, &text) && svg::active(&text) {
+        add(flags, PartFlag::SvgActive);
+    }
+    if let Some(found) = shortcut::inspect(bytes, filename, kind) {
+        budget.record(found, flags);
+    }
+    if kind.label == "application/rtf" {
+        budget.record(office::rtf_external(bytes), flags);
+    }
+    if pdf::is_pdf(bytes) {
+        let scan = pdf::scan(bytes);
+        budget.record(scan.found, flags);
+        if scan.limit_hit {
+            budget.hit = true;
+            add(flags, PartFlag::LimitExceeded);
+        }
+        if scan.unscannable {
+            add(flags, PartFlag::Unscannable);
+        }
+        let embedded = scan.embedded.into_iter().enumerate().map(|(n, file)| {
+            let name = file
+                .name
+                .unwrap_or_else(|| format!("pdf-embedded-{}", n + 1));
+            (name, file.data, file.flate)
+        });
+        embedded_files(embedded, passwords, budget, parts, flags);
+    } else if kind.label == "application/onenote" {
+        let (files, more) = onenote::embedded(bytes);
+        if !files.is_empty() {
+            add(flags, PartFlag::OneNoteEmbedded);
+        }
+        if more {
+            budget.hit = true;
+            add(flags, PartFlag::LimitExceeded);
+        }
+        let embedded = files
+            .into_iter()
+            .enumerate()
+            .map(|(n, data)| (format!("onenote-embedded-{}", n + 1), data, false));
+        embedded_files(embedded, passwords, budget, parts, flags);
+    }
+}
+
+/// Files embedded in a document, as child parts: (name, stream bytes,
+/// FlateDecode). They count against the same budget as archive members.
+fn embedded_files<'b>(
+    files: impl Iterator<Item = (String, &'b [u8], bool)>,
+    passwords: &[String],
+    budget: &mut Budget,
+    parts: &mut Vec<PartInfo>,
+    flags: &mut Vec<PartFlag>,
+) {
+    let mut files = files.peekable();
+    if files.peek().is_none() {
+        return;
+    }
+    if budget.hit || !budget.enter() {
+        add(flags, PartFlag::LimitExceeded);
+        return;
+    }
+    for (name, data, flate) in files {
+        if budget.hit || !budget.admit() {
+            break;
+        }
+        let read = if flate {
+            let allowed = budget.ratio_cap(data.len() as u64);
+            budget.read_bounded(flate2::read::ZlibDecoder::new(data), allowed)
+        } else {
+            budget.read_bounded(data, u64::MAX)
+        };
+        match read {
+            Ok(buf) => child(&buf, &name, passwords, budget, parts),
+            Err(Stop::Limit) => break,
+            Err(Stop::Corrupt) => add(flags, PartFlag::Unscannable),
+        }
+    }
+    budget.leave();
+    if budget.hit {
+        add(flags, PartFlag::LimitExceeded);
+    }
 }
 
 fn child(
@@ -327,7 +444,11 @@ fn unzip(
             }
         };
         match read {
-            Ok(buf) => child(&buf, &name, passwords, budget, parts),
+            Ok(buf) => {
+                // The document, not the member, carries what its parts load.
+                budget.record(office::ooxml_external(&name, &buf), flags);
+                child(&buf, &name, passwords, budget, parts);
+            }
             Err(Stop::Limit) => return,
             Err(Stop::Corrupt) => add(flags, PartFlag::Unscannable),
         }
