@@ -442,7 +442,9 @@ async fn sandbox_concurrent_attempts_and_failed_analysis_remain_fail_closed() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     let part = part(&dir);
-    let cfg = sandbox_config(&server.url);
+    let mut cfg = sandbox_config(&server.url);
+    cfg.required = true;
+    cfg.on_timeout = "deliver".into();
     let db = dir.path().join("db");
     let first = SandboxEngine::new(&cfg, guard(), &db).unwrap();
     let second = SandboxEngine::new(&cfg, guard(), &db).unwrap();
@@ -454,6 +456,9 @@ async fn sandbox_concurrent_attempts_and_failed_analysis_remain_fail_closed() {
     assert!(combine(&failure.outputs, false).fail_closed);
     let retry = second.assess_at(&parts, 102).await;
     assert!(combine(&retry.outputs, false).fail_closed);
+    let late = second.assess_at(&parts, 111).await;
+    assert!(!late.timeout);
+    assert!(combine(&late.outputs, false).fail_closed);
     assert_eq!(server.requests().len(), 2);
 }
 
@@ -514,4 +519,28 @@ async fn sandbox_html_body_is_skipped_but_named_html_and_executable_are_selected
     part.filename = Some("program.com".into());
     part.flags.clear();
     assert!(engine.selected(&part));
+}
+
+#[tokio::test]
+async fn sandbox_connect_failure_retries_after_recovery() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let dir = tempfile::tempdir().unwrap();
+    let parts = [part(&dir)];
+    let mut cfg = sandbox_config(&format!("http://{address}"));
+    cfg.required = true;
+    let db = dir.path().join("sandbox.db");
+    let engine = SandboxEngine::new(&cfg, guard(), &db).unwrap();
+    let failed = engine.assess_at(&parts, 100).await;
+    assert!(combine(&failed.outputs, false).defer);
+    drop(engine);
+    let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+    let server = Server::with_listener(listener, |_| {
+        Response::json(json!({"error":false,"data":{"task_ids":[7]}}))
+    })
+    .await;
+    let engine = SandboxEngine::new(&cfg, guard(), &db).unwrap();
+    assert!(engine.assess_at(&parts, 101).await.pending);
+    assert_eq!(server.requests().len(), 1);
 }

@@ -79,18 +79,19 @@ pub fn active(text: &[u8]) -> bool {
         .bytes()
         .filter(|b| !matches!(b, b'\t' | b'\r' | b'\n'))
         .collect();
+    let markup = decoded.as_bytes();
     let p = patterns();
     // A scheme needs its colon: "JavaScript" in a title is not a link.
-    if p.script.is_match(&compact)
-        || p.handler.is_match(&compact)
+    if p.script.is_match(markup)
+        || p.handler.is_match(markup)
         || p.scheme.is_match(&compact)
-        || p.refresh.is_match(&compact)
-        || p.redirect.is_match(&compact)
+        || p.refresh.is_match(markup)
+        || p.redirect.is_match(markup)
     {
         return true;
     }
-    match p.foreign_object.find(&compact) {
-        Some(at) => p.foreign_html.is_match(&compact[at.end()..]),
+    match p.foreign_object.find(markup) {
+        Some(at) => p.foreign_html.is_match(&markup[at.end()..]),
         None => false,
     }
 }

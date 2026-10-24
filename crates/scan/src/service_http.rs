@@ -11,6 +11,8 @@ use url::Url;
 pub struct ServiceError {
     pub reason: String,
     pub unreachable: bool,
+    /// Connection failed before any request bytes could be sent.
+    pub(crate) unsent: bool,
 }
 
 impl ServiceError {
@@ -18,12 +20,14 @@ impl ServiceError {
         Self {
             reason: reason.into(),
             unreachable: false,
+            unsent: false,
         }
     }
     pub fn unavailable(reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
             unreachable: true,
+            unsent: false,
         }
     }
     pub fn engine_result(&self) -> EngineResult {
@@ -155,7 +159,11 @@ impl EngineHttp {
             .body(body)
             .send()
             .await
-            .map_err(|_| ServiceError::unavailable("engine HTTP request failed"))?;
+            .map_err(|err| {
+                let mut failure = ServiceError::unavailable("engine HTTP request failed");
+                failure.unsent = err.is_connect();
+                failure
+            })?;
         if response.status().is_redirection() {
             if let Some(location) = response
                 .headers()

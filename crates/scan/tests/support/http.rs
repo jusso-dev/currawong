@@ -49,6 +49,12 @@ impl Drop for Server {
 impl Server {
     pub async fn start(reply: impl Fn(&Request) -> Response + Send + Sync + 'static) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        Self::with_listener(listener, reply).await
+    }
+    pub async fn with_listener(
+        listener: TcpListener,
+        reply: impl Fn(&Request) -> Response + Send + Sync + 'static,
+    ) -> Self {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let recorded = requests.clone();

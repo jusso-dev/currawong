@@ -4,6 +4,7 @@
 use crate::external::{self, xml_unescape, Findings};
 use currawong_core::PartFlag;
 use regex::Regex;
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::sync::OnceLock;
 
@@ -94,7 +95,7 @@ pub fn password_candidates(text: &str) -> Vec<String> {
 pub fn ooxml_external(name: &str, bytes: &[u8]) -> Findings {
     let mut found = Findings::default();
     let lower = name.replace('\\', "/").to_ascii_lowercase();
-    let text = String::from_utf8_lossy(bytes);
+    let text = xml_text(bytes);
     if lower.ends_with(".rels") {
         relationships(&text, &mut found);
     } else if lower.starts_with("word/") && lower.ends_with(".xml") {
@@ -106,6 +107,29 @@ pub fn ooxml_external(name: &str, bytes: &[u8]) -> Findings {
         found.flag(PartFlag::DdeField);
     }
     found
+}
+
+/// XML byte order marks and the UTF-16 XML declaration signatures.
+fn xml_text(bytes: &[u8]) -> Cow<'_, str> {
+    let (skip, little_endian) = match bytes {
+        [0xff, 0xfe, ..] => (2, true),
+        [0xfe, 0xff, ..] => (2, false),
+        [b'<', 0, b'?', 0, ..] => (0, true),
+        [0, b'<', 0, b'?', ..] => (0, false),
+        _ => return String::from_utf8_lossy(bytes),
+    };
+    let units = bytes[skip..].as_chunks::<2>().0.iter().map(|pair| {
+        if little_endian {
+            u16::from_le_bytes(*pair)
+        } else {
+            u16::from_be_bytes(*pair)
+        }
+    });
+    Cow::Owned(
+        char::decode_utf16(units)
+            .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+            .collect(),
+    )
 }
 
 /// Relationship types that load their target when the document opens.

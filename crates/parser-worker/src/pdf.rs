@@ -24,6 +24,7 @@ const MAX_OBJSTM_TOTAL: u64 = 64 * 1024 * 1024;
 pub const MAX_EMBEDDED: usize = 256;
 const MAX_NAME: usize = 127;
 const MAX_STRING: usize = 4096;
+const MAX_REFERENCE_LOOKUPS: usize = MAX_EMBEDDED * 4;
 
 /// One embedded file's stream data, still encoded when `flate`.
 pub struct Embedded<'a> {
@@ -62,6 +63,8 @@ struct State {
     /// Object numbers named by `/EF` dictionaries, with the file name from
     /// the same file specification when one was found.
     embedded_refs: Vec<(u32, Option<String>)>,
+    reference_lookups: usize,
+    reference_limit_hit: bool,
 }
 
 pub fn scan(bytes: &[u8]) -> Scan<'_> {
@@ -135,6 +138,7 @@ pub fn scan(bytes: &[u8]) -> Scan<'_> {
             flate,
         });
     }
+    scan.limit_hit |= state.reference_limit_hit;
     scan
 }
 
@@ -166,12 +170,17 @@ fn text(segment: &[u8], state: &mut State, found: &mut Findings) {
                     }
                 }
             }
-            b"EF" if state.embedded_refs.len() < MAX_EMBEDDED * 4 => {
+            b"EF"
+                if state.reference_lookups < MAX_REFERENCE_LOOKUPS
+                    && state.embedded_refs.len() < MAX_REFERENCE_LOOKUPS =>
+            {
+                state.reference_lookups += 1;
                 let name = file_name_near(segment, end);
                 for obj in references(&segment[end..]) {
                     state.embedded_refs.push((obj, name.clone()));
                 }
             }
+            b"EF" => state.reference_limit_hit = true,
             _ => {}
         }
     });
@@ -364,11 +373,11 @@ fn object_number(before: &[u8]) -> Option<u32> {
 
 /// Indirect references in the dictionary that starts at `text`.
 fn references(text: &[u8]) -> Vec<u32> {
-    let text = trim_start(text);
+    let text = trim_start(&text[..text.len().min(512)]);
     if !text.starts_with(b"<<") {
         return Vec::new();
     }
-    let end = find(text, b">>").unwrap_or(text.len()).min(512);
+    let end = find(text, b">>").unwrap_or(text.len());
     patterns()
         .reference
         .captures_iter(&text[..end])

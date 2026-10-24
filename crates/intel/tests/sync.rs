@@ -364,3 +364,91 @@ async fn intel_sync_follows_taxii_pages_and_reports_stale_feeds() {
     let later = syncer.stale_feeds(now + 3 * 3600 + 1);
     assert_eq!(later.len(), 2);
 }
+
+#[tokio::test]
+async fn intel_sync_redirects_stay_same_origin_without_referer() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let key_file = dir.path().join("fixture.key");
+    std::fs::write(&key_file, "synthetic-feed-key").unwrap();
+    let mut keyed = feed("keyed", FeedFormat::Lines, server.url("/key/{key}"));
+    keyed.key_file = Some(key_file);
+    keyed.auth_header = Some("Auth-Key".into());
+    let syncer = setup(dir.path(), &server, vec![keyed.clone()]);
+    server.reply(|req| {
+        if req.path.starts_with("/key/") {
+            Reply {
+                status: 302,
+                headers: vec![("location", "/list".into())],
+                body: vec![],
+            }
+        } else {
+            assert_eq!(req.header("auth-key"), Some("synthetic-feed-key"));
+            ok("old.example\n")
+        }
+    });
+    let now = currawong_intel::now();
+    syncer.sync_feed(&keyed, now).await.unwrap();
+    assert!(server.last().header("referer").is_none());
+}
+
+#[tokio::test]
+async fn intel_sync_refuses_cross_origin_authenticated_redirects() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = Server::start(other_dir.path()).await;
+    // Trust both fake peers: TLS must not hide an unsafe redirect policy.
+    let mut roots = std::fs::read(&server.ca_file).unwrap();
+    roots.extend(std::fs::read(&other.ca_file).unwrap());
+    std::fs::write(&server.ca_file, roots).unwrap();
+    let key_file = dir.path().join("fixture.key");
+    std::fs::write(&key_file, "synthetic-feed-key").unwrap();
+    let mut keyed = feed("keyed", FeedFormat::Lines, server.url("/key/{key}"));
+    keyed.key_file = Some(key_file);
+    keyed.auth_header = Some("Auth-Key".into());
+    let syncer = setup(dir.path(), &server, vec![keyed.clone()]);
+    server.reply(|_| ok("old.example\n"));
+    let now = currawong_intel::now();
+    syncer.sync_feed(&keyed, now).await.unwrap();
+    other.reply(|_| ok("other.example\n"));
+    // Different port is a different origin, even on the same hostname.
+    let location = other.url("/list");
+    server.reply(move |_| Reply {
+        status: 302,
+        headers: vec![("location", location.clone())],
+        body: vec![],
+    });
+    let err = syncer.sync_feed(&keyed, now + 1).await.unwrap_err();
+    assert!(err.contains("cross-origin"), "{err}");
+    assert!(!err.contains("synthetic-feed-key"));
+    assert!(other.requests.lock().unwrap().is_empty());
+    assert!(listed(&syncer, Kind::Domain, "old.example"));
+}
+
+#[tokio::test]
+async fn intel_sync_incomplete_taxii_keeps_previous_collection() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = Server::start(dir.path()).await;
+    let taxii = feed("ctis", FeedFormat::Taxii, server.url("/objects"));
+    let syncer = setup(dir.path(), &server, vec![taxii.clone()]);
+    server.reply(|_| ok(r#"{"more":false,"objects":[{"type":"indicator","pattern":"[domain-name:value = 'old.example']"}]}"#));
+    let now = currawong_intel::now();
+    syncer.sync_feed(&taxii, now).await.unwrap();
+    for next in [
+        None,
+        Some(serde_json::json!(null)),
+        Some(serde_json::json!(42)),
+        Some(serde_json::json!("")),
+        Some(serde_json::json!("  ")),
+    ] {
+        let mut page = serde_json::json!({"more":true,"objects":[{"type":"indicator","pattern":"[domain-name:value = 'partial.example']"}]});
+        if let Some(next) = next {
+            page["next"] = next;
+        }
+        server.reply(move |_| ok(serde_json::to_vec(&page).unwrap()));
+        assert!(syncer.sync_feed(&taxii, now + 1).await.is_err());
+        assert!(listed(&syncer, Kind::Domain, "old.example"));
+        assert!(!listed(&syncer, Kind::Domain, "partial.example"));
+    }
+}

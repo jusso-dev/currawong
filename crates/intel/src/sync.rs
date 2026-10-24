@@ -340,7 +340,7 @@ impl Syncer {
                     self.cfg.max_download_bytes
                 ));
             }
-            next = formats::taxii_next(&bytes);
+            next = formats::taxii_next(&bytes)?;
             let threat = threat.clone();
             let page = tokio::task::spawn_blocking(move || {
                 formats::parse(FeedFormat::Taxii, &bytes, None, threat.as_deref(), now)
@@ -424,6 +424,12 @@ pub fn http_client(ca_file: Option<&Path>, timeout_secs: u64) -> Result<reqwest:
             attempt.error("too many redirects")
         } else if attempt.url().scheme() != "https" {
             attempt.error("redirect to a non-https URL refused")
+        } else if attempt
+            .previous()
+            .first()
+            .is_some_and(|original| original.origin() != attempt.url().origin())
+        {
+            attempt.error("cross-origin feed redirect refused")
         } else {
             attempt.follow()
         }
@@ -432,6 +438,7 @@ pub fn http_client(ca_file: Option<&Path>, timeout_secs: u64) -> Result<reqwest:
         .tls_backend_preconfigured(tls)
         .https_only(true)
         .redirect(policy)
+        .referer(false)
         .user_agent(USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(timeout_secs.max(1)))

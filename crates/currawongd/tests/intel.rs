@@ -399,3 +399,38 @@ fn intel_config_is_validated() {
         assert!(err.contains(expected), "{err}");
     }
 }
+
+#[tokio::test]
+async fn intel_checks_text_urls_with_scanner_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = intel_config(dir.path());
+    cfg.scanner.enabled = false;
+    seed(
+        &cfg,
+        "fixture",
+        &[
+            indicator(Kind::Url, "https://url.example/login", "phishing"),
+            indicator(Kind::Domain, "domain.example", "phishing"),
+        ],
+    );
+    let pipeline = Pipeline::new(Arc::new(cfg), AuthChecker::offline("gw.test").unwrap());
+    for url in [
+        "https://url.example/login",
+        "https://sub.domain.example/path",
+    ] {
+        let raw = message(&format!("See {url}"), &[]);
+        let (report, decision) = pipeline.assess(&envelope(), &raw, None).await;
+        assert!(report.parts.is_empty());
+        assert!(!report.intel.is_empty(), "{report:?}");
+        assert_eq!(queue(&decision).as_deref(), Some("phishing"));
+    }
+    // MIME transfer encoding must be decoded before looking for links.
+    let raw = b"From: a@example.test\r\nTo: dest@example.test\r\nContent-Type: text/plain\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\nSee https://url.example/lo=\r\ngin";
+    let (report, decision) = pipeline.assess(&envelope(), raw, None).await;
+    assert!(!report.intel.is_empty(), "{report:?}");
+    assert_eq!(queue(&decision).as_deref(), Some("phishing"));
+    let raw = b"From: a@example.test\r\nTo: dest@example.test\r\nContent-Type: text/html\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n<a href=3D\"https://url.example/lo=\r\ngin\">Review</a>";
+    let (report, decision) = pipeline.assess(&envelope(), raw, None).await;
+    assert!(!report.intel.is_empty(), "{report:?}");
+    assert_eq!(queue(&decision).as_deref(), Some("phishing"));
+}

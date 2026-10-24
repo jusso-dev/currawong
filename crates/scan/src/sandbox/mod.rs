@@ -278,6 +278,10 @@ impl SandboxEngine {
         };
         match task {
             Ok(task) => entry.task = Some(task.0),
+            Err(err) if err.unsent => {
+                self.cache.release(&self.service, &part.sha256).await?;
+                return Err(err);
+            }
             Err(err) => {
                 // A lost HTTP reply may have created a task. Keep the
                 // reservation; retries must not detonate it twice.
@@ -315,6 +319,14 @@ impl SandboxEngine {
         }
         if entry.failed.as_deref() == Some("timeout") {
             return Ok(self.result(part, &entry, "timeout"));
+        }
+        // A terminal analysis/protocol failure is not a pending-task timeout.
+        if let Some(reason) = entry
+            .failed
+            .as_deref()
+            .filter(|r| r.starts_with("invalid: "))
+        {
+            return Err(cached_failure(reason));
         }
         if now.saturating_sub(entry.submitted) >= self.cfg.max_wait_secs as i64 {
             entry.failed = Some("timeout".into());

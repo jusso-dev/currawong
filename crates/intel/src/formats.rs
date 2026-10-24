@@ -292,12 +292,28 @@ fn pattern_regex() -> &'static Regex {
     })
 }
 
+/// Only independent equalities can become standalone blocking indicators.
+/// Validate the whole pattern before extracting any comparison from it.
+fn supported_pattern(pattern: &str) -> bool {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        let comparison = pattern_regex().as_str();
+        let observation = format!(r"\[\s*(?:{comparison})(?:\s+OR\s+(?:{comparison}))*\s*\]");
+        Regex::new(&format!(
+            r"(?x)\A\s*{observation}(?:\s+OR\s+{observation})*\s*\z"
+        ))
+        .expect("STIX equality/OR pattern regex")
+    })
+    .is_match(pattern)
+}
+
 /// STIX 2.1 `indicator` objects with a `stix` pattern. Revoked indicators
 /// and those past `valid_until` are skipped; `valid_until` becomes the
 /// stored expiry. Observables without an indicator are not used: MISP and
 /// CTIS mark what is to be acted on as indicators.
 fn stix(objects: &[Value], default_threat: Option<&str>, now: i64) -> Parsed {
     let mut parsed = Parsed::default();
+    let mut skipped_patterns = 0;
     for object in objects {
         if object.get("type").and_then(Value::as_str) != Some("indicator") {
             continue;
@@ -342,7 +358,14 @@ fn stix(objects: &[Value], default_threat: Option<&str>, now: i64) -> Parsed {
             })
             .unwrap_or_else(|| "listed".into());
         let pattern = object.get("pattern").and_then(Value::as_str).unwrap_or("");
-        let mut any = false;
+        if pattern.is_empty() {
+            parsed.rejected += 1;
+            continue;
+        }
+        if !supported_pattern(pattern) {
+            skipped_patterns += 1;
+            continue;
+        }
         for found in pattern_regex().captures_iter(pattern) {
             let kind = match &found[1] {
                 "url:value" => Kind::Url,
@@ -352,22 +375,25 @@ fn stix(objects: &[Value], default_threat: Option<&str>, now: i64) -> Parsed {
             };
             let value = found[2].replace("\\'", "'").replace("\\\\", "\\");
             parsed.push_with(kind, &value, &threat, expires);
-            any = true;
         }
-        if !any && pattern.is_empty() {
-            parsed.rejected += 1;
-        }
+    }
+    if skipped_patterns > 0 {
+        tracing::warn!(skipped_patterns, "unsupported STIX patterns skipped");
     }
     parsed
 }
 
 /// A TAXII 2.1 envelope's paging fields: `more` and `next`.
-pub fn taxii_next(body: &[u8]) -> Option<String> {
-    let doc: Value = serde_json::from_slice(body).ok()?;
+pub fn taxii_next(body: &[u8]) -> Result<Option<String>, String> {
+    let doc: Value = serde_json::from_slice(body).map_err(|_| "invalid TAXII JSON")?;
     if doc.get("more").and_then(Value::as_bool) != Some(true) {
-        return None;
+        return Ok(None);
     }
-    doc.get("next").and_then(Value::as_str).map(str::to_string)
+    doc.get("next")
+        .and_then(Value::as_str)
+        .filter(|next| !next.trim().is_empty())
+        .map(|next| Some(next.to_string()))
+        .ok_or_else(|| "TAXII more=true without a valid next token".into())
 }
 
 #[cfg(test)]
@@ -526,16 +552,45 @@ mod tests {
             [
                 (Kind::Sha256, hash.as_str(), "malicious-activity"),
                 (Kind::Url, "https://ctis.example/a'b", "malicious-activity"),
-                (Kind::Domain, "misp.example", "phishing"),
-                (Kind::Ip, "192.0.2.1", "phishing"),
             ]
         );
         assert_eq!(parsed.indicators[0].expires, Some(4_070_908_800));
         assert!(parse(FeedFormat::Taxii, b"{}", None, None, 0).is_err());
         assert_eq!(
-            taxii_next(br#"{"more": true, "next": "p2", "objects": []}"#).as_deref(),
+            taxii_next(br#"{"more": true, "next": "p2", "objects": []}"#)
+                .unwrap()
+                .as_deref(),
             Some("p2")
         );
-        assert_eq!(taxii_next(br#"{"more": false, "next": "p2"}"#), None);
+        assert_eq!(taxii_next(br#"{"more": false, "next": "p2"}"#), Ok(None));
+    }
+    #[test]
+    fn intel_stix_compound_patterns_are_not_flattened() {
+        let unsupported = [
+            "[domain-name:value = 'one.example' AND domain-name:value = 'two.example']",
+            "[domain-name:value = 'one.example'] AND [domain-name:value = 'two.example']",
+            "[domain-name:value = 'one.example'] FOLLOWEDBY [domain-name:value = 'two.example']",
+            "[domain-name:value = 'one.example'] REPEATS 2 TIMES",
+            "[domain-name:value = 'one.example' OR url:value LIKE 'https://two.example/%']",
+            "[domain-name:value != 'one.example']",
+        ];
+        for pattern in unsupported {
+            let objects = [serde_json::json!({"type":"indicator", "pattern": pattern})];
+            let parsed = stix(&objects, None, 0);
+            assert!(parsed.indicators.is_empty(), "{pattern}: {parsed:?}");
+            // Unsupported patterns must not count as broken feed records.
+            assert_eq!(parsed.rejected, 0);
+        }
+        for pattern in [
+            "[domain-name:value = 'one.example' OR domain-name:value = 'two.example']",
+            "[domain-name:value = 'one.example'] OR [domain-name:value = 'two.example']",
+        ] {
+            let parsed = stix(
+                &[serde_json::json!({"type":"indicator", "pattern":pattern})],
+                None,
+                0,
+            );
+            assert_eq!(parsed.indicators.len(), 2);
+        }
     }
 }

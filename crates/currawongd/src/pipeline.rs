@@ -3,7 +3,7 @@ use currawong_auth::{
     strip_forged, AuthChecker, DmarcEventStore, KeyStore, StoredKey, GATEWAY_TENANT,
 };
 use currawong_classify::{
-    message::{too_nested, MAX_RAW_BYTES},
+    message::{too_nested, MessageView, MAX_RAW_BYTES},
     spam::Feedback,
     Classifier, TenantContext,
 };
@@ -537,6 +537,16 @@ impl Pipeline {
                 currawong_parser::text::body_text(raw)
             };
             self.scan_dlp(env, &text, &mut report);
+            report.urls = MessageView::parse(raw).urls;
+            report.url_sources = report
+                .urls
+                .iter()
+                .map(|url| currawong_core::FoundUrl {
+                    url: url.clone(),
+                    source: UrlSource::Text,
+                })
+                .collect();
+            self.check_intel(&mut report).await;
             self.classify(env, raw, &mut report).await;
             let rewritten = self.rewrite_urls(env, raw, &mut report).await;
             let decision = self.decide(env, &report);

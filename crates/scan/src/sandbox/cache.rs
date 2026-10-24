@@ -103,4 +103,16 @@ impl Cache {
             .map(|v| serde_json::to_string(&v).expect("finite sandbox verdict"));
         self.run(move |conn| conn.execute("UPDATE sandbox_tasks SET task=?3, polled=?4, verdict=?5, failed=?6 WHERE service=?1 AND sha256=?2", params![service, sha, entry.task, entry.polled, verdict, entry.failed]).map(|_| ())).await
     }
+    /// Release only when the submission is known not to have been sent.
+    pub async fn release(&self, service: &str, sha: &str) -> Result<(), ServiceError> {
+        let (service, sha) = (service.to_string(), sha.to_string());
+        self.run(move |conn| {
+            conn.execute(
+                "DELETE FROM sandbox_tasks WHERE service=?1 AND sha256=?2",
+                params![service, sha],
+            )
+            .map(|_| ())
+        })
+        .await
+    }
 }

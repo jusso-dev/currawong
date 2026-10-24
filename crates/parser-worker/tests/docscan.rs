@@ -899,3 +899,53 @@ fn ordinary_files_are_not_flagged() {
         }
     }
 }
+
+#[test]
+fn svg_markup_keeps_attribute_whitespace() {
+    for whitespace in ["\n", "\r", "\t", "\r\n"] {
+        let svg = format!("<svg{whitespace}onload=\"go()\"/>");
+        assert!(flags(svg.as_bytes(), "fixture.svg").contains(&PartFlag::SvgActive));
+    }
+}
+
+#[test]
+fn office_relationships_utf16_are_inspected() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-16"?><Relationships><Relationship Type="attachedTemplate" Target="https://templates.example.test/a.dotm" TargetMode="External"/><Relationship Type="hyperlink" Target="search-ms:query=test"/></Relationships>"#;
+    for little_endian in [true, false] {
+        for bom in [true, false] {
+            let mut bytes = Vec::new();
+            if bom {
+                bytes.extend_from_slice(if little_endian {
+                    &[0xff, 0xfe]
+                } else {
+                    &[0xfe, 0xff]
+                });
+            }
+            for unit in xml.encode_utf16() {
+                bytes.extend_from_slice(&if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            let package = docx(&[("word/_rels/settings.xml.rels", &bytes)]);
+            let extracted = extract(&package, Some("fixture.docx"), &roomy(), &[]);
+            assert!(
+                has(&extracted.parts, PartFlag::ExternalTemplate),
+                "LE={little_endian}, BOM={bom}"
+            );
+            assert!(has(&extracted.parts, PartFlag::ProtocolHandler));
+        }
+    }
+}
+
+#[test]
+fn pdf_repeated_unclosed_references_have_bounded_work() {
+    let small = b"/EF << ".repeat(1025);
+    assert!(currawong_parser::pdf::scan(&small).limit_hit);
+    let bytes = b"/EF << ".repeat(200_000);
+    let start = std::time::Instant::now();
+    let scan = currawong_parser::pdf::scan(&bytes);
+    assert!(scan.limit_hit);
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+}
