@@ -25,6 +25,8 @@ const MAX_OWN_HOPS: usize = 3;
 /// deciding again under policies that may have changed.
 #[derive(Debug, Serialize, Deserialize)]
 struct Plan {
+    #[serde(default)]
+    sandbox_pending: bool,
     /// Our headers for every copy: Authentication-Results (inbound), ARC
     /// set (modified inbound) or DKIM signatures (outbound).
     #[serde(default)]
@@ -256,6 +258,7 @@ async fn classify_one(
                 }
             };
             let plan = Plan {
+                sandbox_pending: report.sandbox.iter().any(|r| r.status == "pending"),
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
                 history_sender: pipeline.history_sender(&env, &raw, &report),
@@ -425,7 +428,12 @@ async fn act(
         Verdict::Defer { reason } => {
             env.pipeline = "scan_defer".into();
             env.attempts = env.attempts.saturating_add(1);
-            env.next_attempt_at = Some(OffsetDateTime::now_utc() + time::Duration::minutes(5));
+            let delay = if plan.sandbox_pending {
+                time::Duration::seconds(cfg.scanner.sandbox.poll_secs as i64)
+            } else {
+                time::Duration::minutes(5)
+            };
+            env.next_attempt_at = Some(OffsetDateTime::now_utc() + delay);
             tracing::info!(id = %env.id, %reason, "scan deferred");
             spool.update(&env).await.map_err(|err| err.to_string())?;
             if env.state != SpoolState::Deferred {

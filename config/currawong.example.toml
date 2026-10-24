@@ -142,6 +142,32 @@ required = true
 rules_dir = ""
 load_timeout_secs = 120
 
+# Optional on-box Rspamd. Empty/absent URL disables it. Required failures
+# defer; optional unreachable services add a note. Invalid replies fail closed.
+# Scanning uses /checkv2; controller_url separately opts into release learning.
+# [scanner.rspamd]
+# url = "http://127.0.0.1:11333"
+# controller_url = "http://127.0.0.1:11334"
+# password_file = "/etc/currawong/rspamd-password"
+# required = false
+# timeout_secs = 15 # 1..3600
+# max_size = 52428800
+
+# Optional on-premises CAPEv2; no public sandbox/cloud multi-scanner.
+# Tokens are read from files; never place their values in TOML.
+# Pending tasks and verdicts persist at spool.dir/sandbox.sqlite3.
+# [scanner.sandbox]
+# kind = "cape" # DRAKVUF verdict contract not supported; see docs/integrations/sandbox.md
+# url = "http://127.0.0.1:8000"
+# token_file = "/etc/currawong/cape-token"
+# required = false
+# max_wait_secs = 900 # 1..604800 since first submission
+# poll_secs = 30 # 1..86400; also the spool retry delay while pending
+# submit = ["executable", "script", "office", "pdf", "archive", "disk_image", "html"]
+# max_file_size = 20971520 # risky parts above this limit fail closed
+# on_timeout = "quarantine" # or deliver; other security findings still apply
+# cache_ttl_secs = 86400 # 1..31536000 for terminal verdicts/failures
+
 [scanner.extract]
 max_depth = 5
 max_uncompressed_bytes = 209715200

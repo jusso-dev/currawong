@@ -8,6 +8,10 @@ pub mod clamav;
 pub mod combine;
 pub mod engines;
 pub mod pool;
+mod service_http;
+pub use service_http::ServiceError;
+pub mod rspamd;
+pub mod sandbox;
 pub mod urls;
 
 pub use clamav::{ClamdAddress, ClamdClient};

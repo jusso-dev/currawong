@@ -28,6 +28,11 @@
 //!   `lookalike` (the strongest finding, 0 to 1); `bec` (0 to 1, inbound only)
 //!   with flags `bec.<reason>` such as `bec.display_name_spoof` and
 //!   `bec.payment_change`.
+//!
+//! HTTP engines add `rspamd` (raw score), `rspamd.ratio`,
+//! `rspamd.action.<action>`, positive `rspamd.<symbol>` (lower case, 256 max),
+//! `rspamd.phishing` (PHISHING/PHISHED_*), `sandbox` (maximum score, 0..1),
+//! `sandbox.malicious`, `sandbox.pending` and `sandbox.timeout`.
 use currawong_core::{AuthResults, PartFlag, ScanReport, UrlSource};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -64,6 +69,43 @@ impl Signals {
         }
         if let Some(spam) = &report.spam {
             signals.score("spam", spam.total);
+        }
+        if let Some(rspamd) = &report.rspamd {
+            signals.score("rspamd", rspamd.score);
+            if rspamd.required_score > 0.0 {
+                let ratio = rspamd.score / rspamd.required_score;
+                if ratio.is_finite() {
+                    signals.score("rspamd.ratio", ratio);
+                }
+            }
+            signals.flag(&format!("rspamd.action.{}", rspamd.action));
+            for symbol in rspamd.symbols.iter().filter(|s| s.score > 0.0).take(256) {
+                let name = symbol.name.to_ascii_lowercase();
+                // Restrict names to a single symbol namespace.
+                if name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                    signals.flag(&format!("rspamd.{name}"));
+                    if name == "phishing" || name.starts_with("phished_") {
+                        signals.flag("rspamd.phishing");
+                    }
+                }
+            }
+        }
+        if !report.sandbox.is_empty() {
+            signals.score(
+                "sandbox",
+                report.sandbox.iter().map(|r| r.score).fold(0.0, f64::max),
+            );
+            for result in &report.sandbox {
+                if result.malicious {
+                    signals.flag("sandbox.malicious");
+                }
+                if result.status == "pending" {
+                    signals.flag("sandbox.pending");
+                }
+                if result.status == "timeout" {
+                    signals.flag("sandbox.timeout");
+                }
+            }
         }
         if let Some(bec) = &report.bec {
             signals.score("bec", bec.score);

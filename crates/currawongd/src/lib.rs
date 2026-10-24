@@ -52,6 +52,18 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
     guard
         .enforce_startup(&sinks)
         .map_err(|err| format!("events: {err}"))?;
+    if !cfg.scanner.rspamd.url.is_empty() {
+        currawong_scan::rspamd::RspamdClient::new(
+            &cfg.scanner.rspamd,
+            Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?),
+        )?;
+    }
+    if !cfg.scanner.sandbox.url.is_empty() {
+        currawong_scan::sandbox::cape::Cape::new(
+            &cfg.scanner.sandbox,
+            Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?),
+        )?;
+    }
     yara_summary(&cfg)?;
     if cfg.url_rewrite.enabled {
         url_rewriter(&cfg)?;

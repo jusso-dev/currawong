@@ -221,9 +221,12 @@ impl Walk<'_, '_> {
                 || content_type.as_deref() == Some("text/html");
             self.budget
                 .check(bytes, filename.as_deref(), html, &mut flags);
-            let entry = self
+            let mut entry = self
                 .budget
                 .part(filename.as_deref(), content_type, bytes, flags);
+            entry.is_attachment |= part
+                .content_disposition()
+                .is_some_and(|d| d.is_attachment());
             self.parts.push(entry);
         }
     }

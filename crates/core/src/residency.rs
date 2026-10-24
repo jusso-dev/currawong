@@ -624,6 +624,15 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
 /// `residency.content_endpoints` plus the S3 quarantine blob endpoint, if any.
 fn content_endpoints(cfg: &Config) -> Vec<String> {
     let mut endpoints = cfg.residency.content_endpoints.clone();
+    for endpoint in [
+        &cfg.scanner.rspamd.url,
+        &cfg.scanner.rspamd.controller_url,
+        &cfg.scanner.sandbox.url,
+    ] {
+        if !endpoint.is_empty() {
+            endpoints.push(endpoint.clone());
+        }
+    }
     if cfg.quarantine.blob_store.kind == "s3" {
         endpoints.push(cfg.quarantine.blob_store.endpoint.clone());
     }

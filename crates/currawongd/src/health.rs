@@ -111,8 +111,29 @@ impl ReadinessCheck for SignaturesReady {
     }
 }
 
+pub struct RspamdReady {
+    pub cfg: Config,
+}
+#[async_trait]
+impl ReadinessCheck for RspamdReady {
+    fn name(&self) -> &'static str {
+        "rspamd"
+    }
+    async fn check(&self) -> Result<(), String> {
+        let mut config = self.cfg.scanner.rspamd.clone();
+        config.timeout_secs = 2;
+        let guard = Arc::new(
+            currawong_core::ResidencyGuard::from_config(&self.cfg.residency)
+                .map_err(|e| e.to_string())?,
+        );
+        currawong_scan::rspamd::RspamdClient::new(&config, guard)?
+            .ping()
+            .await
+    }
+}
+
 pub fn checks_for(cfg: &Config) -> Vec<Arc<dyn ReadinessCheck>> {
-    vec![
+    let mut checks: Vec<Arc<dyn ReadinessCheck>> = vec![
         Arc::new(SpoolWritable {
             dir: cfg.spool.dir.clone(),
         }),
@@ -125,7 +146,11 @@ pub fn checks_for(cfg: &Config) -> Vec<Arc<dyn ReadinessCheck>> {
             dirs: cfg.scanner.extra_signature_dirs.clone(),
             files: cfg.scanner.extra_database_paths.clone(),
         }),
-    ]
+    ];
+    if cfg.scanner.enabled && cfg.scanner.rspamd.required {
+        checks.push(Arc::new(RspamdReady { cfg: cfg.clone() }));
+    }
+    checks
 }
 
 pub fn reload_certificates(tls: &TlsManager, cert: &Path, key: &Path) -> Result<(), String> {

@@ -19,7 +19,10 @@ use currawong_policy::{
 };
 use currawong_scan::engines::yara::{self, CompiledRules, PollWatcher};
 use currawong_scan::pool::{display_name, sweep};
+use currawong_scan::rspamd::{MessageMetadata, RspamdClient};
+use currawong_scan::sandbox::SandboxEngine;
 use currawong_scan::urls::{Delivery, UrlRewriter};
+use currawong_scan::ServiceError;
 use currawong_scan::{
     combine, ClamdAddress, ClamdClient, EngineOutput, ScanOutcome, WorkerPool, YaraEngine,
 };
@@ -34,6 +37,8 @@ pub const URL_REWRITE_SKIPPED: &str = "url_rewrite.skipped";
 const MAX_TOKEN_RECIPIENTS: usize = 256;
 
 pub struct Pipeline {
+    rspamd: Option<Result<RspamdClient, String>>,
+    sandbox: Option<Result<SandboxEngine, String>>,
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
     pub pool: Option<WorkerPool>,
@@ -98,7 +103,25 @@ impl Pipeline {
                 }
                 None => (None, None),
             };
+        let guard = || {
+            currawong_core::ResidencyGuard::from_config(&cfg.residency)
+                .map(Arc::new)
+                .map_err(|err| err.to_string())
+        };
+        let rspamd = (!cfg.scanner.rspamd.url.is_empty())
+            .then(|| guard().and_then(|guard| RspamdClient::new(&cfg.scanner.rspamd, guard)));
+        let sandbox = (!cfg.scanner.sandbox.url.is_empty()).then(|| {
+            guard().and_then(|guard| {
+                SandboxEngine::new(
+                    &cfg.scanner.sandbox,
+                    guard,
+                    &cfg.spool.dir.join("sandbox.sqlite3"),
+                )
+            })
+        });
         Self {
+            rspamd,
+            sandbox,
             cfg,
             auth,
             pool,
@@ -546,35 +569,41 @@ impl Pipeline {
                 },
             ));
         }
-        if self.cfg.scanner.clamd.address.is_empty() && self.cfg.scanner.clamd.required {
+        let (clamav, rspamd) = tokio::join!(
+            self.scan_clamav(raw, &report.parts),
+            self.scan_rspamd(env, raw)
+        );
+        if let Some(output) = clamav {
+            outputs.push(output);
+        }
+        if let Some(result) = rspamd {
+            let result = match result {
+                Ok(result) => {
+                    report.rspamd = Some(result);
+                    currawong_scan::EngineResult::Clean
+                }
+                Err(err) => err.engine_result(),
+            };
             outputs.push(EngineOutput {
-                name: "clamav".into(),
-                result: currawong_scan::EngineResult::Failed {
-                    reason: "clamd is required and no address is configured".into(),
-                    unreachable: true,
-                },
-                required: true,
+                name: "rspamd".into(),
+                result,
+                required: self.cfg.scanner.rspamd.required,
             });
         }
-        if !self.cfg.scanner.clamd.address.is_empty() {
-            match ClamdAddress::parse(&self.cfg.scanner.clamd.address) {
-                Ok(address) => {
-                    let client = ClamdClient::new(address, self.cfg.scanner.clamd.required);
-                    let result = client.scan_message(raw, &report.parts).await;
-                    let mut output = finding("clamav", &result);
-                    output.required = self.cfg.scanner.clamd.required;
-                    outputs.push(output);
+        if let Some(sandbox) = &self.sandbox {
+            match sandbox {
+                Ok(sandbox) => {
+                    let assessment = sandbox.assess(&report.parts).await;
+                    report.sandbox = assessment.results;
+                    report.defer |= assessment.pending;
+                    report.notes.extend(assessment.notes);
+                    outputs.extend(assessment.outputs);
                 }
-                Err(err) => {
-                    outputs.push(EngineOutput {
-                        name: "clamav".into(),
-                        result: currawong_scan::EngineResult::Failed {
-                            reason: err,
-                            unreachable: self.cfg.scanner.clamd.required,
-                        },
-                        required: self.cfg.scanner.clamd.required,
-                    });
-                }
+                Err(reason) => outputs.push(EngineOutput {
+                    name: "sandbox".into(),
+                    required: self.cfg.scanner.sandbox.required,
+                    result: ServiceError::unavailable(reason.clone()).engine_result(),
+                }),
             }
         }
         let combined = combine(&outputs, parser_failed);
@@ -587,7 +616,20 @@ impl Pipeline {
             report.engines.push(EngineFinding {
                 engine: output.name.clone(),
                 result: format!("{:?}", output.result),
-                detail: String::new(),
+                detail: if output.name == "rspamd" {
+                    report
+                        .rspamd
+                        .as_ref()
+                        .map(|r| {
+                            format!(
+                                "action={}, score={}, required_score={}",
+                                r.action, r.score, r.required_score
+                            )
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                },
             });
         }
         self.classify(env, raw, &mut report).await;
@@ -595,6 +637,65 @@ impl Pipeline {
         let decision = self.decide(env, &report);
         self.feedback(env, &report, &decision.verdict());
         (report, decision, rewritten)
+    }
+
+    async fn scan_rspamd(
+        &self,
+        env: &Envelope,
+        raw: &[u8],
+    ) -> Option<Result<currawong_core::RspamdResult, ServiceError>> {
+        let client = self.rspamd.as_ref()?;
+        Some(match client {
+            Ok(client) => {
+                client
+                    .scan_message(
+                        raw,
+                        MessageMetadata {
+                            ip: &env.remote_ip.to_string(),
+                            helo: &env.helo,
+                            hostname: &env.helo,
+                            from: &env.mail_from,
+                            recipients: &env.rcpt_to,
+                            queue_id: env.id.as_str(),
+                            user: env.authenticated_as.as_deref(),
+                        },
+                    )
+                    .await
+            }
+            Err(err) => Err(ServiceError::unavailable(err.clone())),
+        })
+    }
+
+    async fn scan_clamav(
+        &self,
+        raw: &[u8],
+        parts: &[currawong_core::PartInfo],
+    ) -> Option<EngineOutput> {
+        let cfg = &self.cfg.scanner.clamd;
+        if cfg.address.is_empty() {
+            return cfg.required.then(|| EngineOutput {
+                name: "clamav".into(),
+                required: true,
+                result: ServiceError::unavailable("clamd is required and no address is configured")
+                    .engine_result(),
+            });
+        }
+        let result = match ClamdAddress::parse(&cfg.address) {
+            Ok(address) => {
+                ClamdClient::new(address, cfg.required)
+                    .scan_message(raw, parts)
+                    .await
+            }
+            Err(err) => currawong_scan::EngineResult::Failed {
+                reason: err,
+                unreachable: cfg.required,
+            },
+        };
+        Some(EngineOutput {
+            name: "clamav".into(),
+            result,
+            required: cfg.required,
+        })
     }
 
     /// Tenant and direction per recipient: a message can reach several tenants,
@@ -676,6 +777,11 @@ impl Pipeline {
     /// the released message id, so a retry does not train twice. Failure is
     /// logged and never holds up delivery.
     pub async fn learn_released(&self, env: &Envelope, raw: &[u8]) {
+        if let Some(Ok(rspamd)) = &self.rspamd {
+            if let Err(err) = rspamd.learn(raw, false).await {
+                tracing::warn!(id = %env.id, %err, "Rspamd release not learned");
+            }
+        }
         let Some(classifier) = self.classifier.clone() else {
             return;
         };

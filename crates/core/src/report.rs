@@ -72,6 +72,9 @@ impl PartFlag {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PartInfo {
+    /// Explicit MIME attachment disposition or a named part/archive member.
+    #[serde(default)]
+    pub is_attachment: bool,
     pub content_type: String,
     pub filename: Option<String>,
     pub size: u64,
@@ -203,6 +206,37 @@ pub struct FoundUrl {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RspamdSymbol {
+    pub name: String,
+    pub score: f64,
+    #[serde(default)]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RspamdResult {
+    pub score: f64,
+    pub required_score: f64,
+    pub action: String,
+    pub symbols: Vec<RspamdSymbol>,
+    #[serde(default)]
+    pub messages: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SandboxResult {
+    pub sha256: String,
+    pub task_id: Option<String>,
+    /// pending, done, timeout or failed.
+    pub status: String,
+    pub malicious: bool,
+    /// Normalised to 0..1.
+    pub score: f64,
+    pub signatures: Vec<String>,
+    pub report_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ScanReport {
     pub message_id: MessageId,
     pub auth: Option<AuthResults>,
@@ -212,6 +246,10 @@ pub struct ScanReport {
     #[serde(default)]
     pub url_sources: Vec<FoundUrl>,
     pub engines: Vec<EngineFinding>,
+    #[serde(default)]
+    pub rspamd: Option<RspamdResult>,
+    #[serde(default)]
+    pub sandbox: Vec<SandboxResult>,
     /// Every YARA rule match, for policy to act on by rule name or tag.
     #[serde(default)]
     pub yara: Vec<YaraMatch>,
@@ -370,6 +408,8 @@ impl ScanReport {
             urls: Vec::new(),
             url_sources: Vec::new(),
             engines: Vec::new(),
+            rspamd: None,
+            sandbox: Vec::new(),
             yara: Vec::new(),
             malware: false,
             active_content: false,

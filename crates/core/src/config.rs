@@ -189,6 +189,8 @@ pub struct ScannerConfig {
     pub worker_binary: Option<PathBuf>,
     pub clamd: ClamdConfig,
     pub yara: YaraConfig,
+    pub rspamd: RspamdConfig,
+    pub sandbox: SandboxConfig,
     /// Directories of supplemental on-premises signatures (the SaneSecurity
     /// approach). Currawong does not upload mail. Point `clamd` at these
     /// paths as well; they are recorded and checked locally.
@@ -207,6 +209,75 @@ pub struct ScannerConfig {
     pub worker_gid: Option<u32>,
     /// A message deferred by the scanner this many times is quarantined.
     pub max_scan_deferrals: u32,
+}
+
+/// Empty URL disables scanning. Learning needs a separate controller URL.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RspamdConfig {
+    pub url: String,
+    pub controller_url: String,
+    pub password_file: Option<PathBuf>,
+    pub required: bool,
+    pub timeout_secs: u64,
+    pub max_size: usize,
+}
+
+impl Default for RspamdConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            controller_url: String::new(),
+            password_file: None,
+            required: false,
+            timeout_secs: 15,
+            max_size: 52_428_800,
+        }
+    }
+}
+
+/// On-premises sandbox; the SQLite task/verdict cache lives in spool.dir.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SandboxConfig {
+    pub kind: String,
+    pub url: String,
+    pub token_file: Option<PathBuf>,
+    pub required: bool,
+    pub max_wait_secs: u64,
+    pub poll_secs: u64,
+    pub submit: Vec<String>,
+    pub max_file_size: u64,
+    pub on_timeout: String,
+    pub cache_ttl_secs: u64,
+}
+
+impl Default for SandboxConfig {
+    fn default() -> Self {
+        Self {
+            kind: "cape".into(),
+            url: String::new(),
+            token_file: None,
+            required: false,
+            max_wait_secs: 900,
+            poll_secs: 30,
+            submit: [
+                "executable",
+                "script",
+                "office",
+                "pdf",
+                "archive",
+                "disk_image",
+                "html",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            max_file_size: 20 * 1024 * 1024,
+            on_timeout: "quarantine".into(),
+            cache_ttl_secs: 86_400,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1153,6 +1224,8 @@ impl Default for ScannerConfig {
             worker_binary: None,
             clamd: ClamdConfig::default(),
             yara: YaraConfig::default(),
+            rspamd: RspamdConfig::default(),
+            sandbox: SandboxConfig::default(),
             extra_signature_dirs: Vec::new(),
             extra_database_paths: Vec::new(),
             blocked_extensions: default_blocked_extensions(),
@@ -1554,6 +1627,67 @@ impl Config {
         }
         if !self.scanner.clamd.address.is_empty() {
             parse_clamd_address(&self.scanner.clamd.address)?;
+        }
+        let rspamd = &self.scanner.rspamd;
+        let sandbox = &self.scanner.sandbox;
+        for (name, endpoint, required) in [
+            ("scanner.rspamd.url", &rspamd.url, rspamd.required),
+            (
+                "scanner.rspamd.controller_url",
+                &rspamd.controller_url,
+                false,
+            ),
+            ("scanner.sandbox.url", &sandbox.url, sandbox.required),
+        ] {
+            if endpoint.is_empty() {
+                if required {
+                    return Err(ConfigError::Invalid(format!("{name} is required")));
+                }
+                continue;
+            }
+            let url = url::Url::parse(endpoint)
+                .map_err(|_| ConfigError::Invalid(format!("{name} must be an HTTP(S) base URL")))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "{name} must be an HTTP(S) base URL without credentials, query or fragment"
+                )));
+            }
+        }
+        if rspamd.timeout_secs == 0 || rspamd.timeout_secs > 3600 || rspamd.max_size == 0 {
+            return Err(ConfigError::Invalid(
+                "scanner.rspamd timeout_secs and max_size must be positive".into(),
+            ));
+        }
+        if sandbox.kind != "cape" {
+            return Err(ConfigError::Invalid("scanner.sandbox.kind: only cape is supported; DRAKVUF has no verified verdict contract".into()));
+        }
+        if sandbox.max_wait_secs == 0
+            || sandbox.poll_secs == 0
+            || sandbox.max_file_size == 0
+            || sandbox.cache_ttl_secs == 0
+            || sandbox.max_wait_secs > 604_800
+            || sandbox.poll_secs > 86_400
+            || sandbox.cache_ttl_secs > 31_536_000
+            || !matches!(sandbox.on_timeout.as_str(), "quarantine" | "deliver")
+            || sandbox.submit.iter().any(|v| {
+                !matches!(
+                    v.as_str(),
+                    "executable" | "script" | "office" | "pdf" | "archive" | "disk_image" | "html"
+                )
+            })
+        {
+            return Err(ConfigError::Invalid("scanner.sandbox: invalid bounds, submit category or on_timeout (quarantine|deliver)".into()));
+        }
+        if !self.scanner.enabled && (rspamd.required || sandbox.required) {
+            return Err(ConfigError::Invalid(
+                "required HTTP scanners need scanner.enabled".into(),
+            ));
         }
         if self.scanner.worker_uid.is_some() != self.scanner.worker_gid.is_some() {
             return Err(ConfigError::Invalid(
@@ -2209,5 +2343,65 @@ mod tests {
         cfg.spool.dir = PathBuf::from("relative/spool");
         let err = cfg.validate().unwrap_err();
         assert!(err.to_string().contains("absolute"));
+    }
+}
+
+#[cfg(test)]
+mod http_engine_tests {
+    use super::*;
+    fn config() -> Config {
+        Config::load(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/currawong.example.toml"),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn http_engines_are_off_and_old_configs_remain_valid() {
+        let cfg = config();
+        cfg.validate().unwrap();
+        assert!(cfg.scanner.rspamd.url.is_empty());
+        assert!(!cfg.scanner.rspamd.required);
+        assert!(cfg.scanner.sandbox.url.is_empty());
+        assert!(!cfg.scanner.sandbox.required);
+        let old = crate::ScanReport::new(crate::MessageId("old".into()));
+        let mut value = serde_json::to_value(old).unwrap();
+        value.as_object_mut().unwrap().remove("rspamd");
+        value.as_object_mut().unwrap().remove("sandbox");
+        let report: crate::ScanReport = serde_json::from_value(value).unwrap();
+        assert!(report.rspamd.is_none());
+        assert!(report.sandbox.is_empty());
+    }
+    #[test]
+    fn http_engine_config_checks_bounds_residency_and_unknown_fields() {
+        for mutate in [
+            |c: &mut Config| c.scanner.rspamd.required = true,
+            |c: &mut Config| c.scanner.rspamd.timeout_secs = 0,
+            |c: &mut Config| c.scanner.rspamd.url = "https://foreign.example".into(),
+            |c: &mut Config| c.scanner.rspamd.controller_url = "https://foreign.example".into(),
+            |c: &mut Config| c.scanner.sandbox.url = "https://foreign.example".into(),
+            |c: &mut Config| c.scanner.sandbox.kind = "drakvuf".into(),
+            |c: &mut Config| c.scanner.sandbox.poll_secs = 0,
+            |c: &mut Config| c.scanner.sandbox.max_wait_secs = u64::MAX,
+            |c: &mut Config| c.scanner.sandbox.on_timeout = "ignore".into(),
+            |c: &mut Config| c.scanner.sandbox.submit = vec!["everything".into()],
+            |c: &mut Config| c.scanner.rspamd.url = "http://user:password@127.0.0.1".into(),
+        ] {
+            let mut cfg = config();
+            mutate(&mut cfg);
+            assert!(cfg.validate().is_err());
+        }
+        assert!(toml::from_str::<RspamdConfig>("typo = true").is_err());
+        assert!(toml::from_str::<SandboxConfig>("typo = true").is_err());
+        let mut cfg = config();
+        cfg.scanner.rspamd.url = "http://127.0.0.1:11333".into();
+        cfg.scanner.rspamd.controller_url = "http://127.0.0.1:11334".into();
+        cfg.scanner.sandbox.url = "http://127.0.0.1:8000".into();
+        cfg.validate().unwrap();
+        let guard = ResidencyGuard::from_config(&cfg.residency).unwrap();
+        let report = guard.report("test", &cfg);
+        assert!(report
+            .endpoints
+            .iter()
+            .any(|e| e.url == cfg.scanner.sandbox.url));
     }
 }
