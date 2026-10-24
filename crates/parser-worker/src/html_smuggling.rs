@@ -2,6 +2,7 @@
 //! from an inline payload and the JavaScript calls that turn one into a
 //! download in the browser.
 use regex::bytes::Regex;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// Base64 inside scripts (summed over every chunk of at least
@@ -22,8 +23,10 @@ const FLAG_POINTS: u32 = 14;
 const LARGE_POINTS: u32 = 8;
 const SMALL_POINTS: u32 = 4;
 const CALL_POINTS: u32 = 3;
-/// A Blob together with an object URL or save call for it. With one more
-/// call (a download trigger, `atob`) or a small payload it is flagged.
+/// A Blob together with an object URL or save call for it, or a download
+/// link to a `data:` file. With one more call (a download trigger, `atob`)
+/// or a small payload a Blob chain is flagged; a download link needs a
+/// large payload.
 const CHAIN_POINTS: u32 = 5;
 
 struct Calls {
@@ -32,6 +35,10 @@ struct Calls {
     object_url: Regex,
     ms_save: Regex,
     download: Regex,
+    /// `<a download>`: the browser saves the link target instead of opening it.
+    download_link: Regex,
+    /// A link to a `data:` file that is not an image.
+    data_href: Regex,
 }
 
 /// Whitespace and quoted property access (`window["atob"]`) are allowed.
@@ -47,6 +54,8 @@ fn calls() -> &'static Calls {
             download: re(
                 r#"\.\s*download\s*=[^=]|setAttribute\s*\(\s*["']download["']|\[\s*["']download["']\s*\]\s*=[^=]"#,
             ),
+            download_link: re(r"(?i)<a\s[^>]*\sdownload(?:\s|=|/?>)"),
+            data_href: re(r#"(?i)\shref\s*=\s*["']?\s*data:(?:application/|text/html)"#),
         }
     })
 }
@@ -72,7 +81,8 @@ fn points(html: &[u8]) -> u32 {
     let blob = calls.blob.is_match(html);
     let object_url = calls.object_url.is_match(html);
     let ms_save = calls.ms_save.is_match(html);
-    let download = calls.download.is_match(html);
+    let download_link = calls.download_link.is_match(html);
+    let download = download_link || calls.download.is_match(html);
     let atob = calls.atob.is_match(html);
     for hit in [blob, atob, object_url, ms_save, download] {
         if hit {
@@ -82,7 +92,25 @@ fn points(html: &[u8]) -> u32 {
     if blob && (object_url || ms_save) {
         points += CHAIN_POINTS;
     }
+    if download_link && calls.data_href.is_match(html) {
+        points += CHAIN_POINTS;
+    }
     points.min(MAX_POINTS)
+}
+
+/// HTML saved as UTF-16 with a byte order mark, as UTF-8: browsers read the
+/// mark, and the patterns here only match ASCII. Other bytes are unchanged.
+pub fn decoded(bytes: &[u8]) -> Cow<'_, [u8]> {
+    let unit: fn([u8; 2]) -> u16 = match bytes {
+        [0xFF, 0xFE, ..] => u16::from_le_bytes,
+        [0xFE, 0xFF, ..] => u16::from_be_bytes,
+        _ => return Cow::Borrowed(bytes),
+    };
+    let units = bytes[2..].as_chunks::<2>().0.iter().map(|pair| unit(*pair));
+    let text: String = char::decode_utf16(units)
+        .map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER))
+        .collect();
+    Cow::Owned(text.into_bytes())
 }
 
 /// HTML by MIME type, attachment name, or a sniff of the first bytes of a

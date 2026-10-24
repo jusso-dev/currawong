@@ -134,15 +134,18 @@ impl Job {
 /// A request frame as a job for the parse thread, or the id and reason to
 /// fail it with.
 fn job(frame: &[u8], limits: &WorkerLimits) -> Result<Job, (String, String)> {
-    if let Ok(load) = serde_json::from_slice::<LoadRules>(frame) {
-        return Ok(Job::Load(load));
-    }
-    let request = serde_json::from_slice::<ParseRequest>(frame)
-        .map_err(|err| ("request".to_string(), err.to_string()))?;
+    let job = match serde_json::from_slice::<LoadRules>(frame) {
+        Ok(load) => Job::Load(load),
+        Err(_) => Job::Parse(
+            serde_json::from_slice::<ParseRequest>(frame)
+                .map_err(|err| ("request".to_string(), err.to_string()))?,
+        ),
+    };
+    // Rule loads too: otherwise a load runs on what the last parse left.
     if let Err(err) = sandbox::start_job(limits) {
-        return Err((request.id, format!("cpu limit: {err}")));
+        return Err((job.id(), format!("cpu limit: {err}")));
     }
-    Ok(Job::Parse(request))
+    Ok(job)
 }
 
 /// The one thread that loads rules and parses, for the worker's whole life.

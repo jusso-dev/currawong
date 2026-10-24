@@ -191,3 +191,76 @@ fn html_smuggling_attachment_is_flagged_and_the_newsletter_body_is_not() {
         .collect();
     assert_eq!(flagged, vec![Some("Invoice.HTM".to_string())]);
 }
+
+fn utf16(html: &str, little_endian: bool) -> Vec<u8> {
+    let mut out = if little_endian {
+        vec![0xFF, 0xFE]
+    } else {
+        vec![0xFE, 0xFF]
+    };
+    for unit in html.encode_utf16() {
+        out.extend_from_slice(&if little_endian {
+            unit.to_le_bytes()
+        } else {
+            unit.to_be_bytes()
+        });
+    }
+    out
+}
+
+#[test]
+fn html_smuggling_saved_as_utf16_is_flagged_as_a_part_and_a_zip_member() {
+    use std::io::Write;
+    for little_endian in [true, false] {
+        let page = utf16(&smuggling_page(), little_endian);
+        let raw = message_with_bytes("invoice.html", &page);
+        let parsed = parse_bytes("m4", &raw, &ExtractLimits::default());
+        assert!(
+            parsed
+                .parts
+                .iter()
+                .any(|part| part.filename.as_deref() == Some("invoice.html")
+                    && part.flags.contains(&PartFlag::HtmlSmuggling)),
+            "little endian {little_endian}: {:?}",
+            parsed.parts
+        );
+
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("invoice.htm", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(&page).unwrap();
+        let archive = zip.finish().unwrap().into_inner();
+        let raw = message_with_bytes("invoice.zip", &archive);
+        let parsed = parse_bytes("m5", &raw, &ExtractLimits::default());
+        assert!(
+            parsed
+                .parts
+                .iter()
+                .any(|part| part.filename.as_deref() == Some("invoice.htm")
+                    && part.flags.contains(&PartFlag::HtmlSmuggling)),
+            "little endian {little_endian}: {:?}",
+            parsed.parts
+        );
+    }
+}
+
+#[test]
+fn html_smuggling_download_link_to_a_data_file_is_flagged_with_a_large_payload() {
+    let link = |bytes: usize| {
+        format!(
+            r#"<html><body><p>Your invoice is ready.</p>
+<a href="data:application/octet-stream;base64,{}" download="invoice.iso">Download</a>
+</body></html>"#,
+            payload(bytes)
+        )
+    };
+    assert!(flagged(&link(60 * 1024)));
+    assert!(!flagged(&link(10 * 1024)));
+    // An inline image beside a download link is not a data file.
+    let image = format!(
+        r#"<html><body><img src="data:image/png;base64,{}">
+<a href="https://example.test/report.pdf" download>Report</a></body></html>"#,
+        payload(60 * 1024)
+    );
+    assert!(!flagged(&image));
+}

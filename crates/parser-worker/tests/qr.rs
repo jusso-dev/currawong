@@ -189,17 +189,66 @@ fn qr_broken_images_decode_to_nothing_and_huge_ones_are_over_the_limit() {
     let png = qr_png("https://evil.example/login");
     assert_eq!(decode(&png[..png.len() / 2]), Ok(Vec::new()));
     assert_eq!(decode(b"\x89PNG\r\n\x1a\nnot really"), Ok(Vec::new()));
-    assert_eq!(decode(&png_header(6000, 6000)), Err(qr::Skipped::TooLarge));
+    // 36 MP, an A4 scan at 600 dpi: not read, but not a bomb.
+    assert_eq!(decode(&png_header(6000, 6000)), Err(qr::Skipped::Budget));
+    assert_eq!(
+        decode(&png_header(20000, 20000)),
+        Err(qr::Skipped::TooLarge)
+    );
 
-    // In a message the skipped image fails closed.
-    let raw = message_with_image("huge.png", &png_header(6000, 6000));
-    let parsed = parse_bytes("m5", &raw, &ExtractLimits::default());
-    let huge = parsed
+    let flags = |image: &[u8]| {
+        let raw = message_with_image("huge.png", image);
+        let parsed = parse_bytes("m5", &raw, &ExtractLimits::default());
+        parsed
+            .parts
+            .into_iter()
+            .find(|part| part.filename.as_deref() == Some("huge.png"))
+            .unwrap()
+            .flags
+    };
+    // A large scan is tagged, not held.
+    let scan = flags(&png_header(6000, 6000));
+    assert!(scan.contains(&PartFlag::QrSkipped), "{scan:?}");
+    assert!(!scan.contains(&PartFlag::LimitExceeded), "{scan:?}");
+    // A possible decode bomb fails closed.
+    let bomb = flags(&png_header(20000, 20000));
+    assert!(bomb.contains(&PartFlag::LimitExceeded), "{bomb:?}");
+}
+
+#[test]
+fn qr_inverted_code_beside_a_normal_one_is_read() {
+    let benign = qr_grey("https://example.test/menu");
+    let mut phishing = qr_grey("https://evil.example/login");
+    image::imageops::invert(&mut phishing);
+    let mut canvas = GrayImage::from_pixel(
+        benign.width() + phishing.width() + 40,
+        benign.height().max(phishing.height()) + 40,
+        Luma([255]),
+    );
+    image::imageops::overlay(&mut canvas, &benign, 10, 10);
+    image::imageops::overlay(&mut canvas, &phishing, i64::from(benign.width()) + 30, 10);
+    let mut codes = decode(&png(canvas)).unwrap();
+    codes.sort();
+    assert_eq!(
+        codes,
+        vec!["https://evil.example/login", "https://example.test/menu"]
+    );
+}
+
+#[test]
+fn qr_urls_are_capped_per_message_and_the_rest_flagged_qr_skipped() {
+    let many: Vec<String> = (0..qr::MAX_URLS + 20)
+        .map(|i| format!("WWW.A{i}.TEST"))
+        .collect();
+    let raw = message_with_image("many.png", &qr_png(&many.join(" ")));
+    let parsed = parse_bytes("m9", &raw, &ExtractLimits::default());
+    assert_eq!(qr_from(&parsed).len(), qr::MAX_URLS);
+    let part = parsed
         .parts
         .iter()
-        .find(|part| part.filename.as_deref() == Some("huge.png"))
+        .find(|part| part.filename.as_deref() == Some("many.png"))
         .unwrap();
-    assert!(huge.flags.contains(&PartFlag::LimitExceeded), "{huge:?}");
+    assert!(part.flags.contains(&PartFlag::QrSkipped), "{part:?}");
 }
 
 #[test]

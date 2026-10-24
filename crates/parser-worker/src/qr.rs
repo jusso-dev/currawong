@@ -1,16 +1,19 @@
 //! QR codes in images and, with the `pdfium` feature, the first pages of a
 //! PDF. URLs in them join the message's links for link analysis. Nothing is
-//! fetched. Work is bounded per image and per message. An image too large
-//! to decode safely is [`Skipped::TooLarge`] (the part fails closed as
-//! `LimitExceeded`); one past the per-message QR budget is
+//! fetched. Work is bounded per image and per message. An image with
+//! dimensions no camera or scanner produces is a possible decode bomb,
+//! [`Skipped::TooLarge`] (the part fails closed as `LimitExceeded`); one
+//! merely too large to decode, or past the per-message QR budget, is
 //! [`Skipped::Budget`] (flagged `QrSkipped`, the message is not held).
-use image::imageops::FilterType;
 use image::{DynamicImage, GrayImage, ImageError, ImageReader, Limits, Luma};
 use std::io::Cursor;
 use std::time::{Duration, Instant};
 
 /// A 24 MP phone photo decodes; larger images are skipped.
 const MAX_DECODE_PIXELS: u64 = 25_000_000;
+/// Past this (an A4 page at 1,200 dpi is 140 MP) an image is a possible
+/// decode bomb rather than a large photo or scan.
+const BOMB_PIXELS: u64 = 250_000_000;
 const MAX_ALLOC: u64 = 128 * 1024 * 1024;
 /// Larger decoded images are scaled down to about this before detection.
 const DETECT_PIXELS: u64 = 8_000_000;
@@ -22,6 +25,7 @@ const MAX_CODES: usize = 8;
 const MAX_PAYLOAD: usize = 4296;
 /// Per message.
 pub const MAX_IMAGES: usize = 64;
+pub const MAX_URLS: usize = 64;
 pub const MAX_PIXELS: u64 = 200_000_000;
 pub const MAX_TIME: Duration = Duration::from_secs(10);
 /// PDF pages rendered, from the first.
@@ -30,9 +34,10 @@ pub const PDF_PAGES: u16 = 3;
 /// Why an image or page was not read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Skipped {
-    /// Over the per-image pixel or memory cap: a possible decode bomb.
+    /// Dimensions past [`BOMB_PIXELS`]: a possible decode bomb.
     TooLarge,
-    /// The message's QR budget (images, pixels or time) was used up.
+    /// Over the per-image pixel or memory cap, or the message's QR budget
+    /// (images, pixels, time or URLs) was used up.
     Budget,
 }
 
@@ -55,8 +60,11 @@ impl Budget {
             return Ok(Vec::new());
         }
         let pixels = u64::from(width) * u64::from(height);
-        if pixels > MAX_DECODE_PIXELS {
+        if pixels > BOMB_PIXELS {
             return Err(Skipped::TooLarge);
+        }
+        if pixels > MAX_DECODE_PIXELS {
+            return Err(Skipped::Budget);
         }
         self.admit(pixels)?;
         let Some(reader) = reader(bytes) else {
@@ -64,7 +72,7 @@ impl Budget {
         };
         match reader.decode() {
             Ok(image) => Ok(decode_grey(&grey(image))),
-            Err(ImageError::Limits(_)) => Err(Skipped::TooLarge),
+            Err(ImageError::Limits(_)) => Err(Skipped::Budget),
             Err(_) => Ok(Vec::new()),
         }
     }
@@ -113,7 +121,8 @@ fn reader(bytes: &[u8]) -> Option<ImageReader<Cursor<&[u8]>>> {
 }
 
 /// Grey on white: transparent pixels become white, so dark modules on a
-/// transparent background still read. Large images are scaled down.
+/// transparent background still read. Large images are scaled down with
+/// integer sums: `resize` would need 16 bytes a pixel on top.
 fn grey(image: DynamicImage) -> GrayImage {
     let grey = if image.color().has_alpha() {
         let image = image.into_luma_alpha8();
@@ -132,21 +141,23 @@ fn grey(image: DynamicImage) -> GrayImage {
     let scale = (DETECT_PIXELS as f64 / pixels as f64).sqrt();
     let width = ((f64::from(grey.width()) * scale) as u32).max(1);
     let height = ((f64::from(grey.height()) * scale) as u32).max(1);
-    image::imageops::resize(&grey, width, height, FilterType::Triangle)
+    image::imageops::thumbnail(&grey, width, height)
 }
 
-/// Light-on-dark codes are read by trying the inverted image when the
-/// image itself has none.
+/// Light-on-dark codes are read from the inverted image, which is always
+/// tried: a benign code must not hide an inverted one beside it.
 fn decode_grey(image: &GrayImage) -> Vec<String> {
     // The detector indexes into the image; a panic on a hostile grid must
     // not take down an in-process parse.
     std::panic::catch_unwind(|| {
-        let codes = read(image, false);
-        if codes.is_empty() {
-            read(image, true)
-        } else {
-            codes
+        let mut codes = read(image, false);
+        for code in read(image, true) {
+            if !codes.contains(&code) {
+                codes.push(code);
+            }
         }
+        codes.truncate(MAX_CODES);
+        codes
     })
     .unwrap_or_default()
 }

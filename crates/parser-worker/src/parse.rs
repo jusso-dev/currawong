@@ -265,8 +265,9 @@ impl ContentChecks {
         kind: &FileKind,
         flags: &mut Vec<PartFlag>,
     ) {
-        if html_smuggling::is_html(html_type, filename, &kind.label, bytes)
-            && html_smuggling::flagged(bytes)
+        let text = html_smuggling::decoded(bytes);
+        if html_smuggling::is_html(html_type, filename, &kind.label, &text)
+            && html_smuggling::flagged(&text)
         {
             flags.push(PartFlag::HtmlSmuggling);
         }
@@ -282,11 +283,22 @@ impl ContentChecks {
                 if !codes.is_empty() {
                     flags.push(PartFlag::QrCode);
                 }
-                self.urls
-                    .extend(qr::urls(&codes).into_iter().map(|url| FoundUrl {
+                for url in qr::urls(&codes) {
+                    let found = FoundUrl {
                         url,
                         source: UrlSource::Qr,
-                    }));
+                    };
+                    if self.urls.contains(&found) {
+                        continue;
+                    }
+                    // Past the cap a message of junk codes could outgrow
+                    // the response frame and fail closed.
+                    if self.urls.len() >= qr::MAX_URLS {
+                        flags.push(PartFlag::QrSkipped);
+                        break;
+                    }
+                    self.urls.push(found);
+                }
             }
             // A possible decode bomb fails closed like an archive limit.
             Err(qr::Skipped::TooLarge) => {
