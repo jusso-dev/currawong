@@ -67,6 +67,9 @@ pub struct ParseResponse {
     /// Extracted text for DLP, bounded by `text::MAX_TEXT_BYTES`.
     #[serde(default)]
     pub dlp: DlpText,
+    /// Decoded message bodies only, at most 64 KiB, for campaign digests.
+    #[serde(default)]
+    pub campaign_body: Box<DlpText>,
     #[serde(default)]
     pub yara: Vec<YaraMatch>,
 }
@@ -86,6 +89,7 @@ impl ParseResponse {
             error: Some(reason.into()),
             warnings: Vec::new(),
             dlp: DlpText::default(),
+            campaign_body: Box::default(),
             yara: Vec::new(),
         }
     }

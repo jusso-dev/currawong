@@ -27,6 +27,10 @@ const MAX_OWN_HOPS: usize = 3;
 struct Plan {
     #[serde(default)]
     sandbox_pending: bool,
+    #[serde(default)]
+    outbreak_id: Option<String>,
+    #[serde(default)]
+    outbreak_hold_until: Option<i64>,
     /// Our headers for every copy: Authentication-Results (inbound), ARC
     /// set (modified inbound) or DKIM signatures (outbound).
     #[serde(default)]
@@ -127,6 +131,9 @@ async fn deliver_released(
     if env.pipeline == RELEASE_HAM_PIPELINE {
         pipeline.learn_released(&env, &raw).await;
     }
+    pipeline
+        .stage_outbreak_copy(item.message_id.as_str(), &env)
+        .await?;
     env.tls = env.tls.max(item.tls);
     if let Some(mode) = item.encrypt {
         let id = env.id.clone();
@@ -163,6 +170,9 @@ async fn deliver_released(
         let report = ScanReport::new(env.id.clone());
         env.prepend_headers = pipeline.delivery_headers(&env, &raw, &report).await?;
     }
+    pipeline
+        .index_delivered_for(item.message_id.as_str(), &env, item.tenant_id.as_deref())
+        .await?;
     env.pipeline = "deliver".into();
     spool.update(&env).await.map_err(|err| err.to_string())?;
     tracing::info!(id = %env.id, "released from quarantine, policy skipped");
@@ -259,6 +269,8 @@ async fn classify_one(
             };
             let plan = Plan {
                 sandbox_pending: report.sandbox.iter().any(|r| r.status == "pending"),
+                outbreak_id: pipeline.outbreak.as_ref().map(|_| env.id.to_string()),
+                outbreak_hold_until: report.outbreak.as_ref().and_then(|r| r.hold_until),
                 headers,
                 bounce: bounce_allowed(&env, &report, &raw),
                 history_sender: pipeline.history_sender(&env, &raw, &report),
@@ -396,6 +408,9 @@ async fn act(
     };
     match verdict {
         Verdict::Deliver => {
+            if let Some(staged_id) = &plan.outbreak_id {
+                pipeline.stage_outbreak_copy(staged_id, &env).await?;
+            }
             // Never delivered as is: the encrypted form, with any rewritten
             // links, goes out as new mail. The spooled body stays the original.
             if let Some(mode) = encrypt::requested(decision) {
@@ -419,6 +434,11 @@ async fn act(
                     .map_err(|err| format!("could not store rewritten links: {err}"))?;
             }
             apply_actions(&mut env, decision, cfg, raw);
+            if let Some(staged_id) = &plan.outbreak_id {
+                pipeline
+                    .index_delivered_for(staged_id, &env, decision.tenant_id.as_deref())
+                    .await?;
+            }
             env.pipeline = "deliver".into();
             spool.update(&env).await.map_err(|err| err.to_string())?;
             if rewritten.is_some() {
@@ -433,7 +453,12 @@ async fn act(
             } else {
                 time::Duration::minutes(5)
             };
-            env.next_attempt_at = Some(OffsetDateTime::now_utc() + delay);
+            let next = OffsetDateTime::now_utc() + delay;
+            env.next_attempt_at = Some(
+                plan.outbreak_hold_until
+                    .and_then(|at| OffsetDateTime::from_unix_timestamp(at).ok())
+                    .map_or(next, |deadline| next.min(deadline)),
+            );
             tracing::info!(id = %env.id, %reason, "scan deferred");
             spool.update(&env).await.map_err(|err| err.to_string())?;
             if env.state != SpoolState::Deferred {

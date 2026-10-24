@@ -46,6 +46,7 @@ pub struct Config {
     pub encrypt: EncryptConfig,
     pub events: EventsConfig,
     pub intel: IntelConfig,
+    pub outbreak: OutbreakConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1668,6 +1669,7 @@ impl Default for Config {
             encrypt: EncryptConfig::default(),
             events: EventsConfig::default(),
             intel: IntelConfig::default(),
+            outbreak: OutbreakConfig::default(),
         }
     }
 }
@@ -1737,6 +1739,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.outbreak.validate().map_err(ConfigError::Invalid)?;
+        if self.outbreak.enabled && !self.scanner.enabled {
+            return Err(ConfigError::Invalid(
+                "outbreak requires scanner.enabled".into(),
+            ));
+        }
         if !self.spool.dir.is_absolute() {
             return Err(ConfigError::Invalid(
                 "spool directory must be an absolute path".into(),
@@ -2627,5 +2635,95 @@ mod http_engine_tests {
             .endpoints
             .iter()
             .any(|e| e.url == cfg.scanner.sandbox.url));
+    }
+}
+
+/// Local post-delivery intelligence, first-seen delay and campaign counts (ADR 0010).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OutbreakConfig {
+    pub enabled: bool,
+    pub retention_days: u64,
+    pub max_messages: usize,
+    pub hold_minutes: u64,
+    pub hold_types: Vec<String>,
+    pub min_tenants: u64,
+    pub known_clean_sha256: Vec<String>,
+    pub retain_parts_hours: u64,
+    pub max_retained_bytes: u64,
+    pub max_part_bytes: u64,
+    pub campaign_window_minutes: u64,
+    pub campaign_threshold: u64,
+}
+
+impl Default for OutbreakConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention_days: 14,
+            max_messages: 100_000,
+            hold_minutes: 30,
+            hold_types: [
+                "executable",
+                "macro_office",
+                "risky_archive",
+                "disk_image",
+                "html",
+                "svg",
+                "active_pdf",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+            min_tenants: 1,
+            known_clean_sha256: Vec::new(),
+            retain_parts_hours: 0,
+            max_retained_bytes: 256 * 1024 * 1024,
+            max_part_bytes: 16 * 1024 * 1024,
+            campaign_window_minutes: 60,
+            campaign_threshold: 5,
+        }
+    }
+}
+
+impl OutbreakConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=365).contains(&self.retention_days)
+            || !(1..=1_000_000).contains(&self.max_messages)
+            || self.hold_minutes > self.retention_days * 1440
+            || !(1..=100_000).contains(&self.min_tenants)
+            || self.retain_parts_hours > self.retention_days * 24
+            || !(1..=1024 * 1024 * 1024).contains(&self.max_retained_bytes)
+            || !(1..=64 * 1024 * 1024).contains(&self.max_part_bytes)
+            || self.max_part_bytes > self.max_retained_bytes
+            || !(1..=1440).contains(&self.campaign_window_minutes)
+            || !(2..=100_000).contains(&self.campaign_threshold)
+        {
+            return Err("outbreak: invalid retention, hold, campaign or storage bounds".into());
+        }
+        for kind in &self.hold_types {
+            if ![
+                "executable",
+                "macro_office",
+                "risky_archive",
+                "disk_image",
+                "html",
+                "svg",
+                "active_pdf",
+            ]
+            .contains(&kind.as_str())
+            {
+                return Err(format!("outbreak: unknown hold type {kind}"));
+            }
+        }
+        if self.known_clean_sha256.len() > 4096
+            || self
+                .known_clean_sha256
+                .iter()
+                .any(|hash| hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err("outbreak.known_clean_sha256: expected at most 4096 SHA-256 values".into());
+        }
+        Ok(())
     }
 }

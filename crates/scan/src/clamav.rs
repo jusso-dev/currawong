@@ -85,6 +85,20 @@ impl ClamdClient {
         self
     }
 
+    /// Includes the signature database version and date. Bounded like PING.
+    pub async fn version(&self) -> Result<String, String> {
+        let deadline = Instant::now() + self.timeout.min(CONNECT_TIMEOUT);
+        let reply = self
+            .round_trip(b"zVERSION\0", &[], deadline)
+            .await
+            .map_err(|err| err.reason)?;
+        if reply.starts_with("ClamAV ") {
+            Ok(reply)
+        } else {
+            Err("clamd VERSION returned an invalid reply".into())
+        }
+    }
+
     pub async fn ping(&self) -> Result<(), String> {
         let deadline = Instant::now() + self.timeout.min(CONNECT_TIMEOUT);
         let reply = self

@@ -37,6 +37,9 @@
 //!   with flags `bec.<reason>` such as `bec.display_name_spoof` and
 //!   `bec.payment_change`.
 //!
+//! Outbreak adds `outbreak.held`, `campaign`; counts `outbreak.first_seen_minutes`,
+//! `campaign.messages`, `campaign.tenants`, `campaign.senders`.
+//!
 //! HTTP engines add `rspamd` (raw score), `rspamd.ratio`,
 //! `rspamd.action.<action>`, positive `rspamd.<symbol>` (lower case, 256 max),
 //! `rspamd.phishing` (PHISHING/PHISHED_*), `sandbox` (maximum score, 0..1),
@@ -74,6 +77,17 @@ impl Signals {
         }
         for flag in &report.flags {
             signals.flag(flag);
+        }
+        if let Some(outbreak) = &report.outbreak {
+            signals.count("campaign.messages", outbreak.messages);
+            signals.count("campaign.tenants", outbreak.tenants);
+            signals.count("campaign.senders", outbreak.senders);
+            if let Some(minutes) = outbreak.first_seen_minutes {
+                signals.count("outbreak.first_seen_minutes", minutes);
+            }
+            if outbreak.held {
+                signals.flag("outbreak.held");
+            }
         }
         if let Some(spam) = &report.spam {
             signals.score("spam", spam.total);

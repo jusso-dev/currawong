@@ -304,3 +304,19 @@ id = "intel-ip"
 priority = 28
 conditions = [{ flag = "intel.ip" }]
 actions = [{ quarantine = "phishing" }]
+
+
+# Campaign size is context, not a blocking verdict. The pipeline expands
+# this header value from the bounded global campaign count.
+[[policy]]
+id = "outbreak-campaign"
+priority = 65
+conditions = [{ flag = "campaign" }]
+actions = [{ add_header = { name = "X-Currawong-Campaign", value = "{campaign.messages}" } }]
+
+# Example only: combine campaign with first-time sender and spam evidence.
+# [[policy]]
+# id = "campaign-first-sender-spam"
+# priority = 64
+# conditions = [{ flag = "campaign" }, { flag = "bec.first_time_sender" }, { score = { name = "spam", at_least = 5.0 } }]
+# actions = [{ quarantine = "spam" }]

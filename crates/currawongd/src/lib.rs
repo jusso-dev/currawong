@@ -4,6 +4,7 @@ mod dmarc;
 mod encrypt;
 mod health;
 pub mod intel;
+pub mod outbreak;
 mod periodic;
 mod pipeline;
 mod scheduler;

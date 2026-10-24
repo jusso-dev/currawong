@@ -10,6 +10,8 @@ It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint 
 
 Optional on-premises engines (#28): [Rspamd](docs/integrations/rspamd.md) adds spam/phishing scores and release learning; [CAPEv2](docs/integrations/sandbox.md) detonates selected attachments with persistent task/verdict caching and deferred spool retries. Both are off by default and residency guarded. DRAKVUF is not implemented; no verified verdict contract. No live engine deployments were exercised.
 
+Optional local outbreak protection (`[outbreak]`, off by default): fixed first-seen attachment delays, bounded cross-tenant campaign counts and headers, and a 14-day delivered-content index for retrospective intel matches. Opt-in retained parts support YARA and ClamAV signature-change rescans. Detections emit verdict-change events and call a logging remediation adapter; mailbox clawback remains #41/#51. See [ADR 0010](docs/adr/0010-outbreak-protection.md).
+
 ## Why
 
 - Mail gateways parse hostile input at high volume while exposed to the internet. That is exactly where memory safety pays off.
