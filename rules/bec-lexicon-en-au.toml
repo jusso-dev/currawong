@@ -130,3 +130,8 @@ category = "payment_change"
 [[phrase]]
 text = "payment details have changed"
 category = "payment_change"
+
+# Domain-age and thread signals are structural; no phrase match required.
+# Re:/Fwd:/FW:/AW:/WG: require first-time actual-recipient history and no
+# In-Reply-To (no delivered Message-ID index exists). Supporting weights:
+# new_sender_domain 0.1, new_reply_to_domain 0.1, thread_hijack 0.15.

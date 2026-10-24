@@ -88,6 +88,49 @@ impl UrlSigner {
         format!("{payload}.{tag}")
     }
 
+    /// Separate MAC domain: a continuation cannot be used as a delivery token.
+    /// Binds the original token, inspected destination, and five-minute expiry.
+    pub fn continuation(&self, token: &str, destination: &str, now: u64) -> String {
+        let expiry = now.saturating_add(300);
+        let mut mac = HmacSha256::new_from_slice(self.key.expose()).expect("any key length");
+        mac.update(b"currawong-continue-v1.");
+        mac.update(token.as_bytes());
+        mac.update(b"\0");
+        mac.update(destination.as_bytes());
+        mac.update(&expiry.to_be_bytes());
+        format!(
+            "{expiry}.{}",
+            URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+        )
+    }
+    pub fn verify_continuation(
+        &self,
+        value: &str,
+        token: &str,
+        destination: &str,
+        now: u64,
+    ) -> bool {
+        let Some((expiry, tag)) = value.split_once('.') else {
+            return false;
+        };
+        let Ok(expiry) = expiry.parse::<u64>() else {
+            return false;
+        };
+        if expiry < now || expiry > now.saturating_add(300) {
+            return false;
+        }
+        let Ok(tag) = URL_SAFE_NO_PAD.decode(tag) else {
+            return false;
+        };
+        let mut mac = HmacSha256::new_from_slice(self.key.expose()).expect("any key length");
+        mac.update(b"currawong-continue-v1.");
+        mac.update(token.as_bytes());
+        mac.update(b"\0");
+        mac.update(destination.as_bytes());
+        mac.update(&expiry.to_be_bytes());
+        mac.verify_slice(&tag).is_ok()
+    }
+
     /// Check the MAC, then the expiry against `now` (Unix seconds).
     pub fn verify(&self, token: &str, now: u64) -> Result<Claims, TokenError> {
         if token.len() > MAX_TOKEN_BYTES {
@@ -155,5 +198,21 @@ mod tests {
         let other = UrlSigner::new(vec![8; 32]).unwrap();
         assert_eq!(other.verify(&token, 0), Err(TokenError::BadSignature));
         assert!(UrlSigner::new(vec![1; 31]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod continuation_tests {
+    use super::*;
+    #[test]
+    fn continuation_is_short_lived_and_bound_to_token_and_destination() {
+        let signer = UrlSigner::new(vec![7; 32]).unwrap();
+        let value = signer.continuation("original", "https://example.com/", 100);
+        assert!(signer.verify_continuation(&value, "original", "https://example.com/", 101));
+        assert!(!signer.verify_continuation(&value, "other", "https://example.com/", 101));
+        assert!(!signer.verify_continuation(&value, "original", "https://changed.com/", 101));
+        assert!(!signer.verify_continuation(&value, "original", "https://example.com/", 401));
+        assert!(!signer.verify_continuation("1", "original", "https://example.com/", 101));
+        assert!(signer.verify(&value, 101).is_err());
     }
 }

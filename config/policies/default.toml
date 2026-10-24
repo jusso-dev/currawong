@@ -268,7 +268,6 @@ priority = 28
 conditions = [{ flag = "intel.ip" }]
 actions = [{ quarantine = "phishing" }]
 
-
 # Campaign size is context, not a blocking verdict. The pipeline expands
 # this header value from the bounded global campaign count.
 [[policy]]
@@ -283,3 +282,24 @@ actions = [{ add_header = { name = "X-Currawong-Campaign", value = "{campaign.me
 # priority = 64
 # conditions = [{ flag = "campaign" }, { flag = "bec.first_time_sender" }, { score = { name = "spam", at_least = 5.0 } }]
 # actions = [{ quarantine = "spam" }]
+
+# RDAP age is supporting evidence, never a quarantine decision by itself.
+# BEC reasons contribute to the existing 0.6 score policy.
+
+[[policy]]
+id = "new-domain-sender"
+priority = 59
+conditions = [{ flag = "domain.new_sender" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "sender" } }]
+
+[[policy]]
+id = "new-domain-reply-to"
+priority = 59
+conditions = [{ flag = "domain.new_reply_to" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "reply_to" } }]
+
+[[policy]]
+id = "new-domain-url"
+priority = 59
+conditions = [{ flag = "domain.new_url" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "url" } }]

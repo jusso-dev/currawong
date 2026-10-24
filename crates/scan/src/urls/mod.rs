@@ -1,12 +1,13 @@
 //! Click-time link protection: inbound links are rewritten to signed
 //! `<base_url>/u/<token>` links, and the click service checks the real link
 //! again when it is clicked.
+pub mod analysis;
 pub mod reputation;
 pub mod rewrite;
 pub mod token;
 mod transfer;
 
-pub use reputation::{LocalBlocklist, Reputation, UrlReputation};
+pub use reputation::{CheckedUrl, LocalBlocklist, Reputation, UrlReputation};
 pub use rewrite::{Delivery, RewriteError, Rewritten, UrlRewriter};
 pub use token::{Claims, TokenError, UrlSigner};
 

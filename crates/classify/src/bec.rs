@@ -105,6 +105,11 @@ pub struct BecContext {
     /// `Some(true)` when no authenticated mail from this sender has been
     /// delivered to the tenant before; `None` when the history is unavailable.
     pub first_time: Option<bool>,
+    /// Actual envelope recipients; never infer them from untrusted To headers.
+    pub recipients: Vec<String>,
+    pub new_sender_domain: bool,
+    pub new_reply_to_domain: bool,
+    pub reply_to_lookalike: bool,
 }
 
 pub fn analyse(
@@ -176,6 +181,13 @@ pub fn analyse(
             continue;
         };
         let same_domain = from_domains.iter().any(|f| f.eq_ignore_ascii_case(domain));
+        if !same_domain && (ctx.new_reply_to_domain || ctx.reply_to_lookalike) {
+            reasons.push((
+                BecReason::NewReplyToDomain,
+                0.1,
+                "replies go to a new or look-alike domain different from From".into(),
+            ));
+        }
         if !same_address && is_free_mail(domain) {
             reasons.push((
                 BecReason::ReplyToMismatch,
@@ -195,6 +207,25 @@ pub fn analyse(
     }
 
     let subject = view.header("Subject").next().unwrap_or("");
+    if ctx.new_sender_domain {
+        reasons.push((
+            BecReason::NewSenderDomain,
+            0.1,
+            "From domain was registered recently".into(),
+        ));
+    }
+    // SenderHistory stores delivered sender/recipient pairs, not Message-IDs.
+    // Without a delivered-thread index, use only the conservative no-I-R-T fallback.
+    if ctx.first_time == Some(true)
+        && reply_subject(subject)
+        && !view.header("In-Reply-To").any(|v| !v.trim().is_empty())
+    {
+        reasons.push((
+            BecReason::ThreadHijack,
+            0.15,
+            "reply or forward subject from a first-time sender without In-Reply-To".into(),
+        ));
+    }
     let text = fold(&format!("{subject}\n{}\n{}", view.body, view.body_tail));
     let change = lexicon.hits(&text, Category::PaymentChange);
     let invoice = lexicon.hits(&text, Category::Invoice);
@@ -254,6 +285,13 @@ pub fn analyse(
         reasons: reasons.iter().map(|(r, _, _)| *r).collect(),
         explanation: reasons.into_iter().map(|(_, _, e)| e).collect(),
     }
+}
+
+fn reply_subject(subject: &str) -> bool {
+    let lower = subject.trim_start().to_ascii_lowercase();
+    ["re:", "fwd:", "fw:", "aw:", "wg:"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 fn is_free_mail(domain: &str) -> bool {
@@ -350,6 +388,18 @@ impl SenderHistory {
                 e => Err(e),
             })?;
         Ok(found.is_some())
+    }
+
+    /// True when this sender has reached this actual recipient before.
+    pub fn seen_recipient(
+        &self,
+        tenant: &str,
+        sender: &str,
+        recipient: &str,
+    ) -> Result<bool, HistoryError> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM sender_history WHERE tenant_id=?1 AND sender=?2 AND recipient=?3)",
+            params![tenant, sender.to_ascii_lowercase(), recipient.to_ascii_lowercase()], |row| row.get(0))?)
     }
 
     /// Record a delivery. Called once per delivered recipient group.

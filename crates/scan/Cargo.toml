@@ -6,6 +6,8 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+currawong-link = { path = "../link" }
+regex = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 url = { workspace = true }

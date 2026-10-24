@@ -626,7 +626,6 @@ dbl = true
 hbl = true
 max_queries_per_message = 30
 
-
 # Local outbreak protection (ADR 0010), off by default. No content leaves
 # this process; optional retained parts stay in the local SQLite store.
 [outbreak]
@@ -643,3 +642,42 @@ max_retained_bytes = 268435456
 max_part_bytes = 16777216
 campaign_window_minutes = 60
 campaign_threshold = 5
+
+# Domain-only external RDAP lookup; see ADR 0012 and docs/residency.md.
+[rdap]
+enabled = false
+scan_urls = false
+database = "/var/lib/currawong/rdap.sqlite3"
+bootstrap_url = "https://data.iana.org/rdap/dns.json"
+bootstrap_ttl_hours = 24
+positive_ttl_days = 7
+negative_ttl_hours = 6
+new_domain_days = 30
+timeout_secs = 5
+concurrency = 4
+max_domains = 32
+
+# Requires url_rewrite.enabled to serve clicks. Local decoding uses no network.
+[click]
+unwrap = true
+redirector_domains = [] # Exact additional hosts exposing ?url= or ?u=.
+max_hops = 8
+cache_ttl_secs = 300
+cache_entries = 10000
+# Omit brands to use Microsoft/Office 365, Google, Apple, DocuSign, Adobe,
+# Dropbox, myGov, ATO, Australia Post, Services Australia and big four banks.
+# brands = [{ name = "Example", domains = ["example.com.au"] }]
+# Supplying brands replaces the built-in list; an empty list disables brands.
+
+[click.fetch]
+enabled = false # Discloses full URL; can activate one-time links.
+ports = [80, 443] # Destination-port allowlist; HTTP and HTTPS are permitted.
+max_bytes = 1048576 # Total response bytes across all hops.
+timeout_secs = 10 # Whole click analysis, including waiting for a slot.
+concurrency = 4
+
+[click.analyser]
+url = "" # e.g. http://127.0.0.1:8099/analyse; all answers must be loopback.
+required = false # Failure blocks when true, warns when false.
+include_html = false
+max_excerpt_bytes = 8192

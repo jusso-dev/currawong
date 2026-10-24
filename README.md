@@ -12,6 +12,8 @@ Optional on-premises engines (#28): [Rspamd](docs/integrations/rspamd.md) adds s
 
 Optional local outbreak protection (`[outbreak]`, off by default): fixed first-seen attachment delays, bounded cross-tenant campaign counts and headers, and a 14-day delivered-content index for retrospective intel matches. Opt-in retained parts support YARA and ClamAV signature-change rescans. Detections emit verdict-change events and call a logging remediation adapter; mailbox clawback remains #41/#51. See [ADR 0010](docs/adr/0010-outbreak-protection.md).
 
+Optional [click-time analysis and domain age](docs/adr/0012-click-analysis.md): local gateway-wrapper decoding, opt-in pinned public-page fetches, static login/brand/form/redirect checks, a loopback analyser hook, short-lived signed warning continuation, cached RDAP registration age and supporting BEC thread/domain reasons. RDAP and fetching are off by default; their domain/URL disclosures are documented in [residency](docs/residency.md).
+
 ## Why
 
 - Mail gateways parse hostile input at high volume while exposed to the internet. That is exactly where memory safety pays off.
@@ -59,6 +61,7 @@ internet -> [smtp listener] -> [spool (durable queue)] -> [pipeline workers]
 | `crates/auth` | SPF, DKIM, DMARC, ARC, BIMI |
 | `crates/scan` | Scanner orchestration and isolated parser workers |
 | `crates/classify` | Spam scoring (per-tenant Bayes and TOML rules) and lookalike domains |
+| `crates/link` | Shared offline wrapper decoding, guarded HTTP and cached RDAP domain age |
 | `crates/dlp` | Australian identifier detection and protective markings |
 | `crates/policy` | Policy engine and scoring |
 | `crates/quarantine` | Quarantine store and digests |

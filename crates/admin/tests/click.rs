@@ -301,8 +301,16 @@ async fn urls_warning_page_lets_the_user_continue() {
         let reply = get(addr, &format!("/u/{token}")).await;
         assert_eq!(reply.status, 200, "{url}");
         assert!(reply.body.contains("Check this link before you continue"));
-        assert!(reply.body.contains(&format!("/u/{token}?proceed=1")));
-        let reply = get(addr, &format!("/u/{token}?proceed=1")).await;
+        let prefix = format!("/u/{token}?proceed=");
+        let continuation = reply
+            .body
+            .split_once(&prefix)
+            .unwrap()
+            .1
+            .split('"')
+            .next()
+            .unwrap();
+        let reply = get(addr, &format!("{prefix}{continuation}")).await;
         assert_eq!(reply.status, 302);
         assert_eq!(reply.location.as_deref(), Some(url));
     }
@@ -463,4 +471,21 @@ async fn urls_one_ipv6_64_is_one_client() {
             .status,
     );
     assert_eq!(statuses, [302, 302, 429, 302]);
+}
+
+#[tokio::test]
+async fn urls_unsigned_proceed_cannot_skip_warning() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("blocklist.txt"), "warn odd.example\n").unwrap();
+    let addr = start_with(dir.path(), false, 1 << 20).await;
+    let token = signer().sign(&claims("https://odd.example/"));
+    assert_eq!(
+        get(addr, &format!("/u/{token}?proceed=1")).await.status,
+        200
+    );
+    let event = events(dir.path()).pop().unwrap();
+    assert_eq!(event.verdict, "warn");
+    assert_eq!(event.action, ClickAction::Warned);
+    assert!(!event.reasons.is_empty());
+    assert_eq!(event.final_url, "https://odd.example/");
 }

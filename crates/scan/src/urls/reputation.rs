@@ -22,6 +22,18 @@ pub enum Reputation {
 #[async_trait]
 pub trait UrlReputation: Send + Sync {
     async fn check(&self, url: &str) -> Reputation;
+    async fn inspect(&self, url: &str) -> CheckedUrl {
+        CheckedUrl {
+            url: url.into(),
+            reputation: self.check(url).await,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CheckedUrl {
+    pub url: String,
+    pub reputation: Reputation,
 }
 
 /// The file is read again at least this often, even when its time and size

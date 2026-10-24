@@ -1213,3 +1213,15 @@ fn intel_hits_become_flags_and_the_default_pack_quarantines_them() {
         Verdict::Deliver
     );
 }
+
+#[test]
+fn domain_age_count_and_flags_are_exposed_without_fabricating_unknown_age() {
+    let mut report = report();
+    let unknown = currawong_policy::Signals::from_report(&report);
+    assert!(!unknown.counts.contains_key("domain.youngest_days"));
+    report.domain_youngest_days = Some(2);
+    report.flags.push("domain.new_sender".into());
+    let signals = currawong_policy::Signals::from_report(&report);
+    assert_eq!(signals.counts.get("domain.youngest_days"), Some(&2));
+    assert!(signals.flags.contains("domain.new_sender"));
+}

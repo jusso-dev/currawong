@@ -307,3 +307,24 @@ Coverage limits: campaign counts are approximate, windowed lower bounds at confi
 Licences checked by hand: new `tlsh2` 1.1.0 is Apache-2.0 OR BSD-3-Clause, with no transitive runtime dependencies. Other crates were already in the lockfile. `cargo deny` is not installed. No GPL code or heavy native dependency was added. TLSH API checked against the published crate source after Context7 returned no Rust TLSH match.
 
 Outbreak worktree final verification (25 October 2026): ran `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p currawong-parser-worker`, `cargo test --workspace --no-fail-fast`, then `cargo run -p currawongd -- --config config/currawong.example.toml --check-config`, in that order. All passed. Workspace: 824 passed, 0 failed, 3 existing ignored tests (two live-clamd tests and the large YARA benchmark). New coverage: 21 tests (10 outbreak store/similarity, 2 core, 1 worker body extraction and 8 daemon integration).
+
+## Click-time analysis, domain age and BEC (ADR 0012)
+
+All cargo commands use `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`. No issue number was supplied for this workstream.
+
+- `cargo test -p currawong-link`: generated bootstrap/registration JSON; positive/negative SQLite caching and lazy refresh; own-domain exclusion; registration timeouts and concurrency cap; registrable `.com.au`; each supported wrapper and hostile/ambiguous host/parameter cases; public-address classification, mixed DNS answers, one-resolution pinned connection, a loopback fake redirect chain and byte cap; loopback-only residency-checked analyser POST and redirect refusal. No public network or DNS is used by tests. Loopback exceptions exist only in this crate's test build and name an exact socket.
+- `cargo test -p currawong-classify`: cached From/Reply-To/URL age signals with scan-URL opt-in and own-domain exclusion; small BEC weights, actual-recipient first-time history, reply-prefix fallback and ordinary-message regressions.
+- `cargo test -p currawong-scan urls --lib`: wrapper/fetch/meta chains, every-hop and cached live reputation, loops/hop limits, private redirect refusal, body caps and optional-fetch deadline warnings; generated login forms, entity-encoded brands, base-URL and override form actions, captcha, smuggling and JS indicators; signed continuation expiry, token binding and destination binding. HTML smuggling calls the existing detector and score.
+- `cargo test -p currawong-admin --test click`: interstitial/block rendering and escaping, valid short-lived continuation, unsigned bypass refusal, click verdict/reasons/final URL, existing limits and logging.
+- `cargo test -p currawong-core --test link_config`: defaults off, unknown-field denial, invalid limits/ports/bootstrap, required analyser without an endpoint and residency-denied analyser configuration.
+- `cargo test -p currawong-policy --test engine`: age count only when known and new-domain flags exposed; both policy packs retain existing decisions and add informational age headers.
+- Final gates: `cargo fmt --all`; `cargo clippy --workspace --all-targets -- -D warnings`; `cargo build -p currawong-parser-worker`; `cargo test --workspace --no-fail-fast`; `cargo run -p currawongd -- --config config/currawong.example.toml --check-config`. Exact final counts are in the implementation handoff. `cargo clean` follows the final commit.
+- Final offline workspace result: 826 passed, zero failed, three ignored. Formatting, workspace Clippy, worker build and example configuration validation passed.
+
+Upstream bootstrap and wrapper format evidence, including unavailable vendor contracts, is linked in [ADR 0012](adr/0012-click-analysis.md). No live registry lookup, ML/headless analyser, commercial gateway decoder, browser rendering or production deployment was run. Static checks do not execute JavaScript or load subresources. Existing history has no delivered Message-ID index; References cannot be validated. Opaque Mimecast tokens stay wrapped, and the vendor API docs returned 403. Public tests remain entirely offline.
+
+No new third-party packages or versions were added. Existing workspace crates were reused; MIT/Apache-2.0/BSD-style licences checked from package metadata. `cargo deny` is not installed locally, so no advisory or licence-tool pass is claimed.
+
+## Phase 2 integration
+
+Outbreak and click-time analysis were merged onto the phase 1 review fixes and the Cranelift release size profile. On that combined tree, `cargo check --workspace --locked --offline --all-targets` passed, as did the outbreak, link, core (`outbreak`, `link_config`), daemon outbreak and classify BEC suites (248 tests). A full workspace test count was not re-run after the merge. The per-workstream counts above are from each branch before the merge.

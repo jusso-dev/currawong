@@ -154,7 +154,6 @@ token_file = "/etc/currawong/wedgetail.token"
 | `admin_action` | `policy.reload` when the policy files or database change. Actor is `policy-store` until the admin API exists |
 | `quarantine_release`, `url_click`, `verdict_changed`, other admin actions | Not yet: release, click-time protection and the admin API are not built. TODO hooks are in `crates/quarantine`, `crates/scan/src/url_rewrite.rs` and `crates/admin` |
 
-
 ## Outbreak retrospective verdicts (ADR 0010)
 
 Outbreak protection reuses `verdict_changed`. `from = "deliver"` means handed to the local delivery queue; `to = "retro_detection"` means newly detected after that hand-off. It does not mean a mailbox item was moved or deleted. `changed_by` is `outbreak:<source>:<indicator>`; sources include `intel:<feed>:<threat>`, `yara:<namespace>:<rule>` and `clamav:<signature>`. `tenant_id` and `message_id` identify the delivered copy. Normal severity for verdict changes applies. Notification is at least once around crashes; adapters must deduplicate.
@@ -164,3 +163,5 @@ Outbreak protection reuses `verdict_changed`. `from = "deliver"` means handed to
 ```
 
 The durable detection passed to a `Remediation` adapter also carries direction, sender, recipients and delivery time. The default adapter logs only; real mailbox remediation is #41/#51. Existing signed event webhook destinations can receive these events.
+
+Click-time analysis (ADR 0012) adds `verdict` (`clean`, `warn`, `blocked`), `reasons` and `final_url` to `url_click`. Existing `action` remains `allowed`, `warned` or `blocked`; continuing a warning keeps `verdict = "warn"`. New fields default when reading old events. CEF adds verdict/reason/finalUrl; OCSF retains the full Currawong event in unmapped data.

@@ -47,6 +47,8 @@ pub struct Config {
     pub events: EventsConfig,
     pub intel: IntelConfig,
     pub outbreak: OutbreakConfig,
+    pub rdap: RdapConfig,
+    pub click: ClickConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1665,6 +1667,8 @@ impl Default for Config {
             policy: PolicyConfig::default(),
             quarantine: QuarantineConfig::default(),
             url_rewrite: UrlRewriteConfig::default(),
+            rdap: RdapConfig::default(),
+            click: ClickConfig::default(),
             dlp: DlpProfile::default(),
             encrypt: EncryptConfig::default(),
             events: EventsConfig::default(),
@@ -1745,6 +1749,7 @@ impl Config {
                 "outbreak requires scanner.enabled".into(),
             ));
         }
+        validate_link_analysis(&self.rdap, &self.click).map_err(ConfigError::Invalid)?;
         if !self.spool.dir.is_absolute() {
             return Err(ConfigError::Invalid(
                 "spool directory must be an absolute path".into(),
@@ -2112,6 +2117,235 @@ pub fn parse_clamd_address(address: &str) -> Result<(), ConfigError> {
         return Err(ConfigError::Invalid(format!(
             "clamd address '{address}' must be unix:/path or tcp:host:port"
         )));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RdapConfig {
+    pub enabled: bool,
+    pub scan_urls: bool,
+    pub database: PathBuf,
+    pub bootstrap_url: String,
+    pub bootstrap_ttl_hours: u64,
+    pub positive_ttl_days: u64,
+    pub negative_ttl_hours: u64,
+    pub new_domain_days: u64,
+    pub timeout_secs: u64,
+    pub concurrency: usize,
+    pub max_domains: usize,
+}
+impl Default for RdapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            scan_urls: false,
+            database: "/var/lib/currawong/rdap.sqlite3".into(),
+            bootstrap_url: "https://data.iana.org/rdap/dns.json".into(),
+            bootstrap_ttl_hours: 24,
+            positive_ttl_days: 7,
+            negative_ttl_hours: 6,
+            new_domain_days: 30,
+            timeout_secs: 5,
+            concurrency: 4,
+            max_domains: 32,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickConfig {
+    pub unwrap: bool,
+    pub redirector_domains: Vec<String>,
+    pub max_hops: usize,
+    pub cache_ttl_secs: u64,
+    pub cache_entries: usize,
+    pub fetch: ClickFetchConfig,
+    pub analyser: ClickAnalyserConfig,
+    pub brands: Vec<ClickBrand>,
+}
+impl Default for ClickConfig {
+    fn default() -> Self {
+        let brands = [
+            (
+                "Microsoft",
+                "microsoft.com office.com office365.com live.com microsoftonline.com",
+            ),
+            (
+                "Office 365",
+                "microsoft.com office.com office365.com live.com microsoftonline.com",
+            ),
+            ("Google", "google.com google.com.au accounts.google.com"),
+            ("Apple", "apple.com icloud.com"),
+            ("DocuSign", "docusign.com docusign.net"),
+            ("Adobe", "adobe.com adobe.io"),
+            ("Dropbox", "dropbox.com dropboxapi.com"),
+            ("myGov", "my.gov.au"),
+            ("ATO", "ato.gov.au"),
+            ("Australia Post", "auspost.com.au"),
+            (
+                "Services Australia",
+                "servicesaustralia.gov.au centrelink.gov.au",
+            ),
+            ("Commonwealth Bank", "commbank.com.au netbank.com.au"),
+            ("Westpac", "westpac.com.au"),
+            ("NAB", "nab.com.au"),
+            ("ANZ", "anz.com anz.com.au"),
+        ]
+        .into_iter()
+        .map(|(name, domains)| ClickBrand {
+            name: name.into(),
+            domains: domains.split_whitespace().map(str::to_string).collect(),
+        })
+        .collect();
+        Self {
+            unwrap: true,
+            redirector_domains: Vec::new(),
+            max_hops: 8,
+            cache_ttl_secs: 300,
+            cache_entries: 10_000,
+            fetch: ClickFetchConfig::default(),
+            analyser: ClickAnalyserConfig::default(),
+            brands,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickFetchConfig {
+    pub enabled: bool,
+    pub ports: Vec<u16>,
+    pub max_bytes: usize,
+    pub timeout_secs: u64,
+    pub concurrency: usize,
+}
+impl Default for ClickFetchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ports: vec![80, 443],
+            max_bytes: 1_048_576,
+            timeout_secs: 10,
+            concurrency: 4,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickAnalyserConfig {
+    pub url: String,
+    pub required: bool,
+    pub include_html: bool,
+    pub max_excerpt_bytes: usize,
+}
+impl Default for ClickAnalyserConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            required: false,
+            include_html: false,
+            max_excerpt_bytes: 8192,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ClickBrand {
+    pub name: String,
+    pub domains: Vec<String>,
+}
+// Config defaults are explicit, matching the project configuration convention.
+#[allow(clippy::derivable_impls)]
+impl Default for ClickBrand {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            domains: Vec::new(),
+        }
+    }
+}
+
+fn validate_link_analysis(rdap: &RdapConfig, click: &ClickConfig) -> Result<(), String> {
+    if rdap.timeout_secs == 0
+        || rdap.timeout_secs > 60
+        || rdap.concurrency == 0
+        || rdap.concurrency > 256
+        || rdap.max_domains == 0
+        || rdap.max_domains > 256
+        || rdap.new_domain_days == 0
+        || rdap.positive_ttl_days == 0
+        || rdap.positive_ttl_days > 365
+        || rdap.negative_ttl_hours == 0
+        || rdap.negative_ttl_hours > 8760
+        || rdap.bootstrap_ttl_hours == 0
+        || rdap.bootstrap_ttl_hours > 8760
+    {
+        return Err("rdap: invalid TTL, deadline, concurrency or domain limit".into());
+    }
+    let bootstrap =
+        url::Url::parse(&rdap.bootstrap_url).map_err(|_| "rdap.bootstrap_url: invalid URL")?;
+    if bootstrap.scheme() != "https"
+        || bootstrap.port_or_known_default() != Some(443)
+        || bootstrap.host_str().is_none()
+        || !bootstrap.username().is_empty()
+        || bootstrap.password().is_some()
+        || (rdap.enabled && !rdap.database.is_absolute())
+    {
+        return Err(
+            "rdap: HTTPS bootstrap without credentials and absolute database path required".into(),
+        );
+    }
+    if click.max_hops == 0
+        || click.max_hops > 32
+        || click.cache_ttl_secs == 0
+        || click.cache_ttl_secs > 86400
+        || click.cache_entries == 0
+        || click.cache_entries > 100_000
+        || click.fetch.max_bytes == 0
+        || click.fetch.max_bytes > 8 * 1024 * 1024
+        || click.fetch.timeout_secs == 0
+        || click.fetch.timeout_secs > 60
+        || click.fetch.concurrency == 0
+        || click.fetch.concurrency > 256
+        || click.fetch.ports.is_empty()
+        || click.fetch.ports.contains(&0)
+        || click.analyser.max_excerpt_bytes > 65536
+    {
+        return Err("click: invalid hop, cache, body, port, deadline or concurrency limit".into());
+    }
+    for domain in click
+        .redirector_domains
+        .iter()
+        .chain(click.brands.iter().flat_map(|b| &b.domains))
+    {
+        if !matches!(url::Host::parse(domain), Ok(url::Host::Domain(_)))
+            || domain.contains(['/', ':', '@'])
+            || !domain.contains('.')
+        {
+            return Err("click: redirector and brand domains must be domain names".into());
+        }
+    }
+    if click
+        .brands
+        .iter()
+        .any(|b| b.name.trim().is_empty() || b.domains.is_empty())
+    {
+        return Err("click.brands: each brand needs a name and legitimate domains".into());
+    }
+    if click.analyser.required && click.analyser.url.is_empty() {
+        return Err("click.analyser.url: required analyser needs an endpoint".into());
+    }
+    if !click.analyser.url.is_empty() {
+        let url =
+            url::Url::parse(&click.analyser.url).map_err(|_| "click.analyser.url: invalid URL")?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.host_str().is_none()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("click.analyser.url: HTTP(S) endpoint without credentials required".into());
+        }
     }
     Ok(())
 }
