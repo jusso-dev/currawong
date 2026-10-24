@@ -77,6 +77,63 @@ priority = 31
 conditions = [{ flag = "html_smuggling" }]
 actions = [{ quarantine = "phishing" }]
 
+# Active SVG: script, event handlers, `javascript:` or `data:text/html` links,
+# HTML forms in `<foreignObject>`, or a redirect. Browsers run script in an
+# SVG opened from disk, and phishing kits send them as attachments.
+[[policy]]
+id = "svg-active"
+priority = 32
+conditions = [{ flag = "svg_active" }]
+actions = [{ quarantine = "phishing" }]
+
+# VHD, VHDX, DMG and raw FAT/NTFS disk images. Windows mounts them and the
+# files inside do not get the Mark of the Web. They are not unpacked, so they
+# also fail closed as unscannable; this names the reason.
+[[policy]]
+id = "disk-image"
+priority = 33
+conditions = [{ flag = "disk_image" }]
+actions = [{ quarantine = "active-content" }]
+
+# OneNote sections with embedded files (a 2023 malware delivery route).
+# Pictures are embedded files too, but `.one` is a blocked extension by
+# default anyway. The files are extracted and scanned as parts.
+[[policy]]
+id = "onenote-embedded"
+priority = 34
+conditions = [{ flag = "onenote_embedded" }]
+actions = [{ quarantine = "active-content" }]
+
+# PDF JavaScript (`/JS`, `/JavaScript`, `/RichMedia`) and launch actions.
+[[policy]]
+id = "pdf-javascript"
+priority = 35
+conditions = [{ flag = "pdf_javascript" }]
+actions = [{ quarantine = "active-content" }]
+
+[[policy]]
+id = "pdf-launch"
+priority = 36
+conditions = [{ flag = "pdf_launch" }]
+actions = [{ quarantine = "active-content" }]
+
+# Files embedded in a PDF are extracted and scanned like archive members, so
+# the PDF itself is only tagged. `/OpenAction` and `/AA` are common in benign
+# PDFs (open at a page, set the zoom, print), so they are only tagged too.
+# `pdf_form` (XFA, SubmitForm) and `pdf_remote_action` (GoToR, GoToE) are
+# signals with no default policy.
+[[policy]]
+id = "pdf-embedded-file-tag"
+priority = 76
+conditions = [{ flag = "pdf_embedded_file" }]
+actions = [{ add_header = { name = "X-Currawong-PDF-Embedded-File", value = "present" } }]
+
+[[policy]]
+id = "pdf-auto-action-tag"
+priority = 77
+conditions = [{ flag = "pdf_auto_action" }]
+actions = [{ add_header = { name = "X-Currawong-PDF-Auto-Action", value = "present" } }]
+
 [[policy]]
 id = "qr-code-tag"
 priority = 75

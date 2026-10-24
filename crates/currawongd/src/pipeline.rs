@@ -863,12 +863,33 @@ impl Pipeline {
                     PartFlag::ExtMismatch => (true, format!("type does not match name {name}")),
                     PartFlag::LimitExceeded => (false, format!("extraction limit exceeded {name}")),
                     PartFlag::Unscannable => (false, format!("could not inspect {name}")),
+                    // These fetch or run something when the document opens,
+                    // with no macro: as active as an embedded OLE object.
+                    PartFlag::ExternalTemplate => {
+                        (true, format!("remote template or object {name}"))
+                    }
+                    PartFlag::DdeField => (true, format!("DDE field {name}")),
+                    PartFlag::ProtocolHandler => (true, format!("protocol handler link {name}")),
+                    // A launcher, like a `.lnk` (which is `Executable`).
+                    PartFlag::Shortcut if scanner.treat_executables_as_active => {
+                        (true, format!("shell shortcut {name}"))
+                    }
                     // Policy acts on these through its signals.
                     PartFlag::Executable
                     | PartFlag::HasMacro
                     | PartFlag::HtmlSmuggling
                     | PartFlag::QrCode
-                    | PartFlag::QrSkipped => continue,
+                    | PartFlag::QrSkipped
+                    | PartFlag::Shortcut
+                    | PartFlag::SvgActive
+                    | PartFlag::OneNoteEmbedded
+                    | PartFlag::DiskImage
+                    | PartFlag::PdfJavaScript
+                    | PartFlag::PdfLaunch
+                    | PartFlag::PdfEmbeddedFile
+                    | PartFlag::PdfAutoAction
+                    | PartFlag::PdfForm
+                    | PartFlag::PdfRemoteAction => continue,
                 };
                 if active {
                     report.active_content = true;

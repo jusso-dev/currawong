@@ -6,7 +6,11 @@
 //! - flags: `malware`, `active_content`, `fail_closed`, `defer`, plus part
 //!   flags `ext_mismatch`, `encrypted`, `has_macro`, `has_ole_object`,
 //!   `executable`, `limit_exceeded`, `html_smuggling`, `qr_code`,
-//!   `qr.skipped` (images not checked once the QR budget ran out); `qr_url`
+//!   `qr.skipped` (images not checked once the QR budget ran out),
+//!   `svg_active`, `external_template`, `dde_field`, `protocol_handler`,
+//!   `onenote_embedded`, `shortcut`, `disk_image`, `pdf_javascript`,
+//!   `pdf_launch`, `pdf_embedded_file`, `pdf_auto_action`, `pdf_form` and
+//!   `pdf_remote_action` (document and file-type checks); `qr_url`
 //!   when a QR code held a link; `yara` when any YARA rule matched and
 //!   `yara.<tag>` for each tag on a matching rule (for example `yara.bec`);
 //!   `dlp.incomplete` when some text could not be scanned for identifiers;
@@ -208,5 +212,18 @@ fn part_flag(flag: PartFlag) -> &'static str {
         PartFlag::QrCode => "qr_code",
         PartFlag::QrSkipped => "qr.skipped",
         PartFlag::Unscannable => "unscannable",
+        PartFlag::SvgActive => "svg_active",
+        PartFlag::ExternalTemplate => "external_template",
+        PartFlag::DdeField => "dde_field",
+        PartFlag::ProtocolHandler => "protocol_handler",
+        PartFlag::OneNoteEmbedded => "onenote_embedded",
+        PartFlag::Shortcut => "shortcut",
+        PartFlag::DiskImage => "disk_image",
+        PartFlag::PdfJavaScript => "pdf_javascript",
+        PartFlag::PdfLaunch => "pdf_launch",
+        PartFlag::PdfEmbeddedFile => "pdf_embedded_file",
+        PartFlag::PdfAutoAction => "pdf_auto_action",
+        PartFlag::PdfForm => "pdf_form",
+        PartFlag::PdfRemoteAction => "pdf_remote_action",
     }
 }

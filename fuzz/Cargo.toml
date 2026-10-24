@@ -59,6 +59,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "doc_scan"
+path = "fuzz_targets/doc_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "pspf_parse"
 path = "fuzz_targets/pspf_parse.rs"
 test = false

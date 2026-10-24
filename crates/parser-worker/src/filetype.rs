@@ -91,6 +91,12 @@ pub fn detect(bytes: &[u8]) -> FileKind {
             executable: false,
         };
     }
+    if crate::onenote::is_onenote(bytes) {
+        return FileKind {
+            label: "application/onenote".into(),
+            executable: false,
+        };
+    }
     if let Some(label) = opaque_container(bytes) {
         return FileKind {
             label: label.into(),
@@ -156,6 +162,9 @@ fn opaque_container(bytes: &[u8]) -> Option<&'static str> {
     if tail(b"koly") {
         return Some("application/x-apple-diskimage");
     }
+    if raw_disk(bytes) {
+        return Some(RAW_DISK);
+    }
     let udf = (0x8001..0x10001)
         .step_by(2048)
         .any(|offset| at(offset, b"BEA01") || at(offset, b"NSR02") || at(offset, b"NSR03"));
@@ -163,6 +172,47 @@ fn opaque_container(bytes: &[u8]) -> Option<&'static str> {
         return Some("application/x-udf-image");
     }
     None
+}
+
+pub const RAW_DISK: &str = "application/x-raw-disk-image";
+
+/// Disk images whose files Windows mounts without the Mark of the Web. They
+/// are recognised and not unpacked.
+pub fn is_disk_image(kind: &FileKind) -> bool {
+    matches!(
+        kind.label.as_str(),
+        "application/x-vhd" | "application/x-apple-diskimage" | RAW_DISK
+    )
+}
+
+/// A FAT, exFAT or NTFS boot sector at the start, or an MBR whose first
+/// partition starts with one, or a GPT header.
+fn raw_disk(bytes: &[u8]) -> bool {
+    if bytes.get(510..512) != Some(&[0x55, 0xaa]) {
+        return false;
+    }
+    if boot_sector(bytes) || bytes.get(512..520) == Some(b"EFI PART") {
+        return true;
+    }
+    (0..4).any(|entry| {
+        let at = 446 + entry * 16;
+        let kind = bytes[at + 4];
+        let lba = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap_or([0; 4]));
+        let start = (lba as usize).saturating_mul(512);
+        kind != 0 && lba != 0 && bytes.get(start..).is_some_and(boot_sector)
+    })
+}
+
+fn boot_sector(sector: &[u8]) -> bool {
+    let at = |offset: usize, magic: &[u8]| sector.get(offset..offset + magic.len()) == Some(magic);
+    sector.get(510..512) == Some(&[0x55, 0xaa])
+        && matches!(sector.first(), Some(0xeb | 0xe9))
+        && (at(54, b"FAT12   ")
+            || at(54, b"FAT16   ")
+            || at(54, b"FAT     ")
+            || at(82, b"FAT32   ")
+            || at(3, b"NTFS    ")
+            || at(3, b"EXFAT   "))
 }
 
 /// A zip end-of-central-directory record near the end of a blob that does
@@ -196,6 +246,7 @@ pub fn is_archive(kind: &FileKind) -> bool {
             | "application/x-vhd"
             | "application/x-apple-diskimage"
             | "application/x-udf-image"
+            | RAW_DISK
     )
 }
 
