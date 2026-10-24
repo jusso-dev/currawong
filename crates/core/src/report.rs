@@ -51,6 +51,40 @@ pub enum PartFlag {
     /// An archive or document that could not be opened (unsupported format,
     /// corrupt, RAR). Treated as a fail-closed scan.
     Unscannable,
+    /// SVG with script, event handlers, `javascript:` or `data:text/html`
+    /// links, HTML forms in `<foreignObject>`, or a meta refresh.
+    SvgActive,
+    /// An Office document that loads a template, frame or object from a
+    /// remote location when opened, or an RTF object set to refresh on open.
+    ExternalTemplate,
+    /// A DDE or DDEAUTO field (Word, RTF) or a DDE link (Excel).
+    DdeField,
+    /// A link or field that calls a dangerous protocol handler
+    /// (`ms-msdt:`, `search-ms:`, `ms-officecmd:` and the like).
+    ProtocolHandler,
+    /// A OneNote section with embedded files.
+    OneNoteEmbedded,
+    /// A Windows shell file that opens something else: an Internet shortcut
+    /// to a file share or non-web URL, `.library-ms`, `.search-ms`,
+    /// `.searchConnector-ms`, `.scf` or `.settingcontent-ms`. `.lnk` files
+    /// are `Executable`.
+    Shortcut,
+    /// A VHD, VHDX, DMG or raw FAT/NTFS disk image. Files inside one do not
+    /// get the Mark of the Web; the image is not unpacked.
+    DiskImage,
+    /// PDF `/JavaScript`, `/JS` or `/RichMedia`.
+    PdfJavaScript,
+    /// PDF `/Launch` action.
+    PdfLaunch,
+    /// PDF with embedded files (extracted as child parts when possible).
+    PdfEmbeddedFile,
+    /// PDF `/OpenAction` or `/AA`: something runs when the file or a page
+    /// opens. Common in benign PDFs.
+    PdfAutoAction,
+    /// PDF `/XFA` form or `/SubmitForm` action.
+    PdfForm,
+    /// PDF `/GoToR` or `/GoToE`: opens another or an embedded document.
+    PdfRemoteAction,
 }
 
 impl PartFlag {
@@ -66,6 +100,19 @@ impl PartFlag {
             Self::QrCode => "QrCode",
             Self::QrSkipped => "QrSkipped",
             Self::Unscannable => "Unscannable",
+            Self::SvgActive => "SvgActive",
+            Self::ExternalTemplate => "ExternalTemplate",
+            Self::DdeField => "DdeField",
+            Self::ProtocolHandler => "ProtocolHandler",
+            Self::OneNoteEmbedded => "OneNoteEmbedded",
+            Self::Shortcut => "Shortcut",
+            Self::DiskImage => "DiskImage",
+            Self::PdfJavaScript => "PdfJavaScript",
+            Self::PdfLaunch => "PdfLaunch",
+            Self::PdfEmbeddedFile => "PdfEmbeddedFile",
+            Self::PdfAutoAction => "PdfAutoAction",
+            Self::PdfForm => "PdfForm",
+            Self::PdfRemoteAction => "PdfRemoteAction",
         }
     }
 }
