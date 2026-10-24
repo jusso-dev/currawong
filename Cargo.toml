@@ -123,3 +123,20 @@ opt-level = 3
 
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+# Cranelift runs only when YARA rules are compiled (start-up and reload),
+# never per message, so it is optimised for size to keep the image small.
+[profile.release.package.cranelift-codegen]
+opt-level = "s"
+
+[profile.release.package.cranelift-assembler-x64]
+opt-level = "s"
+
+[profile.release.package.cranelift-frontend]
+opt-level = "s"
+
+[profile.release.package.regalloc2]
+opt-level = "s"
+
+[profile.release.package.wasmtime-internal-cranelift]
+opt-level = "s"
