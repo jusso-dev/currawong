@@ -3,6 +3,7 @@ pub mod dkim;
 mod dmarc;
 mod encrypt;
 mod health;
+pub mod intel;
 mod periodic;
 mod pipeline;
 mod scheduler;
@@ -53,6 +54,15 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
         .enforce_startup(&sinks)
         .map_err(|err| format!("events: {err}"))?;
     yara_summary(&cfg)?;
+    if cfg.intel.enabled {
+        currawong_intel::sync::http_client(cfg.intel.ca_file.as_deref(), cfg.intel.timeout_secs)
+            .map_err(|err| format!("intel.ca_file: {err}"))?;
+        let dqs = &cfg.intel.dqs;
+        if dqs.enabled {
+            currawong_intel::read_key(dqs.key_env.as_deref(), dqs.key_file.as_deref())
+                .map_err(|err| format!("intel.dqs key: {err}"))?;
+        }
+    }
     if cfg.url_rewrite.enabled {
         url_rewriter(&cfg)?;
         click_limits(&cfg)?;
@@ -80,7 +90,15 @@ pub fn url_protection(cfg: &CoreConfig) -> Result<(UrlRewriter, ClickState), Str
         Some(path) => LocalBlocklist::from_file(path),
         None => LocalBlocklist::from_entries(""),
     };
-    let reputation: Arc<dyn UrlReputation> = Arc::new(list.with_warn_unknown(urls.warn_unknown));
+    let mut reputation: Arc<dyn UrlReputation> =
+        Arc::new(list.with_warn_unknown(urls.warn_unknown));
+    if cfg.intel.enabled && cfg.intel.check_clicks {
+        let store = Arc::new(intel::open_store(cfg)?);
+        reputation = Arc::new(intel::ChainedReputation(vec![
+            reputation,
+            Arc::new(intel::IntelReputation { store }),
+        ]));
+    }
     let log = ClickLog::open(&urls.click_log, urls.click_log_max_bytes)
         .map_err(|err| format!("click log {}: {err}", urls.click_log.display()))?;
     Ok((

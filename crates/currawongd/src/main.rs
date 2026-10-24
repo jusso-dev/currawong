@@ -36,6 +36,9 @@ enum Command {
     /// Manage DKIM and ARC signing keys.
     #[command(subcommand)]
     Dkim(currawongd::dkim::DkimCommand),
+    /// Threat-intel feeds: sync now, or look up an indicator.
+    #[command(subcommand)]
+    Intel(currawongd::intel::IntelCommand),
 }
 
 #[tokio::main]
@@ -64,6 +67,17 @@ async fn main() {
             Err(err) => Err(err),
         };
         match result {
+            Ok(out) => print!("{out}"),
+            Err(err) => {
+                eprintln!("currawongd: {err}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(Command::Intel(command)) = args.command {
+        currawongd::install_tracing(&cfg);
+        match currawongd::intel::run(&cfg, command).await {
             Ok(out) => print!("{out}"),
             Err(err) => {
                 eprintln!("currawongd: {err}");
@@ -161,6 +175,16 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     }
     let mut readiness = checks_for(&cfg);
     readiness.push(Arc::new(report_health));
+    let intel_syncer = if cfg.intel.enabled {
+        let syncer = Arc::new(currawongd::intel::syncer(&cfg)?);
+        readiness.push(Arc::new(currawongd::intel::IntelReady {
+            syncer: Arc::clone(&syncer),
+            required: cfg.intel.required,
+        }));
+        Some(syncer)
+    } else {
+        None
+    };
     currawong_core::telemetry::serve(
         cfg.metrics_addr().map_err(|err| err.to_string())?,
         readiness,
@@ -330,6 +354,19 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
             async move { deliverer.send_tls_reports().await.map(|_| ()) }
         },
     );
+    // Feed downloads write the store on their own loop; a slow feed never
+    // holds up classification, which reads it.
+    if let Some(syncer) = intel_syncer {
+        every(
+            "intel sync",
+            Duration::from_secs(60),
+            shutdown.clone(),
+            move || {
+                let syncer = Arc::clone(&syncer);
+                async move { currawongd::intel::sync_pass(&syncer).await }
+            },
+        );
+    }
     let tls_reload = tls.clone();
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {

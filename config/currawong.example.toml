@@ -256,6 +256,10 @@ contact = ""
 # Put published Microsoft and Google outbound ranges here; do not hard-code a
 # stale copy into the binary.
 # checks.dnsbl: zone, optional dqs_key (never logged) and 127.0.0.x codes.
+# Spamhaus DQS: zone = "zen.dq.spamhaus.net" with dqs_key set queries
+# <reversed-ip>.<key>.zen.dq.spamhaus.net. ZEN codes: 127.0.0.2 SBL,
+# 127.0.0.3 CSS, 127.0.0.4 XBL, 127.0.0.9 DROP, 127.0.0.10/11 PBL. DBL and
+# HBL lookups for links and attachments are in [intel.dqs].
 [checks]
 dnsbl_enabled = false
 ratelimit_enabled = true
@@ -499,3 +503,97 @@ overflow_max_files = 100000
 # [events.wedgetail]
 # url = "https://wedgetail.corp.example/api/ingest/ocsf"
 # token_file = "/etc/currawong/wedgetail.token"
+
+# intel: threat-intelligence feeds (ADR 0006). Off by default. Feeds are
+# downloaded into a local SQLite store and every message's attachment
+# hashes (archive members included), links (text and QR) and link domains
+# are checked against it; the click service also refuses listed links when
+# check_clicks is on. Downloads send nothing about any message.
+# Policy flags: intel.hash, intel.url, intel.domain, intel.ip and
+# intel.<feed name>; count intel_hits. The default packs quarantine hash
+# hits as malware and link hits as phishing.
+# Keys are read from key_env or key_file, never from this file. A feed
+# that fails keeps its last good data; after stale_after_refreshes missed
+# refreshes it is logged as stale (and fails /readyz when required = true);
+# its indicators stop matching expire_after_days after its last good sync.
+[intel]
+enabled = false
+database = "/var/lib/currawong/intel.sqlite"
+max_download_bytes = 67108864
+timeout_secs = 120
+# ca_file = "/etc/currawong/misp-ca.pem"
+expire_after_days = 7
+stale_after_refreshes = 3
+required = false
+max_urls_per_message = 100
+check_clicks = true
+
+# Formats: lines (one indicator per line; set kind = "sha256", "url",
+# "domain" or "ip", or leave it guessed), csv (abuse.ch exports, columns
+# found from the header), threatfox_json, malwarebazaar_sha256, openphish,
+# phishtank_json, stix_bundle, taxii (a TAXII 2.1 collection objects URL).
+# `{key}` in the url is replaced by the key; auth_header sends it as a header.
+#
+# abuse.ch (URLhaus, ThreatFox, MalwareBazaar) needs a free Auth-Key from
+# https://auth.abuse.ch/ and puts it in the URL path. Free use is
+# non-commercial fair use; commercial use needs a Spamhaus subscription.
+# Copy the exact export file names from each project's export page.
+# [[intel.feeds]]
+# name = "urlhaus"
+# format = "csv"
+# url = "https://urlhaus-api.abuse.ch/v2/files/exports/{key}/online.csv"
+# key_env = "ABUSECH_AUTH_KEY"
+# refresh_secs = 900
+#
+# [[intel.feeds]]
+# name = "threatfox"
+# format = "csv"
+# url = "https://threatfox-api.abuse.ch/v2/files/exports/{key}/full.csv.zip"
+# key_env = "ABUSECH_AUTH_KEY"
+# refresh_secs = 3600
+#
+# [[intel.feeds]]
+# name = "malwarebazaar"
+# format = "csv"
+# url = "https://mb-api.abuse.ch/v2/files/exports/{key}/recent.csv"
+# key_env = "ABUSECH_AUTH_KEY"
+# refresh_secs = 900
+#
+# OpenPhish community feed: free for non-commercial use, refreshed about
+# every 12 hours.
+# [[intel.feeds]]
+# name = "openphish"
+# format = "openphish"
+# url = "https://openphish.com/feed.txt"
+# refresh_secs = 21600
+#
+# PhishTank: needs an application key; hourly dumps, Cisco terms of use.
+# [[intel.feeds]]
+# name = "phishtank"
+# format = "phishtank_json"
+# url = "https://data.phishtank.com/data/{key}/online-valid.json.gz"
+# key_file = "/etc/currawong/phishtank.key"
+# refresh_secs = 3600
+#
+# ACSC CTIS or MISP over TAXII 2.1: the API root and collection id come
+# from the provider. auth_header carries the whole value, for example
+# "Basic <base64>" or "Bearer <token>", from the key file.
+# [[intel.feeds]]
+# name = "ctis"
+# format = "taxii"
+# url = "https://taxii.example.gov.au/api/collections/<collection-id>/objects/?match[type]=indicator"
+# key_file = "/etc/currawong/ctis.auth"
+# auth_header = "Authorization"
+# refresh_secs = 3600
+
+# Spamhaus DQS (needs a DQS key): DBL for link domains and HBL for
+# attachment SHA-256 hashes, over DNS. Each query sends the domain or hash
+# and the key to Spamhaus; nothing else about the message. Use the system
+# resolver, not a public one (Spamhaus refuses those). Free use is limited
+# by Spamhaus's DQS terms.
+[intel.dqs]
+enabled = false
+# key_env = "SPAMHAUS_DQS_KEY"
+dbl = true
+hbl = true
+max_queries_per_message = 30

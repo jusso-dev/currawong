@@ -20,6 +20,7 @@ currawong-admin = { path = "../admin" }
 ipnet = { workspace = true }
 currawong-dlp = { path = "../dlp" }
 currawong-integrations = { path = "../integrations" }
+currawong-intel = { path = "../intel" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
