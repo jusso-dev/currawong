@@ -37,6 +37,9 @@ pub const URL_REWRITE_SKIPPED: &str = "url_rewrite.skipped";
 const MAX_TOKEN_RECIPIENTS: usize = 256;
 
 pub struct Pipeline {
+    /// Notification adapter. Default logs only; mailbox adapters must be idempotent.
+    pub outbreak_remediation: Arc<dyn currawong_outbreak::Remediation>,
+    pub outbreak: Option<Result<Arc<currawong_outbreak::Store>, String>>,
     rspamd: Option<Result<RspamdClient, String>>,
     sandbox: Option<Result<SandboxEngine, String>>,
     pub cfg: Arc<Config>,
@@ -131,7 +134,16 @@ impl Pipeline {
                 (None, Some(err))
             }
         };
+        let outbreak = cfg.outbreak.enabled.then(|| {
+            currawong_outbreak::Store::open(
+                &cfg.spool.dir.join("outbreak.sqlite3"),
+                cfg.outbreak.clone(),
+            )
+            .map(Arc::new)
+        });
         Self {
+            outbreak_remediation: Arc::new(crate::outbreak::LogRemediation),
+            outbreak,
             rspamd,
             sandbox,
             cfg,
@@ -656,6 +668,8 @@ impl Pipeline {
                 },
             });
         }
+        self.check_outbreak(env, &parsed.campaign_body.text, &mut report)
+            .await;
         self.check_intel(&mut report).await;
         self.classify(env, raw, &mut report).await;
         let rewritten = self.rewrite_urls(env, raw, &mut report).await;
@@ -770,6 +784,17 @@ impl Pipeline {
             })
             .collect();
         let mut decision = evaluate_message(report, &contexts, &self.policies);
+        if let Some(outbreak) = &report.outbreak {
+            for action in decision.decisions.iter_mut().flat_map(|d| &mut d.actions) {
+                if let currawong_policy::Action::AddHeader { name, value } = action {
+                    if name.eq_ignore_ascii_case("X-Currawong-Campaign")
+                        && value == "{campaign.messages}"
+                    {
+                        *value = outbreak.messages.to_string();
+                    }
+                }
+            }
+        }
         if !tenants.is_empty() {
             for d in decision
                 .decisions

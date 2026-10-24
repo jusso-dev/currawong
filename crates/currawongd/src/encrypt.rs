@@ -78,6 +78,15 @@ pub async fn deliver_encrypted(
                         .await
                         .map_err(|err| err.to_string())?;
                 }
+                let mut delivered = env.clone();
+                delivered.id = derived_id(&env.id, "smime");
+                pipeline
+                    .index_delivered_for(
+                        env.id.as_str(),
+                        &delivered,
+                        quarantine.hold.tenant_id.as_deref(),
+                    )
+                    .await?;
                 tracing::info!(id = %env.id, "sent as S/MIME");
                 return finish(spool, &mut env, "encrypted").await;
             }

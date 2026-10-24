@@ -420,3 +420,45 @@ fn entity(name: &str) -> Option<char> {
     };
     char::from_u32(code)
 }
+
+/// Bodies only for campaign similarity. Subject and attachment text must not
+/// make unrelated messages cluster merely because a common filename matches.
+pub fn campaign_body(message: &Message) -> DlpText {
+    let mut out = DlpText::default();
+    for part in message.text_bodies().chain(message.html_bodies()) {
+        let text = match &part.body {
+            PartType::Text(text) => text.to_string(),
+            PartType::Html(html) => strip_markup(html, Markup::Html),
+            _ => continue,
+        };
+        let room = (64 * 1024_usize).saturating_sub(out.text.len());
+        let mut end = room.min(text.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.text.push_str(&text[..end]);
+        if end < text.len() {
+            out.incomplete = true;
+            break;
+        }
+        if out.text.len() < 64 * 1024 {
+            out.text.push(' ');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod campaign_tests {
+    #[test]
+    fn campaign_body_excludes_subject_and_attachments_and_bounds_unicode() {
+        let raw=format!("Subject: excluded subject\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{}\r\n--b\r\nContent-Type: text/plain; name=excluded.txt\r\nContent-Disposition: attachment\r\n\r\nexcluded attachment\r\n--b--\r\n", "é".repeat(40000));
+        let message = mail_parser::MessageParser::default()
+            .parse(raw.as_bytes())
+            .unwrap();
+        let text = super::campaign_body(&message);
+        assert!(text.incomplete);
+        assert!(text.text.len() <= 64 * 1024);
+        assert!(!text.text.contains("excluded"));
+    }
+}

@@ -21,6 +21,7 @@ ipnet = { workspace = true }
 currawong-dlp = { path = "../dlp" }
 currawong-integrations = { path = "../integrations" }
 currawong-intel = { path = "../intel" }
+currawong-outbreak = { path = "../outbreak" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

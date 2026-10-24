@@ -153,3 +153,14 @@ token_file = "/etc/currawong/wedgetail.token"
 | `message_verdict` | The scheduler, after each verdict is applied (deliver, quarantine hold, reject, discard, defer). Split messages emit one per recipient group |
 | `admin_action` | `policy.reload` when the policy files or database change. Actor is `policy-store` until the admin API exists |
 | `quarantine_release`, `url_click`, `verdict_changed`, other admin actions | Not yet: release, click-time protection and the admin API are not built. TODO hooks are in `crates/quarantine`, `crates/scan/src/url_rewrite.rs` and `crates/admin` |
+
+
+## Outbreak retrospective verdicts (ADR 0010)
+
+Outbreak protection reuses `verdict_changed`. `from = "deliver"` means handed to the local delivery queue; `to = "retro_detection"` means newly detected after that hand-off. It does not mean a mailbox item was moved or deleted. `changed_by` is `outbreak:<source>:<indicator>`; sources include `intel:<feed>:<threat>`, `yara:<namespace>:<rule>` and `clamav:<signature>`. `tenant_id` and `message_id` identify the delivered copy. Normal severity for verdict changes applies. Notification is at least once around crashes; adapters must deduplicate.
+
+```json
+{"schema":"currawong.event.v1","id":"01JA0000000000000000000006","time":"2026-10-25T00:00:00Z","tenant_id":"tenant-a","type":"verdict_changed","message_id":"01JA00000000000000000000M1","from":"deliver","to":"retro_detection","changed_by":"outbreak:intel:openphish:phishing:https://phish.example.test/login"}
+```
+
+The durable detection passed to a `Remediation` adapter also carries direction, sender, recipients and delivery time. The default adapter logs only; real mailbox remediation is #41/#51. Existing signed event webhook destinations can receive these events.

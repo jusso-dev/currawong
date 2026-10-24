@@ -308,6 +308,16 @@ async fn run(cfg: currawong_core::Config) -> Result<(), String> {
     // Classification, delivery and TLS-RPT each run on their own loop, so a
     // slow or failing one cannot hold up the others.
     let pipeline = Arc::new(tokio::sync::Mutex::new((pipeline, quarantine)));
+    let outbreak_loop = Arc::clone(&pipeline);
+    every(
+        "outbreak",
+        Duration::from_secs(60),
+        shutdown.clone(),
+        move || {
+            let pipeline = Arc::clone(&outbreak_loop);
+            async move { pipeline.lock().await.0.outbreak_tick().await }
+        },
+    );
     let spool_loop = Arc::clone(&spool);
     every("pipeline", poll, shutdown.clone(), move || {
         let pipeline = Arc::clone(&pipeline);

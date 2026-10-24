@@ -259,6 +259,21 @@ impl Store {
         Ok(hits)
     }
 
+    /// Stable revision changes only on a successful feed replacement, not a
+    /// failed sync or 304. Used by the local delivered-content retro scanner.
+    pub fn revision(&self) -> Result<String, String> {
+        let conn = self.reader.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stmt = conn
+            .prepare("SELECT source, sync_id FROM feeds ORDER BY source")
+            .map_err(db)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(db)?;
+        serde_json::to_string(&rows.collect::<Result<Vec<_>, _>>().map_err(db)?).map_err(db)
+    }
+
     pub fn lookup(&self, kind: Kind, value: &str, now: i64) -> Result<Vec<IntelHit>, String> {
         self.lookup_many(&[(kind, value.to_string())], now)
     }

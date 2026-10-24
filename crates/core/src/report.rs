@@ -334,6 +334,8 @@ pub struct ScanReport {
     /// domains (`[intel]`).
     #[serde(default)]
     pub intel: Vec<IntelHit>,
+    #[serde(default)]
+    pub outbreak: Option<OutbreakReport>,
 }
 
 /// One indicator a message matched, and the feed that listed it.
@@ -487,7 +489,21 @@ impl ScanReport {
             flags: Vec::new(),
             marking: None,
             intel: Vec::new(),
+            outbreak: None,
             modified: false,
         }
     }
+}
+
+/// Bounded global campaign counts, including this message once across retries.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutbreakReport {
+    pub first_seen_minutes: Option<u64>,
+    pub held: bool,
+    #[serde(default)]
+    pub hold_until: Option<i64>,
+    pub messages: u64,
+    pub tenants: u64,
+    pub senders: u64,
+    pub truncated: bool,
 }

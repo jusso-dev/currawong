@@ -40,6 +40,7 @@ impl RulesCache {
                     warnings: Vec::new(),
                     yara: Vec::new(),
                     dlp: Default::default(),
+                    campaign_body: Default::default(),
                 }
             }
             Err(err) => ParseResponse::failed(LoadRules::REPLY_ID, err),

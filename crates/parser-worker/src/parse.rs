@@ -159,6 +159,7 @@ pub fn parse_full(
         warnings: Vec::new(),
         yara,
         dlp: crate::text::message_text(&message, documents),
+        campaign_body: Box::new(crate::text::campaign_body(&message)),
     }
 }
 
