@@ -1527,6 +1527,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "currawong-intel"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "currawong-core",
+ "flate2",
+ "futures",
+ "psl",
+ "rcgen 0.13.2",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "rustls-pemfile",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "url",
+ "webpki-roots",
+ "zip 9.0.4",
+]
+
+[[package]]
 name = "currawong-parser-worker"
 version = "0.0.1"
 dependencies = [
@@ -1753,6 +1781,7 @@ dependencies = [
  "currawong-core",
  "currawong-dlp",
  "currawong-integrations",
+ "currawong-intel",
  "currawong-parser-worker",
  "currawong-policy",
  "currawong-quarantine",
