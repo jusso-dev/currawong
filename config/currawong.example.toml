@@ -114,6 +114,8 @@ key = "/etc/currawong/key.pem"
 # scanner.blocked_extensions: active content even when ClamAV is clean. Applies
 #   to attachments and to files inside archives.
 # scanner.treat_macros_as_active / treat_executables_as_active: file-type policy.
+#   treat_executables_as_active also covers shell shortcuts (`.url` to a share,
+#   `.library-ms`, `.search-ms`, `.scf` and the like).
 # scanner.extract.*: archive limits (depth, uncompressed bytes, files, ratio).
 [scanner]
 enabled = true

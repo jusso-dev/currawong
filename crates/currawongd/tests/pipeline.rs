@@ -1362,3 +1362,144 @@ async fn bec_inbound_spoof_is_quarantined_and_a_weak_one_marked_through_the_pipe
     let (report, _) = pipeline.evaluate(&outbound, raw, None).await;
     assert!(report.bec.is_none());
 }
+
+/// Document checks reach policy: Office external content and shortcuts fold
+/// into `active_content`, SVG, PDF and disk images go through the default
+/// pack, and a PDF open action alone is only tagged.
+#[tokio::test]
+async fn document_checks_reach_policy() {
+    let dir = tempfile::tempdir().unwrap();
+    let pipeline = classify_pipeline(dir.path(), true);
+    let mut docx = std::io::Cursor::new(Vec::new());
+    {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(&mut docx);
+        let opts = zip::write::SimpleFileOptions::default();
+        writer.start_file("word/document.xml", opts).unwrap();
+        writer.write_all(b"<w:document/>").unwrap();
+        writer
+            .start_file("word/_rels/settings.xml.rels", opts)
+            .unwrap();
+        writer
+            .write_all(br#"<Relationships><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/attachedTemplate" Target="https://templates.example.test/t.dotm" TargetMode="External"/></Relationships>"#)
+            .unwrap();
+        writer.finish().unwrap();
+    }
+    let docx = docx.into_inner();
+    let pdf = |extra: &str| {
+        format!("%PDF-1.7\n1 0 obj\n<< /Type /Catalog {extra} >>\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n")
+            .into_bytes()
+    };
+    let mut vhd = vec![0u8; 2048];
+    vhd[2048 - 512..2048 - 504].copy_from_slice(b"conectix");
+    let message = |name: &str, content_type: &str, bytes: &[u8]| {
+        format!(
+            "From: a@example.test\r\nTo: dest@example.test\r\nSubject: documents\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"b\"\r\n\r\n--b\r\nContent-Type: text/plain\r\n\r\nSee attached.\r\n{}--b--\r\n",
+            attachment(name, content_type, bytes)
+        )
+    };
+    let cases: Vec<(&str, &str, Vec<u8>, &str, &str)> = vec![
+        (
+            "report.docx",
+            "application/octet-stream",
+            docx,
+            "active-content",
+            "external_template",
+        ),
+        (
+            "remit.svg",
+            "image/svg+xml",
+            br#"<svg xmlns="http://www.w3.org/2000/svg" onload="go()"/>"#.to_vec(),
+            "phishing",
+            "svg_active",
+        ),
+        (
+            "statement.pdf",
+            "application/pdf",
+            pdf("/OpenAction << /S /JavaScript /JS (x) >>"),
+            "active-content",
+            "pdf_javascript",
+        ),
+        (
+            "invoice.url",
+            "application/octet-stream",
+            b"[InternetShortcut]\r\nURL=file://fileserver.example.test/share/invoice\r\n".to_vec(),
+            "active-content",
+            "shortcut",
+        ),
+        // Not unpacked: the scan-failed floor holds it before the pack does.
+        (
+            "disk.vhd",
+            "application/octet-stream",
+            vhd,
+            "scan-failed",
+            "disk_image",
+        ),
+    ];
+    for (name, content_type, bytes, queue, signal) in cases {
+        let raw = message(name, content_type, &bytes);
+        let (report, decision) = pipeline
+            .assess(&envelope("a@example.test"), raw.as_bytes(), None)
+            .await;
+        assert_eq!(
+            decision.decisions[0].queue(),
+            Some(queue),
+            "{name}: {decision:?}"
+        );
+        let signals = currawong_policy::Signals::from_report(&report);
+        assert!(signals.flags.contains(signal), "{name}: {signals:?}");
+    }
+
+    // The template URL is in the report for link analysis.
+    let raw = message("report.docx", "application/octet-stream", &{
+        let mut docx = std::io::Cursor::new(Vec::new());
+        {
+            use std::io::Write;
+            let mut writer = zip::ZipWriter::new(&mut docx);
+            let opts = zip::write::SimpleFileOptions::default();
+            writer.start_file("word/_rels/a.rels", opts).unwrap();
+            writer
+                .write_all(br#"<Relationship Type="x/frame" Target="https://frames.example.test/f.html" TargetMode="External"/>"#)
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        docx.into_inner()
+    });
+    let (report, _) = pipeline
+        .assess(&envelope("a@example.test"), raw.as_bytes(), None)
+        .await;
+    assert!(
+        report
+            .urls
+            .contains(&"https://frames.example.test/f.html".to_string()),
+        "{:?}",
+        report.urls
+    );
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|note| note.contains("remote template")),
+        "{:?}",
+        report.notes
+    );
+
+    // An open action alone is common in benign PDFs: delivered and tagged.
+    let raw = message(
+        "statement.pdf",
+        "application/pdf",
+        &pdf("/OpenAction [2 0 R /Fit]"),
+    );
+    let (_, decision) = pipeline
+        .assess(&envelope("a@example.test"), raw.as_bytes(), None)
+        .await;
+    assert!(
+        matches!(decision.verdict(), Verdict::Deliver),
+        "{decision:?}"
+    );
+    assert!(decision.decisions[0].actions.iter().any(|action| matches!(
+        action,
+        currawong_policy::Action::AddHeader { name, value }
+            if name == "X-Currawong-PDF-Auto-Action" && value == "present"
+    )));
+}
