@@ -15,11 +15,13 @@ impl DnsblCheck {
         Self { zones, dns }
     }
 
+    /// Spamhaus DQS puts the key between the reversed address and the
+    /// zone: `<reversed>.<key>.zen.dq.spamhaus.net`.
     pub fn query_name(ip: IpAddr, zone: &DnsblZone) -> Option<String> {
         let reversed = reverse(ip)?;
         let zone_name = normalise(&zone.zone);
         if let Some(key) = &zone.dqs_key {
-            Some(format!("{}.{reversed}.{zone_name}", key.expose()))
+            Some(format!("{reversed}.{}.{zone_name}", key.expose()))
         } else {
             Some(format!("{reversed}.{zone_name}"))
         }
