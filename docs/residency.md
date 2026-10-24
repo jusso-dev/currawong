@@ -62,3 +62,11 @@ The signing key is created atomically: a temporary `0600` file, synced, then lin
 Without `residency.signing_key_path` no report is written, and `currawongd` logs a warning at startup.
 
 An auditor verifies a report with `verify_report(&signed, &trusted_key)`, where `trusted_key` is the public key they pinned out of band (for example from `residency-signing.pub` at install time). The key embedded in a report is informational only. A report re-signed with any other key fails.
+
+## Optional domain-age and click analysis (ADR 0012)
+
+`rdap.enabled` permits IANA bootstrap downloads and public HTTPS registry lookups. Only registrable domain names leave the gateway; own domains are excluded. DNS and RDAP providers may be overseas. No mail addresses, content, attachments or full message URLs are submitted. SQLite caches reduce lookups; `rdap.scan_urls` separately enables URL-domain enrichment at scan time.
+
+`click.fetch.enabled` permits recipient-designated page fetches outside Australia. Requests disclose their full URL, appliance address and fixed User-Agent, without cookies, email content, credentials or referrers. Every fetched HTTP or meta-refresh hop is resolved, checked and pinned; private/metadata/special-use addresses are refused. Wrappers are decoded locally, with reputation checked at every hop. These fetches can activate tracking and one-time links.
+
+The analyser receives full URLs and, only with `click.analyser.include_html`, a bounded HTML excerpt. `click.analyser.url` joins startup content endpoint checks; runtime POSTs call `check_request`, resolve and pin. All DNS answers must be loopback, even with a residency override. Redirects are checked with `check_redirect` and refused. Any analyser-controlled browser/ML egress needs its own equivalent protections. See [ADR 0012](adr/0012-click-analysis.md) for contracts and limits.

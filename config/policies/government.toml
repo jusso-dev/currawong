@@ -304,3 +304,24 @@ id = "intel-ip"
 priority = 28
 conditions = [{ flag = "intel.ip" }]
 actions = [{ quarantine = "phishing" }]
+
+# RDAP age is supporting evidence, never a quarantine decision by itself.
+# BEC reasons contribute to the existing 0.6 score policy.
+
+[[policy]]
+id = "new-domain-sender"
+priority = 59
+conditions = [{ flag = "domain.new_sender" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "sender" } }]
+
+[[policy]]
+id = "new-domain-reply-to"
+priority = 59
+conditions = [{ flag = "domain.new_reply_to" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "reply_to" } }]
+
+[[policy]]
+id = "new-domain-url"
+priority = 59
+conditions = [{ flag = "domain.new_url" }]
+actions = [{ add_header = { name = "X-Currawong-New-Domain", value = "url" } }]

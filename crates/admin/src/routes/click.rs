@@ -180,6 +180,12 @@ pub struct ClickEvent {
     pub url: String,
     pub action: ClickAction,
     pub reason: String,
+    #[serde(default)]
+    pub verdict: String,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    #[serde(default)]
+    pub final_url: String,
 }
 
 /// Append-only JSON lines file of click events, mode 0600. When it passes
@@ -300,8 +306,19 @@ async fn click(
             "Wait a minute and try the link again.",
         );
     }
-    let proceed = query.proceed.is_some();
-    let (action, reason) = match state.reputation.check(&claims.u).await {
+    let checked = state.reputation.inspect(&claims.u).await;
+    let final_url = checked.url;
+    let proceed = query.proceed.as_deref().is_some_and(|value| {
+        state
+            .signer
+            .verify_continuation(value, &token, &final_url, now)
+    });
+    let (verdict, reasons) = match &checked.reputation {
+        Reputation::Clean => ("clean", Vec::new()),
+        Reputation::Warn { reason } => ("warn", reason.lines().map(str::to_string).collect()),
+        Reputation::Blocked { reason } => ("blocked", reason.lines().map(str::to_string).collect()),
+    };
+    let (action, reason) = match checked.reputation {
         Reputation::Clean => (ClickAction::Redirected, String::new()),
         Reputation::Warn { reason } if proceed => (
             ClickAction::Redirected,
@@ -317,6 +334,9 @@ async fn click(
         url: claims.u,
         action,
         reason,
+        verdict: verdict.into(),
+        reasons,
+        final_url,
     };
     state.log.record(&event);
     export::emit(Event::new(
@@ -325,6 +345,9 @@ async fn click(
             message_id: event.message_id.clone(),
             recipient: event.recipient.clone(),
             url: event.url.clone(),
+            verdict: event.verdict.clone(),
+            reasons: event.reasons.clone(),
+            final_url: event.final_url.clone(),
             action: match action {
                 ClickAction::Redirected => "allowed",
                 ClickAction::Warned => "warned",
@@ -333,7 +356,8 @@ async fn click(
             .into(),
         },
     ));
-    let link = escape(&event.url);
+    let continuation = state.signer.continuation(&token, &event.final_url, now);
+    let link = escape(&event.final_url);
     let reason = escape(&event.reason);
     match action {
         ClickAction::Blocked => page(
@@ -344,9 +368,9 @@ async fn click(
         ClickAction::Warned => page(
             StatusCode::OK,
             "Check this link before you continue",
-            &format!("Currawong has not confirmed this link is safe ({reason}). It goes to <code>{link}</code>. Continue only if you expected it. <a href=\"/u/{token}?proceed=1\" rel=\"noreferrer\">Continue to the site</a>"),
+            &format!("Currawong has not confirmed this link is safe ({reason}). It goes to <code>{link}</code>. Continue only if you expected it. <a href=\"/u/{token}?proceed={continuation}\" rel=\"noreferrer\">Continue to the site</a>"),
         ),
-        ClickAction::Redirected => match HeaderValue::from_str(&event.url) {
+        ClickAction::Redirected => match HeaderValue::from_str(&event.final_url) {
             Ok(location) => (
                 StatusCode::FOUND,
                 [

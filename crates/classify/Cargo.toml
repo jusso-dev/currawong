@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio = { workspace = true }
+currawong-link = { path = "../link" }
 currawong-core = { path = "../core" }
 mail-parser = { workspace = true }
 rusqlite = { workspace = true }

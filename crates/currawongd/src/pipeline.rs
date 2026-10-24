@@ -38,6 +38,7 @@ const MAX_TOKEN_RECIPIENTS: usize = 256;
 
 pub struct Pipeline {
     rspamd: Option<Result<RspamdClient, String>>,
+    rdap: Option<Result<Arc<currawong_link::rdap::Rdap>, String>>,
     sandbox: Option<Result<SandboxEngine, String>>,
     pub cfg: Arc<Config>,
     pub auth: AuthChecker,
@@ -131,7 +132,12 @@ impl Pipeline {
                 (None, Some(err))
             }
         };
+        let rdap = cfg
+            .rdap
+            .enabled
+            .then(|| currawong_link::rdap::Rdap::open(&cfg.rdap).map(Arc::new));
         Self {
+            rdap,
             rspamd,
             sandbox,
             cfg,
@@ -815,6 +821,28 @@ impl Pipeline {
 
     /// Classification is CPU and SQLite work, so it runs off the async workers.
     async fn classify(&self, env: &Envelope, raw: &[u8], report: &mut ScanReport) {
+        let tenant = tenant_context(&self.cfg, env);
+        match &self.rdap {
+            Some(Ok(rdap)) => {
+                let bytes = raw[..raw.len().min(MAX_RAW_BYTES + 1)].to_vec();
+                if let Ok(view) = tokio::task::spawn_blocking(move || {
+                    currawong_classify::message::MessageView::parse(&bytes)
+                })
+                .await
+                {
+                    currawong_classify::domain_age::assess(
+                        rdap,
+                        &self.cfg.rdap,
+                        &tenant.domains,
+                        &view,
+                        report,
+                    )
+                    .await;
+                }
+            }
+            Some(Err(error)) => report.notes.push(format!("RDAP unavailable: {error}")),
+            None => {}
+        }
         let Some(classifier) = self.classifier.clone() else {
             if let Some(err) = &self.classify_error {
                 report.notes.push(format!("classifier unavailable: {err}"));
@@ -828,6 +856,9 @@ impl Pipeline {
         let urls = report.urls.clone();
         let bec =
             (env.direction == Direction::Inbound).then(|| currawong_classify::bec::BecContext {
+                recipients: env.rcpt_to.clone(),
+                new_sender_domain: report.flags.iter().any(|f| f == "domain.new_sender"),
+                new_reply_to_domain: report.flags.iter().any(|f| f == "domain.new_reply_to"),
                 dmarc_failed: report
                     .auth
                     .as_ref()

@@ -628,6 +628,7 @@ fn content_endpoints(cfg: &Config) -> Vec<String> {
         &cfg.scanner.rspamd.url,
         &cfg.scanner.rspamd.controller_url,
         &cfg.scanner.sandbox.url,
+        &cfg.click.analyser.url,
     ] {
         if !endpoint.is_empty() {
             endpoints.push(endpoint.clone());

@@ -198,6 +198,9 @@ pub enum BecReason {
     FirstTimeSender,
     /// DMARC failed for the From domain.
     AuthFailure,
+    NewSenderDomain,
+    NewReplyToDomain,
+    ThreadHijack,
 }
 
 impl BecReason {
@@ -213,6 +216,9 @@ impl BecReason {
             Self::Secrecy => "secrecy",
             Self::FirstTimeSender => "first_time_sender",
             Self::AuthFailure => "auth_failure",
+            Self::NewSenderDomain => "new_sender_domain",
+            Self::NewReplyToDomain => "new_reply_to_domain",
+            Self::ThreadHijack => "thread_hijack",
         }
     }
 }
@@ -334,6 +340,9 @@ pub struct ScanReport {
     /// domains (`[intel]`).
     #[serde(default)]
     pub intel: Vec<IntelHit>,
+    /// Youngest known registration age; absent means no age was established.
+    #[serde(default)]
+    pub domain_youngest_days: Option<u64>,
 }
 
 /// One indicator a message matched, and the feed that listed it.
@@ -487,6 +496,7 @@ impl ScanReport {
             flags: Vec::new(),
             marking: None,
             intel: Vec::new(),
+            domain_youngest_days: None,
             modified: false,
         }
     }

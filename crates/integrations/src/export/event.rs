@@ -37,7 +37,13 @@ pub enum EventKind {
         message_id: String,
         recipient: String,
         url: String,
-        /// `allowed` or `blocked`.
+        #[serde(default)]
+        verdict: String,
+        #[serde(default)]
+        reasons: Vec<String>,
+        #[serde(default)]
+        final_url: String,
+        /// `allowed`, `warned` or `blocked`.
         action: String,
     },
     QuarantineRelease {
@@ -174,6 +180,9 @@ pub(crate) mod tests {
                     recipient: "ap@example.com.au".into(),
                     url: "https://login.example.net/a?b=c|d".into(),
                     action: "blocked".into(),
+                    verdict: "blocked".into(),
+                    reasons: vec!["listed threat".into()],
+                    final_url: "https://login.example.net/a?b=c|d".into(),
                 },
             ),
             mk(

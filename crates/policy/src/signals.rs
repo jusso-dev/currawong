@@ -27,6 +27,9 @@
 //!   `intel.ip` by indicator kind, and `intel.<source>` per feed (for example
 //!   `intel.urlhaus` or `intel.spamhaus-dbl`); `intel.dbl_low_reputation`
 //!   when Spamhaus DBL lists a link domain only as low reputation.
+//!   Domain age adds `domain.new_sender`, `domain.new_reply_to`, `domain.new_url`
+//!   and count `domain.youngest_days` when RDAP establishes an age. BEC adds
+//!   `bec.new_sender_domain`, `bec.new_reply_to_domain`, `bec.thread_hijack`.
 //! - marking: the PSPF classification (`PROTECTED`, `OFFICIAL:Sensitive`...),
 //!   for the `marking` and `marking_at_least` conditions.
 //! - counts: `parts`, `urls`, `yara` (matches), `intel_hits`, and distinct identifiers
@@ -124,6 +127,9 @@ impl Signals {
         if let Some(strongest) = report.lookalikes.iter().map(|f| f.score).reduce(f64::max) {
             signals.flag("lookalike");
             signals.score("lookalike", strongest);
+        }
+        if let Some(days) = report.domain_youngest_days {
+            signals.count("domain.youngest_days", days);
         }
         signals.count("parts", report.parts.len() as u64);
         signals.count("urls", report.urls.len() as u64);

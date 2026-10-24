@@ -65,6 +65,20 @@ pub fn check_config(path: &Path) -> Result<CoreConfig, String> {
             Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|err| err.to_string())?),
         )?;
     }
+    if !cfg.click.analyser.url.is_empty() {
+        let endpoint = url::Url::parse(&cfg.click.analyser.url).map_err(|e| e.to_string())?;
+        guard.check_request(&endpoint).map_err(|e| e.to_string())?;
+        if let Some(url::Host::Ipv4(ip)) = endpoint.host() {
+            if !currawong_link::http::on_box(ip.into()) {
+                return Err("click.analyser must be on-box".into());
+            }
+        }
+        if let Some(url::Host::Ipv6(ip)) = endpoint.host() {
+            if !currawong_link::http::on_box(ip.into()) {
+                return Err("click.analyser must be on-box".into());
+            }
+        }
+    }
     yara_summary(&cfg)?;
     if cfg.intel.enabled {
         currawong_intel::sync::http_client(cfg.intel.ca_file.as_deref(), cfg.intel.timeout_secs)
@@ -111,6 +125,21 @@ pub fn url_protection(cfg: &CoreConfig) -> Result<(UrlRewriter, ClickState), Str
             Arc::new(intel::IntelReputation { store }),
         ]));
     }
+    let guard = Arc::new(ResidencyGuard::from_config(&cfg.residency).map_err(|e| e.to_string())?);
+    let mut analysis =
+        currawong_scan::urls::analysis::ClickAnalysis::new(&cfg.click, reputation, guard);
+    if cfg.rdap.enabled {
+        let rdap = Arc::new(currawong_link::rdap::Rdap::open(&cfg.rdap)?);
+        let mut own = cfg.domains.accept.clone();
+        own.extend(
+            cfg.relay
+                .tenants
+                .iter()
+                .flat_map(|t| t.domains.iter().cloned()),
+        );
+        analysis = analysis.with_rdap(rdap, own, cfg.rdap.new_domain_days);
+    }
+    let reputation: Arc<dyn UrlReputation> = Arc::new(analysis);
     let log = ClickLog::open(&urls.click_log, urls.click_log_max_bytes)
         .map_err(|err| format!("click log {}: {err}", urls.click_log.display()))?;
     Ok((

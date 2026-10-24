@@ -67,7 +67,13 @@ fn extension(event: &Event) -> (&'static str, Vec<(&'static str, String)>) {
             recipient,
             url,
             action,
+            verdict,
+            reasons,
+            final_url,
         } => {
+            ext.push(("verdict", verdict.clone()));
+            ext.push(("reason", reasons.join("; ")));
+            ext.push(("finalUrl", final_url.clone()));
             message(&mut ext, message_id);
             ext.push(("act", action.clone()));
             ext.push(("duser", recipient.clone()));

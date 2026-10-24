@@ -1414,6 +1414,7 @@ name = "currawong-classify"
 version = "0.0.1"
 dependencies = [
  "currawong-core",
+ "currawong-link",
  "idna",
  "mail-parser",
  "psl",
@@ -1424,6 +1425,7 @@ dependencies = [
  "strsim",
  "tempfile",
  "thiserror 2.0.21",
+ "tokio",
  "toml",
  "tracing",
  "unicode-security",
@@ -1553,6 +1555,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "currawong-link"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "base64 0.22.1",
+ "currawong-core",
+ "psl",
+ "reqwest",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "currawong-parser-worker"
 version = "0.0.1"
 dependencies = [
@@ -1644,6 +1665,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "currawong-core",
+ "currawong-link",
  "currawong-parser-worker",
  "encoding_rs",
  "flate2",
@@ -1654,6 +1676,7 @@ dependencies = [
  "lol_html",
  "mail-parser",
  "notify",
+ "regex",
  "reqwest",
  "rusqlite",
  "rustls",
@@ -1784,6 +1807,7 @@ dependencies = [
  "currawong-dlp",
  "currawong-integrations",
  "currawong-intel",
+ "currawong-link",
  "currawong-parser-worker",
  "currawong-policy",
  "currawong-quarantine",

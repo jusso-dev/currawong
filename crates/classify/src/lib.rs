@@ -2,6 +2,7 @@
 //! compromise (BEC) heuristics. The optional LLM classifier joins later.
 //! Results go on the `ScanReport`; the policy engine decides what to do.
 pub mod bec;
+pub mod domain_age;
 pub mod lookalike;
 pub mod message;
 pub mod spam;
@@ -300,6 +301,23 @@ impl Classifier {
             ctx.lookalike_sender |= lookalikes
                 .iter()
                 .any(|f| f.source != "url" && f.score >= STRONG_LOOKALIKE);
+            ctx.reply_to_lookalike |= lookalikes
+                .iter()
+                .any(|f| f.source == "reply-to" && f.score >= STRONG_LOOKALIKE);
+            let from_domains: Vec<_> = view
+                .from
+                .iter()
+                .filter_map(|a| address_domain(a))
+                .map(str::to_string)
+                .collect();
+            ctx.reply_to_lookalike |=
+                view.reply_to
+                    .iter()
+                    .filter_map(|a| address_domain(a))
+                    .any(|domain| {
+                        lookalike::score(domain, &from_domains)
+                            .is_some_and(|hit| hit.score >= STRONG_LOOKALIKE)
+                    });
             if ctx.first_time.is_none() {
                 // The From address, the one `record_delivery` stores.
                 let sender = view
@@ -310,7 +328,18 @@ impl Classifier {
                 ctx.first_time = self
                     .history
                     .as_ref()
-                    .and_then(|history| history.seen(&tenant.key, sender).ok())
+                    .and_then(|history| {
+                        if ctx.recipients.is_empty() {
+                            return history.seen(&tenant.key, sender).ok();
+                        }
+                        // Any newly contacted recipient deserves the supporting signal.
+                        ctx.recipients
+                            .iter()
+                            .map(|r| history.seen_recipient(&tenant.key, sender, r))
+                            .collect::<Result<Vec<_>, _>>()
+                            .ok()
+                            .map(|seen| seen.into_iter().all(|s| s))
+                    })
                     .map(|seen| !seen);
             }
             bec::analyse(

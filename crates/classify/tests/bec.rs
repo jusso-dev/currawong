@@ -234,3 +234,45 @@ fn bec_vip_spoof_alone_reaches_the_threshold_and_staff_subdomains_are_internal()
     let (score, _) = reasons(&message("From: x <x@vendor.test>", "nothing to see"));
     assert_eq!(score.to_bits(), 0.0_f64.to_bits(), "no negative zero");
 }
+
+#[test]
+fn bec_age_reply_and_thread_reasons_remain_supporting_evidence() {
+    let classifier = classifier();
+    let mut ctx = BecContext {
+        new_sender_domain: true,
+        new_reply_to_domain: true,
+        recipients: vec!["ap@acme.test".into()],
+        ..Default::default()
+    };
+    let raw = b"From: new@supplier.test\r\nReply-To: payments@new-domain.test\r\nSubject: AW: invoice\r\n\r\nHello\r\n";
+    let result = classifier
+        .classify_with(&tenant(), raw, "", &[], Some(ctx.clone()))
+        .bec
+        .unwrap();
+    assert!(result.reasons.contains(&BecReason::NewSenderDomain));
+    assert!(result.reasons.contains(&BecReason::NewReplyToDomain));
+    assert!(result.reasons.contains(&BecReason::ThreadHijack));
+    assert!(result.score < THRESHOLD, "{result:?}");
+    classifier.record_delivery(&tenant(), "new@supplier.test", &["other@acme.test".into()]);
+    assert!(classifier
+        .classify_with(&tenant(), raw, "", &[], Some(ctx.clone()))
+        .bec
+        .unwrap()
+        .reasons
+        .contains(&BecReason::ThreadHijack));
+    classifier.record_delivery(&tenant(), "new@supplier.test", &["ap@acme.test".into()]);
+    assert!(!classifier
+        .classify_with(&tenant(), raw, "", &[], Some(ctx.clone()))
+        .bec
+        .unwrap()
+        .reasons
+        .contains(&BecReason::ThreadHijack));
+    ctx.first_time = Some(true);
+    let raw = b"From: new@supplier.test\r\nSubject: Re: invoice\r\nIn-Reply-To: <prior@example.test>\r\n\r\nHello\r\n";
+    assert!(!classifier
+        .classify_with(&tenant(), raw, "", &[], Some(ctx))
+        .bec
+        .unwrap()
+        .reasons
+        .contains(&BecReason::ThreadHijack));
+}
