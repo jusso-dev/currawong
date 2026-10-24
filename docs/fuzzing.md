@@ -4,7 +4,7 @@ Fuzz entry points live in library code so the normal test suite does not need li
 
 - `currawong_smtp::fuzz::{command, data, sasl}`. `data` uses the session's own framing (`LinesCodec` with the line limit, then `push_data_line`, including the drain after an oversized message).
 - `currawong_parser::fuzz::mime`.
-- `currawong_fuzzstand::*` for the rest: `archive_extract` (the first byte picks the attachment name, two passwords are tried), `office_detect` (file type and Office/RTF checks), `pspf_parse`, `dlp_scan`, `url_rewrite` (`currawong_scan::urls::fuzz`: link rewriting of a whole message, MIME, HTML and text), `auth_strip` (forged Authentication-Results), `clamd_address`, `parser_ipc` (length-prefixed frames and the JSON request) and `spool_envelope` (envelope JSON).
+- `currawong_fuzzstand::*` for the rest: `archive_extract` (the first byte picks the attachment name, two passwords are tried), `office_detect` (file type and Office/RTF checks), `doc_scan` (the first byte picks a name: PDF, OneNote, SVG, shortcut, RTF, disk image and single OOXML members, plus the PDF, RTF and OOXML scanners called directly), `pspf_parse`, `dlp_scan`, `url_rewrite` (`currawong_scan::urls::fuzz`: link rewriting of a whole message, MIME, HTML and text), `auth_strip` (forged Authentication-Results), `clamd_address`, `parser_ipc` (length-prefixed frames and the JSON request) and `spool_envelope` (envelope JSON).
 
 `currawong_fuzzstand::TARGETS` lists every target. A test checks that it matches `fuzz/fuzz_targets/`, `fuzz/Cargo.toml` and `.github/workflows/fuzz.yml`.
 
