@@ -146,3 +146,40 @@ conditions = [
     { not = { auth = { method = "dmarc", result = "pass" } } },
 ]
 actions = [{ add_header = { name = "X-Currawong-Warning", value = "links from an unauthenticated sender were not checked" } }]
+
+# Optional on-premises HTTP engines (#28); Bayes/rules remain independent.
+[[policy]]
+id = "rspamd-phishing"
+priority = 32
+conditions = [{ flag = "rspamd.phishing" }]
+actions = [{ quarantine = "phishing" }]
+
+[[policy]]
+id = "rspamd-reject"
+priority = 59
+conditions = [{ flag = "rspamd.action.reject" }]
+actions = [{ quarantine = "spam" }]
+
+[[policy]]
+id = "rspamd-add-header"
+priority = 61
+conditions = [{ flag = "rspamd.action.add_header" }]
+actions = [{ add_header = { name = "X-Spam", value = "Yes" } }]
+
+[[policy]]
+id = "rspamd-rewrite-subject"
+priority = 62
+conditions = [{ flag = "rspamd.action.rewrite_subject" }]
+actions = [{ add_header = { name = "X-Spam", value = "Yes" } }]
+
+[[policy]]
+id = "rspamd-greylist"
+priority = 58
+conditions = [{ flag = "rspamd.action.greylist" }]
+actions = ["defer"]
+
+[[policy]]
+id = "rspamd-soft-reject"
+priority = 58
+conditions = [{ flag = "rspamd.action.soft_reject" }]
+actions = ["defer"]

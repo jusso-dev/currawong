@@ -13,6 +13,7 @@ pub use report::{
     DlpSample, EngineFinding, FoundUrl, LookalikeFinding, LookalikeTechnique, MarkingReport,
     PartFlag, PartInfo, RuleHit, ScanReport, SpamReport, UrlSource, YaraMatch,
 };
+pub use report::{RspamdResult, RspamdSymbol, SandboxResult};
 pub use residency::{ResidencyError, ResidencyGuard, SignedReport};
 pub use secret::Secret;
 

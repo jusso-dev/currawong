@@ -571,6 +571,7 @@ async fn clamd_gets_one_deadline_per_message_and_stops_when_unreachable() {
             let path = dir.path().join(format!("{i}.part"));
             std::fs::write(&path, format!("part {i}")).unwrap();
             PartInfo {
+                is_attachment: true,
                 content_type: "text/plain".into(),
                 filename: None,
                 size: 6,

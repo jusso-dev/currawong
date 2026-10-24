@@ -41,6 +41,7 @@ axum = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
+rusqlite = { workspace = true }
 rcgen = { workspace = true }
 rsa = { workspace = true }
 rand = { workspace = true }

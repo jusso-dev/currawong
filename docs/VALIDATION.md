@@ -224,3 +224,21 @@ Official ClamAV signatures are the baseline only. See `docs/adr/0005-malware-eng
 - The `prepend_banner` policy action is not implemented yet: policy banner actions need message-body rewriting (being added with URL rewriting, #29). Until then the default pack marks sub-threshold impersonation with an `X-Currawong-Warning` header (`bec-warn`) that transport rules or clients can turn into a banner.
 - A message to recipients in several tenants is scored once, for the first recipient's tenant.
 - The sender history only records From addresses of delivered inbound mail that passed SPF or DMARC; it keeps at most 200,000 pairs per tenant and forgets senders not seen for a year.
+
+## Rspamd engine (#28)
+
+Commands: `cargo test -p currawong-scan --test http_engines rspamd`, `cargo test -p currawongd --test http_engines rspamd`, `cargo test -p currawong-core http_engine`.
+
+In-process port-0 HTTP fakes cover reject/add-header/rewrite-subject/no-action/greylist/soft-reject, envelope and repeated recipient headers, credentials, ham/spam learning, disabled learning, required/optional unreachable service, invalid JSON, skipped scan, message/response size limits, residency rejection and redirects. Daemon tests exercise policy signals/queues, score/ratio, engine explanation, release learning without Bayes and required readiness. Config tests cover old report deserialisation, disabled defaults, unknown keys, bounds and content endpoint residency checks. No live Rspamd, Redis, DNS-dependent filtering or deployment was run.
+
+## Sandbox detonation (#28)
+
+Commands: `cargo test -p currawong-scan --test http_engines sandbox`, `cargo test -p currawong-scan --test http_engines cape`, `cargo build -p currawong-parser-worker`, `cargo test -p currawongd --test http_engines sandbox`.
+
+Fake CAPEv2 servers cover multipart/token submission, pending/status/report, malformed and missing scores, task failures, clean/malicious results, SHA-256 cache reuse across engine restart, duplicate parts, TTL expiry, selection (including named/unnamed HTML attachments versus an ordinary HTML body), size/hash bounds, timeout in both modes and required/optional outages. Daemon tests use the real parser worker and spool: first pass defers at the configured poll interval; a later attempt delivers clean files or quarantines malware; cached results avoid another HTTP request. SQLite timestamps are advanced in tests instead of sleeping. Sandbox score is normalised 0..1; CAPE >=5/10 is malicious. Static content controls still apply to clean files.
+
+DRAKVUF routes were checked against upstream, but no malicious/clean verdict contract was verified. No adapter is shipped; the config rejects `drakvuf`. No live CAPE, DRAKVUF, hypervisor, guest VM, real malware, public endpoint or deployment was exercised. Benign fixtures are generated in tests. Cache expiry is lazy and has no row-count quota; ambiguous uploads reserve rather than immediately retrying submission. HTTP limits are 15 seconds, 64 KiB create reply, 8 MiB report/status. Learning retries rely on Rspamd's duplicate protection; no administrator mark-spam hook exists.
+
+Dependencies reuse workspace/lockfile crates: reqwest, rustls, url and hex (MIT/Apache-2.0; rustls also ISC), rusqlite (MIT, bundled SQLite public domain). Rspamd Apache-2.0 and CAPEv2 GPL-3.0 are separate HTTP services. No GPL code is linked or vendored. `cargo deny` is not installed locally; licences checked by hand.
+
+Engine worktree final verification (24 October 2026): with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0`, ran `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo build -p currawong-parser-worker`, `cargo test --workspace --no-fail-fast`, then `cargo run -p currawongd -- --config config/currawong.example.toml --check-config`, in that order. All passed. Workspace: 737 passed, 0 failed, 3 existing ignored tests (two live-clamd tests and the large YARA rule-set benchmark). New coverage: 14 scanner HTTP/cache tests, 8 daemon integration tests and 2 core config/report compatibility tests. The daemon tests include unnamed HTML attachment disposition through the real parser; ordinary HTML message bodies are not submitted. No live Rspamd or CAPE instance was run.

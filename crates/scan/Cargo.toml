@@ -6,6 +6,11 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+reqwest = { workspace = true }
+rustls = { workspace = true }
+url = { workspace = true }
+rusqlite = { workspace = true }
+hex = { workspace = true }
 currawong-core = { path = "../core" }
 currawong-parser-worker = { path = "../parser-worker" }
 async-trait = { workspace = true }
@@ -30,7 +35,6 @@ hmac = { workspace = true }
 lol_html = { workspace = true }
 encoding_rs = { workspace = true }
 mail-parser = { workspace = true }
-url = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

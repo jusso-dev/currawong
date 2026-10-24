@@ -204,6 +204,7 @@ impl<'a, 'r> Budget<'a, 'r> {
         let sha256 = filetype::sha256(bytes);
         let path = self.store(&sha256, bytes);
         PartInfo {
+            is_attachment: filename.is_some(),
             content_type: content_type
                 .filter(|ct| !ct.is_empty())
                 .unwrap_or_else(|| filetype::detect(bytes).label),

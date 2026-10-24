@@ -8,6 +8,8 @@ It runs as a VM, a container or an appliance image. Think FortiMail, Proofpoint 
 
 > Exchange Server on-premises (2016, 2019 and SE): an `exchange_onprem` domain route delivers to the Mailbox servers in order with failover, over required STARTTLS checked against the Exchange certificate name, and `currawong-admin` renders the Receive, Send, transport and rollback PowerShell from the tenant's values. The admin UI wizard page (pending #39) and its health checks (#52) are not built yet. See [docs/integrations/exchange-onprem.md](docs/integrations/exchange-onprem.md).
 
+Optional on-premises engines (#28): [Rspamd](docs/integrations/rspamd.md) adds spam/phishing scores and release learning; [CAPEv2](docs/integrations/sandbox.md) detonates selected attachments with persistent task/verdict caching and deferred spool retries. Both are off by default and residency guarded. DRAKVUF is not implemented; no verified verdict contract. No live engine deployments were exercised.
+
 ## Why
 
 - Mail gateways parse hostile input at high volume while exposed to the internet. That is exactly where memory safety pays off.
