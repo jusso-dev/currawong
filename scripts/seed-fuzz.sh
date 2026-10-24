@@ -4,7 +4,7 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 corpus="$root/fuzz/corpus"
 for target in smtp_command smtp_data smtp_sasl mime_parse archive_extract \
-  office_detect pspf_parse url_rewrite dlp_scan auth_strip clamd_address \
+  office_detect doc_scan pspf_parse url_rewrite dlp_scan auth_strip clamd_address \
   parser_ipc spool_envelope; do
   mkdir -p "$corpus/$target"
 done
@@ -33,4 +33,7 @@ printf 'unix:/run/clamav/clamd.ctl' > "$corpus/clamd_address/unix"
 printf '{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","rcpt_to":[]}' > "$corpus/spool_envelope/partial"
 printf '\000\000\000\076{"id":"a","raw_path":"/x","limits":{"max_depth":1,"max_uncompressed_bytes":1,"max_files":1,"max_ratio":1}}' \
   > "$corpus/parser_ipc/request"
+printf '\000%%PDF-1.7\n1 0 obj\n<< /OpenAction << /S /JavaScript /JS (x) >> >>\nendobj\n' > "$corpus/doc_scan/pdf"
+printf '\002<svg xmlns="http://www.w3.org/2000/svg" onload="x"/>' > "$corpus/doc_scan/svg"
+printf '\003[InternetShortcut]\r\nURL=file://server/share/a\r\n' > "$corpus/doc_scan/url"
 echo "seeded $corpus"

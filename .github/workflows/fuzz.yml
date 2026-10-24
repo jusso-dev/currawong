@@ -17,6 +17,7 @@ jobs:
           - mime_parse
           - archive_extract
           - office_detect
+          - doc_scan
           - pspf_parse
           - url_rewrite
           - dlp_scan

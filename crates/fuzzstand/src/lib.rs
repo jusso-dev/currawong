@@ -16,6 +16,7 @@ pub const TARGETS: &[(&str, Target)] = &[
     ("mime_parse", currawong_parser::fuzz::mime),
     ("archive_extract", archive_extract),
     ("office_detect", office_detect),
+    ("doc_scan", doc_scan),
     ("pspf_parse", pspf_parse),
     ("dlp_scan", dlp_scan),
     ("url_rewrite", url_rewrite),
@@ -67,6 +68,33 @@ pub fn office_detect(data: &[u8]) {
     let _ = office::ooxml_macro_bytes(data);
     let _ = office::rtf_has_object(data);
     let _ = office::password_candidates(&text(data));
+}
+
+/// Document checks: SVG, shortcuts, RTF, PDF (object streams and embedded
+/// files), OneNote and disk images, plus single OOXML members. The first
+/// byte picks the name, which selects the name-driven paths.
+pub fn doc_scan(data: &[u8]) {
+    const NAMES: [&str; 10] = [
+        "a.pdf",
+        "a.one",
+        "a.svg",
+        "a.url",
+        "a.rtf",
+        "a.library-ms",
+        "a.img",
+        "word/document.xml",
+        "word/_rels/settings.xml.rels",
+        "xl/externalLinks/externalLink1.xml",
+    ];
+    let Some((&pick, rest)) = data.split_first() else {
+        return;
+    };
+    let name = NAMES[usize::from(pick) % NAMES.len()];
+    let rest = cap(rest, 256 * 1024);
+    let _ = currawong_parser::archive::extract(rest, Some(name), &tight(), &[]);
+    let _ = currawong_parser::office::ooxml_external(name, rest);
+    let _ = currawong_parser::office::rtf_external(rest);
+    let _ = currawong_parser::pdf::scan(rest);
 }
 
 pub fn pspf_parse(data: &[u8]) {
@@ -152,6 +180,13 @@ mod tests {
             b"{\\rtf1\\object\\objdata 0102}".to_vec(),
             b"PK\x03\x04".to_vec(),
             b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1".to_vec(),
+            b"\x00%PDF-1.7\n1 0 obj\n<< /OpenAction << /S /J#61vaScript /JS (x) >> /URI (https://example.test/) >>\nendobj\n2 0 obj\n<< /Type /ObjStm /Filter /FlateDecode /Length 10 >>\nstream\nx\x9c\x03\x00\x00\x00\x00\x01\nendstream\nendobj\n3 0 obj\n<< /Type /Filespec /UF (a.txt) /EF << /F 4 0 R >> >>\nendobj\n4 0 obj\n<< /Type /EmbeddedFile /Length 2 >>\nstream\nhi\nendstream\nendobj\n".to_vec(),
+            b"\x01\xe4\x52\x5c\x7b\x8c\xd8\xa7\x4d\xae\xb1\x53\x78\xd0\x29\x96\xd3\xe7\x16\xe3\xbd\x65\x26\x11\x45\xa4\xc4\x8d\x4d\x0b\x7a\x9e\xac\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00MZ".to_vec(),
+            b"\x02<svg xmlns=\"http://www.w3.org/2000/svg\" onload=\"x\"><foreignObject><form/></foreignObject></svg>".to_vec(),
+            b"\x03[InternetShortcut]\r\nURL=file://server/share/a\r\nIconFile=\\\\server\\i.ico\r\n".to_vec(),
+            b"\x04{\\rtf1{\\*\\template http://example.test/a.dot}{\\field{\\*\\fldinst {\\b DDEAUTO} x}}\\objupdate}".to_vec(),
+            b"\x07<w:p><w:fldChar w:fldCharType=\"begin\"/><w:instrText>DDE x</w:instrText><w:fldSimple w:instr=\"HYPERLINK ms-msdt:x\"/></w:p>".to_vec(),
+            b"\x08<Relationships><Relationship Type=\"x/attachedTemplate\" Target=\"\\\\h\\s\" TargetMode=\"External\"/></Relationships>".to_vec(),
             vec![0, 1, 2, 255, 10, 13],
         ];
         for dir in ["testdata/corpus", "testdata/fixtures", "testdata/auth"] {
