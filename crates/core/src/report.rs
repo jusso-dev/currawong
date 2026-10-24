@@ -245,6 +245,23 @@ pub struct ScanReport {
     /// and the subject. `None` when markings were not inspected.
     #[serde(default)]
     pub marking: Option<MarkingReport>,
+    /// Threat-intelligence feed matches on part hashes, links and link
+    /// domains (`[intel]`).
+    #[serde(default)]
+    pub intel: Vec<IntelHit>,
+}
+
+/// One indicator a message matched, and the feed that listed it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntelHit {
+    /// `sha256`, `url`, `domain` or `ip`.
+    pub kind: String,
+    /// The normalised indicator that matched.
+    pub value: String,
+    /// Feed name from `[[intel.feeds]]`, or `spamhaus-dbl` / `spamhaus-hbl`.
+    pub source: String,
+    /// The feed's threat label, for example `phishing` or `malware_download`.
+    pub threat: String,
 }
 
 /// PSPF security classifications, lowest first, so `Ord` compares levels.
@@ -382,6 +399,7 @@ impl ScanReport {
             bec: None,
             flags: Vec::new(),
             marking: None,
+            intel: Vec::new(),
             modified: false,
         }
     }

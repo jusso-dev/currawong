@@ -45,6 +45,7 @@ pub struct Config {
     pub dlp: DlpProfile,
     pub encrypt: EncryptConfig,
     pub events: EventsConfig,
+    pub intel: IntelConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1058,6 +1059,227 @@ impl Default for BlobStoreConfig {
     }
 }
 
+/// `[intel]`: threat-intelligence indicators synced from public and
+/// government feeds into a local store (ADR 0006). Lookups are local; only
+/// the opt-in Spamhaus DQS queries leave the box, and they carry a domain or
+/// a file hash, never message content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IntelConfig {
+    pub enabled: bool,
+    /// SQLite indicator store.
+    pub database: PathBuf,
+    /// Largest feed download, before and after decompression.
+    pub max_download_bytes: u64,
+    /// Whole-download timeout for one feed.
+    pub timeout_secs: u64,
+    /// PEM bundle for a private CA, for example a self-hosted MISP or TAXII
+    /// server. Public roots are always trusted.
+    pub ca_file: Option<PathBuf>,
+    /// Indicators from a feed that has not synced for this long stop matching.
+    pub expire_after_days: u64,
+    /// A feed is stale once this many refresh periods pass without a good sync.
+    pub stale_after_refreshes: u32,
+    /// Stale feeds fail `/readyz` instead of only logging a warning.
+    pub required: bool,
+    /// Links checked per message; the rest are noted as not checked.
+    pub max_urls_per_message: usize,
+    /// The click service also refuses links on a feed (`url_rewrite`).
+    pub check_clicks: bool,
+    pub feeds: Vec<IntelFeedConfig>,
+    pub dqs: DqsConfig,
+}
+
+/// Indicator file layouts. `lines` takes one indicator per line and guesses
+/// its kind unless `kind` is set; `malwarebazaar_sha256` and `openphish` are
+/// line lists of hashes and URLs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedFormat {
+    Lines,
+    /// abuse.ch CSV exports (URLhaus, ThreatFox, MalwareBazaar). Columns are
+    /// found by name from the header line.
+    Csv,
+    ThreatfoxJson,
+    MalwarebazaarSha256,
+    Openphish,
+    PhishtankJson,
+    /// One STIX 2.1 bundle.
+    StixBundle,
+    /// A TAXII 2.1 collection's `objects/` endpoint, followed across pages.
+    Taxii,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IntelFeedConfig {
+    /// Lower case letters, digits, `-` and `_`. Policy sees it as `intel.<name>`.
+    pub name: String,
+    pub format: FeedFormat,
+    /// `https://` only. `{key}` is replaced by the feed key (abuse.ch puts
+    /// its Auth-Key in the path).
+    pub url: String,
+    /// Environment variable holding the feed key.
+    #[serde(default)]
+    pub key_env: Option<String>,
+    /// File holding the feed key (trailing newline ignored).
+    #[serde(default)]
+    pub key_file: Option<PathBuf>,
+    /// Send the key in this request header, for example `Authorization`.
+    #[serde(default)]
+    pub auth_header: Option<String>,
+    #[serde(default = "default_feed_refresh")]
+    pub refresh_secs: u64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// `lines` only: `sha256`, `url`, `domain` or `ip` for every line.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Threat label for indicators the feed does not label.
+    #[serde(default)]
+    pub threat: Option<String>,
+}
+
+fn default_feed_refresh() -> u64 {
+    3600
+}
+
+/// Spamhaus Data Query Service: DBL for link domains and HBL for attachment
+/// SHA-256 hashes, over DNS. Needs a DQS key. Each query sends the domain or
+/// hash to Spamhaus through the system resolver.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DqsConfig {
+    pub enabled: bool,
+    pub key_env: Option<String>,
+    pub key_file: Option<PathBuf>,
+    pub dbl: bool,
+    pub hbl: bool,
+    /// DNS queries per message, domains first, then hashes.
+    pub max_queries_per_message: usize,
+}
+
+/// Source names the DQS lookups report hits under.
+pub const DQS_SOURCES: &[&str] = &["spamhaus-dbl", "spamhaus-hbl"];
+
+impl Default for IntelConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            database: PathBuf::from("/var/lib/currawong/intel.sqlite"),
+            max_download_bytes: 64 * 1024 * 1024,
+            timeout_secs: 120,
+            ca_file: None,
+            expire_after_days: 7,
+            stale_after_refreshes: 3,
+            required: false,
+            max_urls_per_message: 100,
+            check_clicks: true,
+            feeds: Vec::new(),
+            dqs: DqsConfig::default(),
+        }
+    }
+}
+
+impl Default for DqsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            key_env: None,
+            key_file: None,
+            dbl: true,
+            hbl: true,
+            max_queries_per_message: 30,
+        }
+    }
+}
+
+/// `CURRAWONG_` variables are configuration overrides; a key there would
+/// be read as an unknown setting.
+fn reserved_env(name: &str) -> bool {
+    name.to_ascii_uppercase().starts_with("CURRAWONG_")
+}
+
+impl IntelConfig {
+    fn validate(&self) -> Result<(), ConfigError> {
+        let bad = |msg: String| Err(ConfigError::Invalid(format!("intel.{msg}")));
+        if !self.enabled {
+            return Ok(());
+        }
+        if !self.database.is_absolute() {
+            return bad("database must be an absolute path".into());
+        }
+        if self.max_download_bytes < 1024 || self.timeout_secs == 0 {
+            return bad(
+                "max_download_bytes must be at least 1024 and timeout_secs at least 1".into(),
+            );
+        }
+        if self.expire_after_days == 0 || self.stale_after_refreshes == 0 {
+            return bad("expire_after_days and stale_after_refreshes must be at least 1".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for feed in &self.feeds {
+            let name = &feed.name;
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+            {
+                return bad(format!(
+                    "feeds: name {name:?} must be lower case letters, digits, - or _"
+                ));
+            }
+            if DQS_SOURCES.contains(&name.as_str()) || !names.insert(name.as_str()) {
+                return bad(format!("feeds: name {name:?} is used twice or reserved"));
+            }
+            match url::Url::parse(&feed.url.replace("{key}", "key")) {
+                Ok(url) if url.scheme() == "https" && url.host_str().is_some() => {}
+                _ => return bad(format!("feeds.{name}: url must be an https URL")),
+            }
+            if feed.refresh_secs < 60 {
+                return bad(format!("feeds.{name}: refresh_secs must be at least 60"));
+            }
+            if feed.key_env.as_deref().is_some_and(reserved_env) {
+                return bad(format!(
+                    "feeds.{name}: key_env may not start with CURRAWONG_ (those set configuration)"
+                ));
+            }
+            if feed.key_env.is_some() && feed.key_file.is_some() {
+                return bad(format!("feeds.{name}: set key_env or key_file, not both"));
+            }
+            let keyed = feed.key_env.is_some() || feed.key_file.is_some();
+            if (feed.url.contains("{key}") || feed.auth_header.is_some()) && !keyed {
+                return bad(format!(
+                    "feeds.{name}: {{key}} or auth_header needs key_env or key_file"
+                ));
+            }
+            match (feed.format, feed.kind.as_deref()) {
+                (_, None) | (FeedFormat::Lines, Some("sha256" | "url" | "domain" | "ip")) => {}
+                _ => {
+                    return bad(format!(
+                        "feeds.{name}: kind is for format \"lines\": sha256, url, domain or ip"
+                    ))
+                }
+            }
+        }
+        let dqs = &self.dqs;
+        if dqs.enabled {
+            if dqs.key_env.as_deref().is_some_and(reserved_env) {
+                return bad(
+                    "dqs: key_env may not start with CURRAWONG_ (those set configuration)".into(),
+                );
+            }
+            if dqs.key_env.is_some() == dqs.key_file.is_some() {
+                return bad("dqs: set one of key_env or key_file".into());
+            }
+            if !dqs.dbl && !dqs.hbl {
+                return bad("dqs: enable dbl, hbl or both".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 impl EventsConfig {
     /// Every sink destination as a URL, in the form the residency guard checks.
     /// Syslog is `syslog://host:port` or `syslog-tls://host:port`.
@@ -1372,6 +1594,7 @@ impl Default for Config {
             dlp: DlpProfile::default(),
             encrypt: EncryptConfig::default(),
             events: EventsConfig::default(),
+            intel: IntelConfig::default(),
         }
     }
 }
@@ -1667,6 +1890,7 @@ impl Config {
             }
         }
         self.events.validate()?;
+        self.intel.validate()?;
         Ok(())
     }
 

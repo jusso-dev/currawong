@@ -183,3 +183,30 @@ conditions = [
     { not = { auth = { method = "dmarc", result = "pass" } } },
 ]
 actions = [{ add_header = { name = "X-Currawong-Warning", value = "links from an unauthenticated sender were not checked" } }]
+
+# Threat-intel feeds (`[intel]`): an attachment hash, a link, or a link's
+# domain or address listed by a feed or by Spamhaus DQS. Each feed also
+# raises `intel.<feed name>`, so a single noisy feed can be tagged instead.
+[[policy]]
+id = "intel-hash"
+priority = 25
+conditions = [{ flag = "intel.hash" }]
+actions = [{ quarantine = "malware" }]
+
+[[policy]]
+id = "intel-url"
+priority = 26
+conditions = [{ flag = "intel.url" }]
+actions = [{ quarantine = "phishing" }]
+
+[[policy]]
+id = "intel-domain"
+priority = 27
+conditions = [{ flag = "intel.domain" }]
+actions = [{ quarantine = "phishing" }]
+
+[[policy]]
+id = "intel-ip"
+priority = 28
+conditions = [{ flag = "intel.ip" }]
+actions = [{ quarantine = "phishing" }]
