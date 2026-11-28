@@ -60,14 +60,8 @@ fn pack(actions: Vec<Action>) -> PolicySet {
 
 /// The parser worker built beside this test binary.
 fn worker_bin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let worker = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .map(|dir| dir.join("currawong-parser-worker"))
-        .unwrap();
-    assert!(worker.is_file(), "build the parser worker first");
-    worker
+    currawong_scan::pool::worker_binary_from_exe()
+        .expect("parser worker binary: run cargo build -p currawong-parser-worker")
 }
 
 struct Harness {

@@ -635,13 +635,13 @@ fn running_as_root() -> bool {
     false
 }
 
+/// The worker in the nearest directory above the running executable. Test
+/// binaries sit in `target/debug/deps/` or, with newer cargo, in
+/// `target/debug/build/<pkg>/<hash>/out/`; the worker is in `target/debug/`.
 pub fn worker_binary_from_exe() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?.parent()?;
-    let candidate = dir.join("currawong-parser-worker");
-    if candidate.is_file() {
-        Some(candidate)
-    } else {
-        None
-    }
+    exe.ancestors()
+        .skip(1)
+        .map(|dir| dir.join("currawong-parser-worker"))
+        .find(|candidate| candidate.is_file())
 }
