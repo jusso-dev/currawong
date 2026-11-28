@@ -11,6 +11,7 @@ currawong-spool = { path = "../spool" }
 currawong-auth = { path = "../auth" }
 currawong-quarantine = { path = "../quarantine" }
 currawongd = { path = "../currawongd" }
+currawong-scan = { path = "../scan" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 mail-send = { workspace = true }

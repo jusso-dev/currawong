@@ -94,9 +94,7 @@ pub async fn spawn_gateway(overrides: impl FnOnce(&mut Config)) -> TestGateway {
     cfg.scanner.clamd.required = false;
     // Parsing only ever happens in the worker; `cargo test --workspace`
     // builds it next to the test binaries.
-    cfg.scanner.worker_binary = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("currawong-parser-worker")));
+    cfg.scanner.worker_binary = currawong_scan::pool::worker_binary_from_exe();
     cfg.listeners = vec![ListenerConfig {
         name: "test".into(),
         bind: "127.0.0.1:0".into(),
@@ -252,9 +250,9 @@ pub async fn read_banner(addr: SocketAddr) -> String {
     line
 }
 
-/// The EICAR test file, decoded at run time from XOR bytes (as in
-/// `crates/scan/build.rs`). The contiguous string is never stored in the
-/// repository.
+/// The EICAR test file, decoded at run time from XOR bytes (the same
+/// technique as `currawong_scan::eicar`). The contiguous string is never
+/// stored in the repository.
 pub fn eicar() -> Vec<u8> {
     const ENCODED: [u8; 68] = [
         114, 31, 101, 11, 122, 15, 106, 107, 122, 113, 30, 118, 122, 112, 114, 31, 30, 2, 122, 116,

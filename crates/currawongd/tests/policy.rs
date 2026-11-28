@@ -67,17 +67,8 @@ fn with(extra: Vec<Policy>) -> PolicySet {
 
 /// `cargo test --workspace` builds the parser worker next to the tests.
 fn worker_bin() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let candidate = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .map(|dir| dir.join("currawong-parser-worker"))
-        .unwrap();
-    assert!(
-        candidate.is_file(),
-        "parser worker binary: run cargo build -p currawong-parser-worker"
-    );
-    candidate
+    currawong_scan::pool::worker_binary_from_exe()
+        .expect("parser worker binary: run cargo build -p currawong-parser-worker")
 }
 
 fn config(dir: &std::path::Path) -> Config {

@@ -33,17 +33,8 @@ fn envelope(from: &str) -> Envelope {
 
 /// `cargo test --workspace` builds the worker binary next to the tests.
 fn worker_bin() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let candidate = exe
-        .parent()
-        .and_then(|deps| deps.parent())
-        .map(|dir| dir.join("currawong-parser-worker"))
-        .unwrap();
-    assert!(
-        candidate.is_file(),
-        "parser worker binary: run cargo build -p currawong-parser-worker"
-    );
-    candidate
+    currawong_scan::pool::worker_binary_from_exe()
+        .expect("parser worker binary: run cargo build -p currawong-parser-worker")
 }
 
 /// A scanning config without ClamAV.

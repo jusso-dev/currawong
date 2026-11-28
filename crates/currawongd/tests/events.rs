@@ -80,9 +80,7 @@ async fn a_pipeline_verdict_reaches_the_syslog_sink() {
     cfg.scanner.clamd.address.clear();
     cfg.scanner.clamd.required = false;
     // `cargo test --workspace` builds the parser worker next to the tests.
-    cfg.scanner.worker_binary = std::env::current_exe()
-        .ok()
-        .and_then(|exe| Some(exe.parent()?.parent()?.join("currawong-parser-worker")));
+    cfg.scanner.worker_binary = currawong_scan::pool::worker_binary_from_exe();
     cfg.events.syslog = Some(SyslogSinkConfig {
         address,
         tls: false,
